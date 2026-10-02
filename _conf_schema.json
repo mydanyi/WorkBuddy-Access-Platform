@@ -1,0 +1,224 @@
+{
+  "gateway": {
+    "type": "object",
+    "description": "本地 OpenAI 兼容聊天网关",
+    "hint": "在本机开放一个仅用于 AstrBot 的 OpenAI 兼容接口，供原生 Provider 接入；默认只监听回环地址。",
+    "items": {
+      "enabled": {
+        "type": "bool",
+        "default": true,
+        "description": "启用本地聊天网关",
+        "hint": "关闭后不会监听任何端口，也不会通过本网关接收聊天请求；但不会禁止由成长任务等已单独授权的聊天。"
+      },
+      "host": {
+        "type": "string",
+        "default": "127.0.0.1",
+        "description": "监听地址",
+        "hint": "默认 127.0.0.1（仅本机）。改为非回环地址时，请自行确保有网络访问控制或 TLS，插件不代部署代理/证书。"
+      },
+      "port": {
+        "type": "int",
+        "default": 17863,
+        "description": "监听端口",
+        "hint": "取值范围 1..65535；测试时可用 0 表示由系统随机分配（仅测试用途）。"
+      },
+      "api_key": {
+        "type": "string",
+        "default": "",
+        "secret": true,
+        "description": "网关访问密钥",
+        "hint": "供 AstrBot 原生 Provider 使用；UI 仅掩码显示。留空则不开放聊天监听端口。"
+      },
+      "concurrency": {
+        "type": "int",
+        "default": 1,
+        "description": "并发上限",
+        "hint": "同时处理的聊天请求数上限，默认 1。"
+      },
+      "rpm": {
+        "type": "int",
+        "default": 6,
+        "description": "每分钟请求上限",
+        "hint": "与成长任务共享同一预算，默认 6。"
+      },
+      "queue_size": {
+        "type": "int",
+        "default": 2,
+        "description": "等待队列长度",
+        "hint": "并发已满时最多排队数，默认 2。"
+      },
+      "queue_timeout": {
+        "type": "int",
+        "default": 30,
+        "description": "排队等待超时（秒）",
+        "hint": "排队超过该秒数返回 429，默认 30。"
+      }
+    }
+  },
+  "signin": {
+    "type": "object",
+    "description": "每日签到",
+    "hint": "按配置时区自动签到；手动签到命令始终可用（受暂停与冷却约束）。",
+    "items": {
+      "enabled": {
+        "type": "bool",
+        "default": true,
+        "description": "启用自动签到",
+        "hint": "仅控制自动签到；关闭后手动 /wb signin 仍可执行。"
+      },
+      "timezone": {
+        "type": "string",
+        "default": "Asia/Shanghai",
+        "description": "签到时区",
+        "hint": "必须是合法的 IANA 时区名，如 Asia/Shanghai。"
+      },
+      "primary": {
+        "type": "string",
+        "default": "00:10",
+        "description": "主签到时间",
+        "hint": "HH:MM 格式，默认 00:10。"
+      },
+      "recovery": {
+        "type": "string",
+        "default": "12:10",
+        "description": "补签到时间",
+        "hint": "HH:MM 格式，默认 12:10。"
+      },
+      "jitter": {
+        "type": "int",
+        "default": 120,
+        "description": "随机抖动（秒）",
+        "hint": "在主/补签到时间上叠加的随机延迟上限（秒），默认 120。"
+      },
+      "max_attempts": {
+        "type": "int",
+        "default": 5,
+        "description": "每日尝试上限",
+        "hint": "自动与手动共享的每日次数上限，最大 5。"
+      }
+    }
+  },
+  "growth": {
+    "type": "object",
+    "description": "成长任务",
+    "hint": "仅执行白名单内、有真实动作链的任务；其余列明为 manual 不执行。",
+    "items": {
+      "auto_after_signin": {
+        "type": "bool",
+        "default": false,
+        "description": "签到成功后自动执行成长任务",
+        "hint": "默认关闭；仅在后台启动，不阻塞签到。"
+      },
+      "auto_claim": {
+        "type": "bool",
+        "default": true,
+        "description": "自动领取完成后奖励",
+        "hint": "普通轮次自动领奖；显式 /wb tasks claim 属人工授权，不受此开关限制。"
+      },
+      "max_chat_requests": {
+        "type": "int",
+        "default": 20,
+        "description": "每日成长聊天请求上限",
+        "hint": "按 Asia/Shanghai 日期统计，默认 20，可有限调整。"
+      },
+      "max_retries": {
+        "type": "int",
+        "default": 2,
+        "description": "失败重试上限",
+        "hint": "仅约束失败重试，不限制正常成功步骤，默认 2。"
+      },
+      "task_interval": {
+        "type": "int",
+        "default": 2,
+        "description": "任务间隔（秒）",
+        "hint": "相邻任务之间的等待秒数，默认 2。"
+      },
+      "poll_interval": {
+        "type": "int",
+        "default": 5,
+        "description": "进度轮询间隔（秒）",
+        "hint": "回读任务/奖励状态的轮询间隔，默认 5。"
+      },
+      "progress_timeout": {
+        "type": "int",
+        "default": 120,
+        "description": "进度确认超时（秒）",
+        "hint": "单步等待计分到账的最长时间，默认 120。"
+      },
+      "allowed_tasks": {
+        "type": "list",
+        "default": [],
+        "description": "允许的任务白名单",
+        "hint": "留空表示全部已支持白名单（不是不执行）；填写则仅执行列出的任务码。"
+      },
+      "allow_telemetry": {
+        "type": "bool",
+        "default": true,
+        "description": "允许行为指纹上报类动作",
+        "hint": "RichMeow / 资料库等需要客户端行为上报的动作，默认允许。"
+      },
+      "allow_theme_change": {
+        "type": "bool",
+        "default": false,
+        "description": "允许主题变更类动作",
+        "hint": "默认关闭，避免改动账号外观偏好。"
+      },
+      "allow_adoption": {
+        "type": "bool",
+        "default": false,
+        "description": "允许领养类动作",
+        "hint": "默认关闭。"
+      }
+    }
+  },
+  "auth": {
+    "type": "object",
+    "description": "登录与凭据",
+    "hint": "凭据以 AES 加密后保存在插件数据目录；主密钥仅从环境变量读取，不落盘、不入日志。",
+    "items": {
+      "master_key_env": {
+        "type": "string",
+        "default": "WORKBUDDY_MASTER_KEY",
+        "description": "主密钥环境变量名",
+        "hint": "插件只读取该环境变量的值（标准 base64、解码后 32 字节），从不保存其内容。"
+      },
+      "login_timeout": {
+        "type": "int",
+        "default": 120,
+        "description": "登录轮询超时（秒）",
+        "hint": "等待扫码/授权完成的最长时间，默认 120。"
+      },
+      "poll_interval": {
+        "type": "int",
+        "default": 1,
+        "description": "登录轮询间隔（秒）",
+        "hint": "默认 1。"
+      }
+    }
+  },
+  "http": {
+    "type": "object",
+    "description": "HTTP 超时",
+    "hint": "对上游请求的超时设置（秒）。",
+    "items": {
+      "total_timeout": {
+        "type": "int",
+        "default": 180,
+        "description": "总超时（秒）",
+        "hint": "默认 180。"
+      },
+      "connect_timeout": {
+        "type": "int",
+        "default": 15,
+        "description": "连接超时（秒）",
+        "hint": "默认 15。"
+      },
+      "sock_read_timeout": {
+        "type": "int",
+        "default": 120,
+        "description": "读取超时（秒）",
+        "hint": "默认 120。"
+      }
+    }
+  }
+}

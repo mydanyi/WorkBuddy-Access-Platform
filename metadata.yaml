@@ -1,0 +1,7 @@
+name: astrbot_plugin_workbuddy
+display_name: WorkBuddy 接入平台
+desc: WorkBuddy API、每日签到与成长任务
+author: mydanyi
+version: v0.1.0
+repo: https://github.com/mydanyi/WorkBuddy-Access-Platform
+astrbot_version: ">=4.27.4,<5"

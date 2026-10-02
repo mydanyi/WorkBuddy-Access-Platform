@@ -1,0 +1,1 @@
+"""AstrBot WorkBuddy plugin package."""

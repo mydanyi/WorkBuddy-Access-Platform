@@ -1,0 +1,38 @@
+# WorkBuddy 插件源码 .gitignore
+#
+# 这些是本地缓存与运行时产物：它们不应被提交到版本库。
+# 注意：这只是「不纳入版本控制」，绝不是「删除用户数据」——
+# 运行时的凭据、状态与备份仍由部署者自行保留。
+
+# Python 缓存 / 构建产物
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+build/
+dist/
+
+# 测试 / 静态检查缓存
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# 虚拟环境
+.venv/
+venv/
+env/
+
+# 可控临时目录（测试在 WORKBUDDY_TEST_TMP 下创建）
+tmp/
+
+# 运行时机密 / 状态（绝不入库；也请勿在群聊或聊天中传播）
+credentials.enc
+state.json
+.env
+.env.*
+*.pem
+*.key
+secrets*
