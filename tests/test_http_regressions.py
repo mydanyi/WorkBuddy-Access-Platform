@@ -523,18 +523,44 @@ class _RegressionTestCase(unittest.IsolatedAsyncioTestCase):
         ):
             self.assertNotIn(excluded, ids)
 
-    async def test_balance_posts_empty_body_to_user_resource(self):
+    async def test_balance_posts_resource_filters(self):
         async def balance_handler(request):
-            return _ok({"remain": 1})
+            return _ok(
+                {
+                    "Response": {
+                        "Data": {
+                            "Accounts": [{"CapacitySize": 2, "CapacityRemain": 1}],
+                            "TotalCount": 1,
+                        }
+                    }
+                }
+            )
 
         self.up.on("POST", BALANCE_PATH, balance_handler)
 
         client = self._make_client()
-        await client.balance()
+        summary = await client.balance()
+
+        self.assertTrue(summary["known"])
+        self.assertEqual(summary["remaining"], 1)
+        self.assertEqual(summary["used"], 1)
+        self.assertEqual(summary["total"], 2)
 
         calls = self.up.calls_for("POST", BALANCE_PATH)
         self.assertEqual(len(calls), 1)
-        self.assertEqual(self.up.json_body(calls[0]), {})
+        body = self.up.json_body(calls[0])
+        self.assertEqual(body["PageNumber"], 1)
+        self.assertEqual(body["PageSize"], 100)
+        self.assertEqual(body["ProductCode"], "p_tcaca")
+        self.assertEqual(body["Status"], [0, 3])
+        self.assertRegex(
+            body["PackageEndTimeRangeBegin"],
+            r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$",
+        )
+        self.assertRegex(
+            body["PackageEndTimeRangeEnd"],
+            r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$",
+        )
 
 
 if __name__ == "__main__":

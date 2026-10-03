@@ -11,11 +11,25 @@ Error contract (shared by every API, including the future chat path):
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import secrets
 from contextlib import asynccontextmanager
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
+
+import aiohttp
 
 from .auth import common_headers, parse_retry_after
+from .credits import (
+    format_credits,
+    is_finite_number,
+    parse_credits,
+    promotion_discount,
+    promotion_label,
+    promotion_note,
+    select_promotion,
+)
 from .errors import UpstreamError
 
 MODELS_PATH = "/console/enterprises/personal/models"
@@ -27,6 +41,20 @@ CHAT_PATH = "/v2/chat/completions"
 # Pinned WorkBuddy desktop client version (``X-IDE-Version`` / UA).
 _CHAT_CLIENT_VERSION = "5.5.4"
 
+# ``/v3/config`` (IDE shape) supplements same-id credits + ``modelPromotions``.
+V3_CONFIG_PATH = "/v3/config"
+_V3_CONFIG_HEADERS = {
+    "User-Agent": "CodeBuddyIDE/4.12.0 CodeBuddy/4.12.0",
+    "X-Product": "SaaS",
+}
+
+# Balance (resource) query: fixed page/product/status and effective-time window.
+_PACKAGE_PAGE_SIZE = 100
+_PACKAGE_PRODUCT_CODE = "p_tcaca"
+_PACKAGE_STATUS = (0, 3)
+_PACKAGE_WINDOW_TZ = ZoneInfo("Asia/Shanghai")
+_PACKAGE_WINDOW_DAYS = 101 * 365
+
 
 def _stable_account_id(uid, purpose) -> str:
     """Derive the 36-hex per-account device/session id pinned in ``headers.go``."""
@@ -34,6 +62,91 @@ def _stable_account_id(uid, purpose) -> str:
         ("wb2a:" + purpose + ":" + str(uid)).encode("utf-8")
     ).hexdigest()
     return digest[:36]
+
+
+def _balance_window() -> tuple[str, str]:
+    """The fixed, server-side effective window (Asia/Shanghai, +101 years)."""
+    now = datetime.now(_PACKAGE_WINDOW_TZ)
+    begin = now.strftime("%Y-%m-%d %H:%M:%S")
+    end = (now + timedelta(days=_PACKAGE_WINDOW_DAYS)).strftime("%Y-%m-%d %H:%M:%S")
+    return begin, end
+
+
+def _unknown_balance() -> dict:
+    """A safe "cannot aggregate" summary: never a fabricated zero."""
+    return {
+        "known": False,
+        "remaining": None,
+        "used": None,
+        "total": None,
+        "package_count": None,
+    }
+
+
+def _balance_page(data):
+    """Extract one ``Response.Data`` page, or ``(None, None)`` if unrecognized."""
+    if not isinstance(data, dict):
+        return None, None
+    response = data.get("Response")
+    if not isinstance(response, dict):
+        return None, None
+    inner = response.get("Data")
+    if not isinstance(inner, dict):
+        return None, None
+    accounts = inner.get("Accounts")
+    total = inner.get("TotalCount")
+    if not isinstance(accounts, list):
+        return None, None
+    if not isinstance(total, int) or isinstance(total, bool) or total < 0:
+        return None, None
+    return accounts, total
+
+
+def _package_amounts(account):
+    """Return ``(size, remain, used)`` for one package, or ``None`` if unusable.
+
+    A cycle-quota package (valid ``CycleCapacitySize`` > 0) is read *only* from
+    its ``Cycle*`` fields and never mixed with ``Capacity*``.  Otherwise the
+    plain ``Capacity*`` fields apply.  Server-reported ``Used`` larger than
+    ``size - remain`` is treated as truth (then clamped), and ``remain`` is
+    re-derived from the adopted ``used``.
+    """
+    cycle_size = account.get("CycleCapacitySize")
+    if is_finite_number(cycle_size) and cycle_size > 0:
+        size = cycle_size
+        remain_raw = account.get("CycleCapacityRemain")
+        used_raw = account.get("CycleCapacityUsed")
+    else:
+        size = account.get("CapacitySize")
+        remain_raw = account.get("CapacityRemain")
+        used_raw = account.get("CapacityUsed")
+
+    if not is_finite_number(size) or size < 0:
+        return None
+    if not is_finite_number(remain_raw):
+        return None
+
+    remain = 0.0 if remain_raw < 0 else float(remain_raw)
+    if remain > size:
+        remain = float(size)
+
+    derived_used = float(size) - remain
+    used = derived_used
+    if is_finite_number(used_raw) and used_raw > derived_used:
+        used = float(used_raw)
+        if used > size:
+            used = float(size)
+    if used < 0:
+        used = 0.0
+
+    return float(size), float(size) - used, used
+
+
+def _clean_number(value):
+    """Collapse integral floats to ``int`` for stable summaries."""
+    if value == int(value):
+        return int(value)
+    return value
 
 
 # Catalog entries under these id prefixes / tags are never chat models.
@@ -203,15 +316,16 @@ class UpstreamClient:
         data = body.get("data") if isinstance(body, dict) else None
         return data if isinstance(data, dict) else {}
 
-    async def models(self) -> list[str]:
-        """Return the CLI-chat model ids advertised by the live catalog.
+    def _select_chat_entries(self, data: dict) -> list[dict]:
+        """Return the raw catalog entries the ``cli`` agent exposes.
 
-        Derived from the enterprise ``personal/models`` document: the ids the
-        ``cli`` agent exposes, intersected with the ``models`` metadata list,
-        with non-chat entries filtered out.  A missing ``cli`` agent or an empty
-        result is an upstream contract violation -- never a static fallback.
+        The enterprise ``personal/models`` document decides the callable set:
+        the ids the ``cli`` agent lists, intersected with the ``models`` catalog
+        and filtered for non-chat entries (disabled / id prefix / tag / capped
+        ``maxOutputTokens``), order preserved and de-duplicated.  A missing
+        ``cli`` agent or an empty result is an upstream contract violation --
+        never a static fallback.
         """
-        data = await self.request_json("GET", MODELS_PATH)
         catalog = data.get("models")
         catalog = catalog if isinstance(catalog, list) else []
         agents = data.get("agents")
@@ -258,17 +372,169 @@ class UpstreamClient:
             ):
                 continue
             seen.add(model_id)
-            result.append(model_id)
+            result.append(item)
 
         if not result:
             raise UpstreamError(200, None)
         return result
 
+    async def models(self) -> list[str]:
+        """Return the CLI-chat model ids advertised by the live catalog.
+
+        Unchanged contract: only the enterprise ``personal/models`` document is
+        read, and only the pure ids are returned (no ``/v3/config`` query).
+        """
+        data = await self.request_json("GET", MODELS_PATH)
+        return [item["id"] for item in self._select_chat_entries(data)]
+
+    async def _fetch_v3_config(self) -> dict:
+        """Fetch ``/v3/config`` (IDE shape); a failure yields an empty supplement.
+
+        ``UpstreamError`` (bad status / business code) and network/timeout
+        failures leave the enterprise metadata usable.  Cancellation is a
+        ``BaseException`` and is deliberately never caught here.
+        """
+        try:
+            return await self.request_json(
+                "GET",
+                V3_CONFIG_PATH,
+                base=self.chat_base,
+                headers=dict(_V3_CONFIG_HEADERS),
+            )
+        except UpstreamError:
+            return {}
+        except (asyncio.TimeoutError, aiohttp.ClientError):
+            return {}
+
+    async def model_details(self, now=None) -> list[dict]:
+        """Return per-model credit / promotion metadata for the CLI-callable set.
+
+        The enterprise document decides the set; ``/v3/config`` only
+        *supplements* same-id credits and ``modelPromotions`` and never widens
+        it.  A failing ``/v3/config`` leaves the still-usable enterprise
+        metadata in place.  Each entry carries the raw base ``credits`` (number
+        or ``None``), its canonical ``effective_credits`` string, and the active
+        promotion's ``promo_label`` / ``promo_note`` (``""`` when none applies).
+        """
+        data = await self.request_json("GET", MODELS_PATH)
+        entries = self._select_chat_entries(data)
+
+        v3 = await self._fetch_v3_config()
+        v3_models = v3.get("models") if isinstance(v3, dict) else None
+        v3_models = v3_models if isinstance(v3_models, list) else []
+        v3_by_id = {}
+        for item in v3_models:
+            if not isinstance(item, dict):
+                continue
+            model_id = item.get("id")
+            if isinstance(model_id, str) and model_id and model_id not in v3_by_id:
+                v3_by_id[model_id] = item
+        promotions = v3.get("modelPromotions") if isinstance(v3, dict) else None
+        promotions = promotions if isinstance(promotions, list) else []
+
+        if now is None:
+            now = datetime.now(timezone.utc)
+        elif now.tzinfo is None:
+            now = now.replace(tzinfo=timezone.utc)
+
+        details = []
+        for item in entries:
+            model_id = item["id"]
+            name = item.get("name")
+            name = name if isinstance(name, str) else ""
+
+            base = parse_credits(item.get("credits"))
+            if base is None:
+                supplement = v3_by_id.get(model_id)
+                if supplement is not None:
+                    base = parse_credits(supplement.get("credits"))
+
+            promo = select_promotion(promotions, model_id, now)
+            label = ""
+            note = ""
+            effective = format_credits(base)
+            if promo is not None:
+                label = promotion_label(promo)
+                note = promotion_note(promo)
+                discounted = promotion_discount(promo, base)
+                if discounted is not None:
+                    effective = format_credits(discounted)
+
+            details.append(
+                {
+                    "id": model_id,
+                    "name": name,
+                    "credits": base,
+                    "effective_credits": effective,
+                    "promo_label": label,
+                    "promo_note": note,
+                }
+            )
+        return details
+
     async def balance(self) -> dict:
-        """Fetch the account resource/balance summary."""
-        return await self.request_json(
-            "POST", BALANCE_PATH, base=self.billing_base, json={}
-        )
+        """Aggregate the account resource/balance summary across all packages.
+
+        Reads the billing meter with a fixed, server-side effective window and
+        paginates until every advertised record is collected.  ``TotalDosage``
+        is deliberately ignored (its semantics are unconfirmed).  A partial or
+        unreadable document is reported as *unknown* (all-``None``), never as a
+        fabricated zero; a page failure raises a safe ``UpstreamError`` rather
+        than exposing a partial total.
+        """
+        begin, end = _balance_window()
+        accounts = []
+        total_count = None
+        deadline_pages = None
+        page_number = 1
+        while True:
+            payload = {
+                "PageNumber": page_number,
+                "PageSize": _PACKAGE_PAGE_SIZE,
+                "ProductCode": _PACKAGE_PRODUCT_CODE,
+                "Status": list(_PACKAGE_STATUS),
+                "PackageEndTimeRangeBegin": begin,
+                "PackageEndTimeRangeEnd": end,
+            }
+            data = await self.request_json(
+                "POST", BALANCE_PATH, base=self.billing_base, json=payload
+            )
+            page_accounts, page_total = _balance_page(data)
+            if page_accounts is None:
+                return _unknown_balance()
+            if total_count is None:
+                total_count = page_total
+                deadline_pages = (
+                    (total_count + _PACKAGE_PAGE_SIZE - 1) // _PACKAGE_PAGE_SIZE + 1
+                )
+            accounts.extend(page_accounts)
+            if len(accounts) >= total_count:
+                break
+            if not page_accounts or page_number >= deadline_pages:
+                # The server claims more records but cannot deliver them.
+                return _unknown_balance()
+            page_number += 1
+
+        remaining = 0.0
+        used_total = 0.0
+        total = 0.0
+        for account in accounts:
+            if not isinstance(account, dict):
+                return _unknown_balance()
+            amounts = _package_amounts(account)
+            if amounts is None:
+                return _unknown_balance()
+            size, remain, used = amounts
+            total += size
+            remaining += remain
+            used_total += used
+        return {
+            "known": True,
+            "remaining": _clean_number(remaining),
+            "used": _clean_number(used_total),
+            "total": _clean_number(total),
+            "package_count": len(accounts),
+        }
 
     async def signin_status(self) -> dict:
         """Fetch the daily check-in status."""

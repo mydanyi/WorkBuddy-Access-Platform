@@ -33,6 +33,7 @@ import aiohttp
 from aiohttp import web
 
 from .chat import aggregate_chunks
+from .credits import display_model_id, upstream_model_id
 from .errors import ChatStreamError, UpstreamError
 from .limits import ConcurrencyGate, LimitExceeded
 
@@ -202,16 +203,32 @@ class Gateway:
         if not self._authorized(request):
             return self._auth_error()
         try:
-            ids = await self._client.models()
+            details = await self._client.model_details()
         except UpstreamError as exc:
             return self._failed_error(exc)
         except (aiohttp.ClientError, asyncio.TimeoutError):
             # A transport failure is a fixed JSON 502, never an unhandled 500.
             return self._failed_error(ChatStreamError("upstream request failed"))
-        data = [
-            {"id": model_id, "object": "model", "created": 0, "owned_by": "workbuddy"}
-            for model_id in ids
-        ]
+        data = []
+        for detail in details or []:
+            if not isinstance(detail, dict):
+                continue
+            upstream_id = detail.get("id")
+            if not isinstance(upstream_id, str) or not upstream_id:
+                continue
+            data.append(
+                {
+                    "id": display_model_id(detail),
+                    "upstream_id": upstream_id,
+                    "object": "model",
+                    "created": 0,
+                    "owned_by": "workbuddy",
+                    "credits": detail.get("credits"),
+                    "effective_credits": detail.get("effective_credits"),
+                    "promo_label": detail.get("promo_label"),
+                    "promo_note": detail.get("promo_note"),
+                }
+            )
         return web.json_response({"object": "list", "data": data})
 
     async def _handle_chat(self, request):
@@ -236,6 +253,11 @@ class Gateway:
                 "both 'model' and a non-empty 'messages' list are required",
                 "invalid_request_error",
             )
+        # Shallow-copy and remap only ``model``: a display alias becomes the pure
+        # upstream id while messages / system / tools / persona / stream are left
+        # untouched.  A plain id passes through unchanged.
+        payload = dict(payload)
+        payload["model"] = upstream_model_id(payload["model"])
         stream = bool(payload.get("stream"))
         try:
             async with self.limits.slot():

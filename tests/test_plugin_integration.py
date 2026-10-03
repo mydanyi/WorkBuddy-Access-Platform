@@ -137,6 +137,8 @@ ACCEPT_PATH = "/v2/activity/growth/tasks/accept"
 CLAIM_ROUTE = "/activity/growth/tasks/{code}/claim"
 REPORT_PATH = "/v2/report"
 MODELS_CATALOG_PATH = "/console/enterprises/personal/models"
+BALANCE_PATH = "/v2/billing/meter/get-user-resource"
+V3_CONFIG_PATH = "/v3/config"
 # OAuth endpoints the real ``AuthManager`` talks to: a fresh per-login ``state``,
 # the pending/success token poll, and the account lookup that matches it.
 STATE_PATH = "/v2/plugin/auth/state"
@@ -210,12 +212,22 @@ class _IntegrationUpstream(_BaseUpstream):
     def __init__(self) -> None:
         super().__init__()
         self.tasks = []
-        self.models = [MODEL, "glm-5.2"]
+        self.models = [
+            {"id": MODEL, "name": MODEL, "credits": 0.11},
+            {"id": "glm-5.2", "name": "glm-5.2"},
+        ]
         self.checkin = {"active": True, "today_checked_in": False}
         self.accept_calls = []
         self.claim_calls = []
         self.report_calls = []
         self._extra_hits = 0
+        # Registrable external fixtures for the balance read and /v3/config;
+        # tests may replace ``handlers`` entries or flip ``balance_status``.
+        self.handlers = {}
+        self.balance_status = 200
+        self.v3 = {"models": [], "modelPromotions": []}
+        self.handlers[("POST", BALANCE_PATH)] = self._balance_handler
+        self.handlers[("GET", V3_CONFIG_PATH)] = self._v3_handler
         # Login state machine: ``begin_login`` mints a unique state; the token
         # poll is pending until the test flips ``token_ready`` on, and the
         # account route then names the account the current state authorized.
@@ -246,6 +258,15 @@ class _IntegrationUpstream(_BaseUpstream):
                 },
                 status=401,
             )
+        # Registrable external fixtures (balance read / /v3/config).
+        handler = self.handlers.get((request.method, path))
+        if handler is not None:
+            body = await request.read()
+            self._record(request, body)
+            result = handler(request)
+            if hasattr(result, "__await__"):
+                result = await result
+            return result
         if request.method == "POST" and path == STATE_PATH:
             body = await request.read()
             self._record(request, body)
@@ -299,7 +320,10 @@ class _IntegrationUpstream(_BaseUpstream):
             REPORT_PATH,
             MODELS_CATALOG_PATH,
         ) or path.endswith("/claim"):
-            await request.read()
+            body = await request.read()
+            # Record per-path (for "queried exactly once" assertions) while
+            # keeping the legacy aggregate counter other tests rely on.
+            self._record(request, body)
             self._extra_hits += 1
             if path == CHECKIN_STATUS_PATH:
                 return self._json({"code": 0, "data": dict(self.checkin)})
@@ -317,8 +341,24 @@ class _IntegrationUpstream(_BaseUpstream):
                     {
                         "code": 0,
                         "data": {
-                            "models": [{"id": m, "name": m} for m in self.models],
-                            "agents": [{"name": "cli", "models": list(self.models)}],
+                            "models": [
+                                {
+                                    "id": m["id"],
+                                    "name": m["name"],
+                                    **(
+                                        {"credits": m["credits"]}
+                                        if "credits" in m
+                                        else {}
+                                    ),
+                                }
+                                for m in self.models
+                            ],
+                            "agents": [
+                                {
+                                    "name": "cli",
+                                    "models": [m["id"] for m in self.models],
+                                }
+                            ],
                         },
                     }
                 )
@@ -357,6 +397,31 @@ class _IntegrationUpstream(_BaseUpstream):
         # A real aiohttp JSON response; ``def`` (not ``async def``) because the
         # handlers ``return self._json(...)`` without awaiting it.
         return web.json_response(body, status=status, headers=headers or {})
+
+    def _balance_handler(self, request):
+        if self.balance_status != 200:
+            return self._json(
+                {"code": 5000, "msg": "FICTIONAL-BALANCE-ERROR"},
+                status=self.balance_status,
+            )
+        return self._json(
+            {
+                "code": 0,
+                "data": {
+                    "Response": {
+                        "Data": {
+                            "Accounts": [
+                                {"CapacitySize": 150, "CapacityRemain": 105, "CapacityUsed": 45}
+                            ],
+                            "TotalCount": 1,
+                        }
+                    }
+                },
+            }
+        )
+
+    def _v3_handler(self, request):
+        return self._json({"code": 0, "data": dict(self.v3)})
 
     @property
     def extra_hits(self) -> int:
@@ -1132,6 +1197,164 @@ class _PluginIntegrationTestCase(unittest.IsolatedAsyncioTestCase):
         )
         self.assertIn("done_task", listing)
         self.assertIn("已领取", listing)
+
+    # -- 12. status overview: balance + credits + signin + growth --------
+    def _off_growth(self, **extra):
+        growth = {"auto_after_signin": False, "auto_claim": False}
+        growth.update(extra)
+        return self._make_ready_plugin_config(growth=growth)
+
+    async def test_status_shows_balance_and_overview_without_extra_upstream(self):
+        self._seed_credentials()
+        self.up.tasks = [
+            {
+                "task_code": "grow_task",
+                "title": "成长任务",
+                "current": 0,
+                "target": 1,
+                "progress": {"current": 0, "target": 1},
+                "accept_status": "claimed",
+            }
+        ]
+        plugin = await self._make_plugin(**self._off_growth())
+        self.assertTrue(plugin.ready)
+
+        text = _text_of(await _invoke(plugin.wb, _make_event("wb status"), "status", ""))
+
+        self.assertIn("剩余积分：105", text)
+        self.assertIn("已用积分：45", text)
+        self.assertIn("总额度：150", text)
+        self.assertIn("wb-1 [0.11x]", text)
+        self.assertIn("00:10", text)           # 签到定时
+        self.assertIn("Asia/Shanghai", text)   # 时区
+        self.assertIn("聊天", text)             # 成长聊天预算
+        self.assertIn("0/1", text)             # 任务进度
+        self.assertIn("已领取", text)
+
+        # Read-only overview: model catalog / config / balance / tasks, once each.
+        self.assertEqual(self.up.hits[("GET", MODELS_CATALOG_PATH)], 1)
+        self.assertEqual(self.up.hits[("GET", V3_CONFIG_PATH)], 1)
+        self.assertEqual(self.up.hits[("POST", BALANCE_PATH)], 1)
+        self.assertEqual(self.up.hits[("GET", GROWTH_LIST_PATH)], 1)
+        # No side-effecting route is ever touched.
+        self.assertEqual(self.up.hits[("POST", "/v2/chat/completions")], 0)
+        self.assertEqual(self.up.hits[("GET", CHECKIN_STATUS_PATH)], 0)
+        self.assertEqual(self.up.hits[("POST", CHECKIN_STATUS_PATH)], 0)
+        self.assertEqual(self.up.hits[("POST", CHECKIN_CLAIM_PATH)], 0)
+        self.assertEqual(self.up.hits[("POST", ACCEPT_PATH)], 0)
+        self.assertEqual(self.up.hits[("POST", REPORT_PATH)], 0)
+        self.assertEqual(self.up.claim_calls, [])
+
+    # -- 13. a balance failure degrades only the balance block ----------
+    async def test_status_survives_balance_failure_without_leaking(self):
+        self._seed_credentials()
+        self.up.balance_status = 500
+        plugin = await self._make_plugin(**self._off_growth())
+
+        text = _text_of(await _invoke(plugin.wb, _make_event("wb status"), "status", ""))
+
+        # Model / signin / task blocks still render.
+        self.assertIn("wb-1 [0.11x]", text)
+        self.assertIn("00:10", text)
+        self.assertIn("Asia/Shanghai", text)
+        self.assertIn("聊天", text)
+        # The raw upstream body and any token must never leak.
+        self.assertNotIn("FICTIONAL-BALANCE-ERROR", text)
+        self.assertNotIn(SEED_CREDENTIALS["accessToken"], text)
+        self.assertNotIn(SEED_CREDENTIALS["refreshToken"], text)
+        self.assertNotIn(GATEWAY_KEY, text)
+
+    # -- 14. unlogged / unauthorized status touches no upstream ---------
+    async def test_status_without_login_or_permission_touches_no_upstream(self):
+        # Unlogged: nothing to read.
+        plugin = await self._make_plugin(**self._off_growth())
+        self.assertFalse(plugin.auth.credentials)
+        await _invoke(plugin.wb, _make_event("wb status"), "status", "")
+        self.assertEqual(self.up.total_hits(), 0)
+
+        # Logged in, but a management-group and a non-admin event are both
+        # rejected before any upstream work.
+        self._seed_credentials()
+        plugin2 = await self._make_plugin(**self._off_growth())
+        self.assertTrue(plugin2.auth.credentials)
+        before = self.up.total_hits()
+        for event in (
+            _make_event("wb status", admin=True, private=False),
+            _make_event("wb status", admin=False, private=True),
+        ):
+            await _invoke(plugin2.wb, event, "status", "")
+        self.assertEqual(self.up.total_hits(), before)
+
+    # -- 15. real Provider lists the alias and maps it back -------------
+    async def test_real_provider_lists_alias_and_maps_back_on_completion(self):
+        self._seed_credentials()
+        plugin = await self._make_plugin(**self._off_growth())
+        port = plugin.gateway.bound_port
+        base = f"http://127.0.0.1:{port}/v1"
+
+        self.up.queue_sse(_basic_sse("你好，来自网关"))
+        provider = ProviderOpenAIOfficial(
+            provider_config={
+                "id": "wb-test",
+                "type": "openai_chat_completion",
+                "api_base": base,
+                "key": [GATEWAY_KEY],
+                "model": "wb-1 [0.11x]",
+                "timeout": 5,
+            },
+            provider_settings={},
+        )
+        self._providers.append(provider)
+
+        models = await provider.get_models()
+        self.assertIn("wb-1 [0.11x]", models)
+
+        response = await provider.text_chat(
+            prompt="hi",
+            contexts=[],
+            system_prompt="You are persona X.",
+            request_max_retries=1,
+        )
+        self.assertTrue(response.completion_text)
+
+        # The gateway maps the display alias back to the pure upstream id.
+        sent = self.up.chat_bodies()[0]
+        self.assertEqual(sent["model"], "wb-1")
+
+    # -- 16. status separates "auto disabled" from "paused" --------------
+    async def test_status_distinguishes_disabled_from_paused(self):
+        self._seed_credentials()
+        # Default ready config has signin.enabled False -> auto is *disabled*,
+        # which is a different state from a manually *paused* scheduler.
+        plugin = await self._make_plugin(**self._make_ready_plugin_config())
+        self.assertTrue(plugin.ready)
+
+        text = _text_of(await _invoke(plugin.wb, _make_event("wb status"), "status", ""))
+        self.assertIn("签到自动：未启用", text)
+        self.assertIn("签到状态：正常", text)
+
+        # The real scheduler has no pause(); a server-forced pause is recorded
+        # in the shared state store, exactly as the live 429 path does.
+        plugin.state.update("scheduler", {"paused": True})
+        text = _text_of(await _invoke(plugin.wb, _make_event("wb status"), "status", ""))
+        self.assertIn("签到自动：未启用", text)
+        self.assertIn("签到状态：已暂停", text)
+
+        # Auto enabled: stop the real background loop immediately, then pause.
+        self._seed_credentials()
+        auto = await self._make_plugin(
+            **self._make_ready_plugin_config(signin={"enabled": True})
+        )
+        await auto.scheduler.stop()
+        auto.state.update("scheduler", {"paused": True})
+        text = _text_of(await _invoke(auto.wb, _make_event("wb status"), "status", ""))
+        self.assertIn("签到自动：已启用", text)
+        self.assertIn("签到状态：已暂停", text)
+
+        # A status read never triggers any claim / accept side effect.
+        self.assertEqual(self.up.claim_calls, [])
+        self.assertEqual(self.up.hits[("POST", CHECKIN_CLAIM_PATH)], 0)
+        self.assertEqual(self.up.hits[("POST", ACCEPT_PATH)], 0)
 
 
 def tearDownModule() -> None:

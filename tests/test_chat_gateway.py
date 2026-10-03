@@ -712,7 +712,9 @@ class _GatewayTestCase(unittest.IsolatedAsyncioTestCase):
             self.assertIsInstance(data, list)
             ids = [item.get("id") if isinstance(item, dict) else item for item in data]
             # The advertised model must come from the real upstream catalog.
-            self.assertIn(MODEL, ids)
+            # Its catalog carries no credits, so the display alias renders the
+            # unknown-multiplier form.
+            self.assertIn(f"{MODEL} [倍率未知]", ids)
             self.assertNotIn(UID, json.dumps(body))
             self.assertNotIn(AT_OLD, json.dumps(body))
 

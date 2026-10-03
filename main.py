@@ -29,6 +29,7 @@ from .core.auth import AuthManager
 from .core.chat import ChatService
 from .core.client import UpstreamClient
 from .core.config import ConfigError, load_settings
+from .core.credits import display_model_id
 from .core.gateway import Gateway
 from .core.growth import GrowthService
 from .core.scheduler import SigninScheduler
@@ -45,11 +46,11 @@ WEB_BASE = "https://www.workbuddy.cn"
 
 HELP_TEXT = """WorkBuddy 指令（仅管理员私聊）：
 /wb help                 显示本帮助
-/wb status               查看插件与账号状态
+/wb status               查看只读完整总览（就绪/登录/监听/签到/积分/模型/成长）
 /wb login                获取登录链接
 /wb logout               退出登录
-/wb models               列出可用模型
-/wb balance              查看账户余额
+/wb models               列出可用模型（带倍率与促销说明）
+/wb balance              查看账户积分
 /wb signin               手动签到
 /wb signin resume        恢复被暂停的签到
 /wb tasks                只读列出成长任务
@@ -64,7 +65,7 @@ HELP_TEXT = """WorkBuddy 指令（仅管理员私聊）：
     "astrbot_plugin_workbuddy",
     "mydanyi",
     "WorkBuddy API、每日签到与成长任务",
-    "0.1.0",
+    "0.1.1",
 )
 class WorkBuddyPlugin(Star):
     """The single WorkBuddy entry point."""
@@ -325,7 +326,7 @@ class WorkBuddyPlugin(Star):
             return
 
         if action == "status":
-            yield event.plain_result(self._status_text())
+            yield event.plain_result(await self._status_text())
             return
         if action == "login":
             yield event.plain_result(await self._begin_login(event))
@@ -451,34 +452,62 @@ class WorkBuddyPlugin(Star):
     # command renderers (fixed Chinese summaries, no secrets)
     # ------------------------------------------------------------------ #
 
-    def _status_text(self) -> str:
+    async def _status_text(self) -> str:
         lines = ["WorkBuddy 插件状态：", "就绪：是"]
         creds = self.auth.credentials if self.auth is not None else {}
-        lines.append("登录：{}".format("已登录" if creds.get("accessToken") else "未登录"))
+        logged_in = bool(creds.get("accessToken"))
+        lines.append("登录：{}".format("已登录" if logged_in else "未登录"))
         if self.gateway is not None and getattr(self.gateway, "bound_port", None):
             lines.append("网关：监听中（端口 {}）".format(self.gateway.bound_port))
         else:
             lines.append("网关：未监听")
+
         if self.scheduler is not None:
             st = self.scheduler.status()
+            signin_cfg = self._settings["signin"] if self._settings else {}
             lines.append(
-                "签到：{}，今日尝试 {}，上次成功 {}".format(
-                    "已暂停" if st["paused"] else "正常",
-                    st["attempts_today"],
+                "签到自动：{}".format("已启用" if st.get("enabled") else "未启用")
+            )
+            lines.append(
+                "签到状态：{}".format("已暂停" if st.get("paused") else "正常")
+            )
+            lines.append(
+                "签到定时：每日 {} 主 / {} 恢复（时区 {}）".format(
+                    st.get("primary") or signin_cfg.get("primary") or "无",
+                    st.get("recovery") or signin_cfg.get("recovery") or "无",
+                    st.get("timezone") or signin_cfg.get("timezone") or "无",
+                )
+            )
+            lines.append(
+                "签到今日尝试 {}，上次成功 {}".format(
+                    st.get("attempts_today", 0),
                     st.get("last_success_date") or "无",
                 )
             )
             if st.get("last_outcome"):
                 lines.append("签到最近结果：" + str(st["last_outcome"]))
+
         if self.growth is not None:
-            gs = self.growth.status()
-            lines.append(
-                "成长：{}，今日聊天 {}/{}".format(
-                    "运行中" if gs["running"] else "空闲",
-                    gs["chat_requests_today"],
-                    gs["max_chat_requests"],
-                )
-            )
+            lines.append(self._format_growth_status(self.growth.status()))
+
+        # A logged-in overview reads each source at most once, and the three
+        # renderers are already safe on their own; gather them so one slow query
+        # never serializes the whole status and one failure never hides another.
+        balance_text, models_text, tasks_text = await asyncio.gather(
+            self._balance_text(),
+            self._models_text(),
+            self._tasks_text(""),
+            return_exceptions=True,
+        )
+        if isinstance(balance_text, BaseException):
+            balance_text = "查询余额失败，请稍后重试。"
+        if isinstance(models_text, BaseException):
+            models_text = "获取模型列表失败，请稍后重试。"
+        if isinstance(tasks_text, BaseException):
+            tasks_text = "获取任务列表失败，请稍后重试。"
+        lines.append(balance_text)
+        lines.append(models_text)
+        lines.append(tasks_text)
         return "\n".join(lines)
 
     async def _signin_text(self, rest: str) -> str:
@@ -509,29 +538,58 @@ class WorkBuddyPlugin(Star):
         if not creds.get("accessToken"):
             return "尚未登录，无法获取模型列表。"
         try:
-            ids = await self.client.models()
+            details = await self.client.model_details()
         except Exception:
             return "获取模型列表失败，请稍后重试。"
-        if not ids:
+        if not details:
             return "当前没有可用模型。"
-        return "可用模型：\n" + "\n".join("- " + str(m) for m in ids)
+        lines = ["可用模型："]
+        for detail in details:
+            if not isinstance(detail, dict):
+                continue
+            alias = display_model_id(detail)
+            note = detail.get("promo_note")
+            if isinstance(note, str) and note.strip():
+                lines.append("- {}（{}）".format(alias, note.strip()))
+            else:
+                lines.append("- " + alias)
+        if len(lines) == 1:
+            return "当前没有可用模型。"
+        lines.append("提示：倍率为查询快照，实际扣费以官方结算为准。")
+        return "\n".join(lines)
 
     async def _balance_text(self) -> str:
         creds = self.auth.credentials if self.auth is not None else {}
         if not creds.get("accessToken"):
             return "尚未登录，无法查询余额。"
         try:
-            data = await self.client.balance()
+            summary = await self.client.balance()
         except Exception:
             return "查询余额失败，请稍后重试。"
-        parts = ["账户资源："]
-        for key in ("credit", "credits", "energy", "balance", "remain", "remaining"):
-            value = data.get(key) if isinstance(data, dict) else None
-            if isinstance(value, (int, float)) and not isinstance(value, bool):
-                parts.append("{}：{}".format(key, value))
-        if len(parts) == 1:
-            parts.append("暂无可展示的余额字段。")
-        return "\n".join(parts)
+        if not isinstance(summary, dict) or not summary.get("known"):
+            return "积分信息：未知（上游数据不完整）"
+        return (
+            "账户积分：\n"
+            "剩余积分：{}\n"
+            "已用积分：{}\n"
+            "总额度：{}\n"
+            "积分包：{}\n"
+            "（本次返回积分包合计，非月度额度）"
+        ).format(
+            self._format_amount(summary.get("remaining")),
+            self._format_amount(summary.get("used")),
+            self._format_amount(summary.get("total")),
+            self._format_amount(summary.get("package_count")),
+        )
+
+    @staticmethod
+    def _format_amount(value) -> str:
+        """Render a credit amount as a plain number (no trailing ``.0``)."""
+        if isinstance(value, bool) or value is None:
+            return "未知"
+        if isinstance(value, float) and value.is_integer():
+            return str(int(value))
+        return str(value)
 
     async def _tasks_text(self, rest: str) -> str:
         creds = self.auth.credentials if self.auth is not None else {}
