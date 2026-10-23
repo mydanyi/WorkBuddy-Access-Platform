@@ -83,8 +83,8 @@ HELP_TEXT = """WorkBuddy 指令（仅管理员私聊）：
 @register(
     "astrbot_plugin_workbuddy",
     "mydanyi",
-    "WorkBuddy API、每日签到与成长任务",
-    "0.1.2",
+    "将 WorkBuddy 接入 AstrBot，提供 OpenAI 兼容 API（普通/流式）、自动签到、成长任务一键执行与领奖、积分与模型倍率总览、模型列表定时刷新、主备模型按顺序调用，以及可配置管理员 QQ 的签到与异常通知。",
+    "0.1.3",
 )
 class WorkBuddyPlugin(Star):
     """The single WorkBuddy entry point."""

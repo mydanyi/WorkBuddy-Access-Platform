@@ -1,7 +1,7 @@
 name: astrbot_plugin_workbuddy
 display_name: WorkBuddy 接入平台
-desc: WorkBuddy API、每日签到与成长任务
+desc: 将 WorkBuddy 接入 AstrBot，提供 OpenAI 兼容 API（普通/流式）、自动签到、成长任务一键执行与领奖、积分与模型倍率总览、模型列表定时刷新、主备模型按顺序调用，以及可配置管理员 QQ 的签到与异常通知。
 author: mydanyi
-version: v0.1.2
+version: v0.1.3
 repo: https://github.com/mydanyi/WorkBuddy-Access-Platform
 astrbot_version: ">=4.27.4,<5"

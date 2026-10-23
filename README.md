@@ -8,15 +8,17 @@
 
 模型接入、每日签到、积分查询，在 AstrBot 里一起打理。
 
-[![版本](https://img.shields.io/badge/WorkBuddy-0.1.2-6d7fe8)](https://github.com/mydanyi/WorkBuddy-Access-Platform/releases/tag/v0.1.2)
+[![版本](https://img.shields.io/badge/WorkBuddy-0.1.3-6d7fe8)](https://github.com/mydanyi/WorkBuddy-Access-Platform/releases/tag/v0.1.3)
 [![AstrBot](https://img.shields.io/badge/AstrBot-%3E%3D4.27.4%2C%3C5-52b9b2)](https://github.com/AstrBotDevs/AstrBot)
 [![许可](https://img.shields.io/badge/License-MIT-f0bc68)](LICENSE)
 
-[开始使用](#开始使用) · [使用指南](docs/USAGE.md) · [常用指令](#常用指令) · [下载](https://github.com/mydanyi/WorkBuddy-Access-Platform/releases/tag/v0.1.2)
+[开始使用](#开始使用) · [使用指南](docs/USAGE.md) · [常用指令](#常用指令) · [下载](https://github.com/mydanyi/WorkBuddy-Access-Platform/releases/tag/v0.1.3)
 
 </div>
 
-**WorkBuddy 接入平台是 AstrBot 的插件**，为**单个 WorkBuddy（CN）账号**服务：它把账号里的模型接到 AstrBot 原生 Provider 上，按你的设置完成每日签到与已支持的成长任务，并把积分、运行状态和管理员通知一起收进管理员私聊。
+将 WorkBuddy 接入 AstrBot，提供 OpenAI 兼容 API（普通/流式）、自动签到、成长任务一键执行与领奖、积分与模型倍率总览、模型列表定时刷新、主备模型按顺序调用，以及可配置管理员 QQ 的签到与异常通知。
+
+支持单个 WorkBuddy（CN）账号，复用 AstrBot 原生 Provider，在插件设置和管理员私聊中管理。
 
 ## 在机器人里用上 WorkBuddy
 
@@ -52,10 +54,10 @@
 
 ## 开始使用
 
-插件要求 **AstrBot `>=4.27.4,<5`** 与 **Python 3.12**，当前版本 **0.1.2**。
+插件要求 **AstrBot `>=4.27.4,<5`** 与 **Python 3.12**，当前版本 **0.1.3**。
 
 1. 在 AstrBot 中完成机器人平台连接；如需管理员 QQ 通知，请接好 QQ / OneBot v11（aiocqhttp）。
-2. 安装插件：从本仓库放入 `data/plugins/astrbot_plugin_workbuddy/`（`main.py` 等文件应直接位于该目录），或从[发布页](https://github.com/mydanyi/WorkBuddy-Access-Platform/releases/tag/v0.1.2)下载 ZIP 解压安装，然后在管理面板重载插件。
+2. 安装插件：从本仓库放入 `data/plugins/astrbot_plugin_workbuddy/`（`main.py` 等文件应直接位于该目录），或从[发布页](https://github.com/mydanyi/WorkBuddy-Access-Platform/releases/tag/v0.1.3)下载 ZIP 解压安装，然后在管理面板重载插件。
 3. 自行生成并设置主密钥 `WORKBUDDY_MASTER_KEY`（标准 base64、解码后恰好 32 字节），再设置网关密钥 `gateway.api_key`。主密钥环境变量需要对 AstrBot 进程生效，再保存插件配置并重载；生成与配置方法见[使用指南](docs/USAGE.md)。
 4. 由管理员**私聊**执行 `/wb login` 取得链接，在**自己的浏览器**里完成授权。
 5. 在 AstrBot 中添加 OpenAI 兼容 Provider：API Base 同一容器内默认为 `http://127.0.0.1:17863/v1`，密钥填 `gateway.api_key`。
