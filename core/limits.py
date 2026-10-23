@@ -10,7 +10,11 @@ Contract:
 * The active + queued counts are exact: a request is admitted, queued or
   rejected, never silently dropped.
 * The RPM check runs *before* a request is queued, and only for requests that
-  already passed authorization in the caller.
+  already passed authorization in the caller.  Admission may also *pre-check*
+  the budget without consuming it (``count_rpm=False``); the chat layer then
+  spends exactly one permit per real upstream POST (``consume_rpm``), so a
+  standby attempt or a 401 refresh resend is counted once, never twice, and a
+  refused attempt consumes nothing.
 * A full queue or an expired queue wait raises :class:`LimitExceeded`; the
   caller maps it to HTTP 429 with a ``Retry-After`` hint.
 * ``close`` releases every waiter so a shutdown does not leave tasks parked.
@@ -66,24 +70,50 @@ class ConcurrencyGate:
     def queued(self) -> int:
         return len(self._waiters)
 
-    def _check_rpm_locked(self) -> None:
+    def _trim_rpm_locked(self, now) -> None:
+        while self._rpm_events and now - self._rpm_events[0] >= _WINDOW_SECONDS:
+            self._rpm_events.popleft()
+
+    def _refuse_rpm_locked(self, now):
+        retry = _WINDOW_SECONDS - (now - self._rpm_events[0])
+        raise LimitExceeded("rpm", retry_after=max(1.0, retry))
+
+    def _precheck_rpm_locked(self) -> None:
+        """Judge the budget *without* consuming a permit (admission time)."""
         if self._rpm is None:
             return
         now = self._clock()
-        while self._rpm_events and now - self._rpm_events[0] >= _WINDOW_SECONDS:
-            self._rpm_events.popleft()
+        self._trim_rpm_locked(now)
         if len(self._rpm_events) >= self._rpm:
-            retry = _WINDOW_SECONDS - (now - self._rpm_events[0])
-            raise LimitExceeded("rpm", retry_after=max(1.0, retry))
+            self._refuse_rpm_locked(now)
+
+    def _check_rpm_locked(self) -> None:
+        """Judge the budget and consume one permit for a real upstream POST."""
+        if self._rpm is None:
+            return
+        now = self._clock()
+        self._trim_rpm_locked(now)
+        if len(self._rpm_events) >= self._rpm:
+            self._refuse_rpm_locked(now)
         self._rpm_events.append(now)
 
-    async def acquire(self) -> None:
-        """Reserve a slot, waiting in the queue if necessary."""
+    async def acquire(self, *, count_rpm=True) -> None:
+        """Reserve a slot, waiting in the queue if necessary.
+
+        ``count_rpm=True`` keeps the historic behaviour: the permit is consumed
+        before enqueueing and a refused request never consumes one.
+        ``count_rpm=False`` only *judges* the budget here and leaves the permit
+        to :meth:`consume_rpm`, which the chat layer calls right before each real
+        upstream POST.
+        """
         if self._closed:
             raise LimitExceeded("stopped", retry_after=1.0)
         async with self._lock:
-            # RPM is judged before enqueue; a refused request never consumes it.
-            self._check_rpm_locked()
+            if count_rpm:
+                # RPM is judged before enqueue; a refused request never consumes it.
+                self._check_rpm_locked()
+            else:
+                self._precheck_rpm_locked()
             if self._closed:
                 raise LimitExceeded("stopped", retry_after=1.0)
             if self._active < self._concurrency:
@@ -130,9 +160,16 @@ class ConcurrencyGate:
         async with self._lock:
             self._handoff_locked()
 
+    async def consume_rpm(self) -> None:
+        """Consume one request permit right before a real upstream chat POST."""
+        async with self._lock:
+            if self._closed:
+                raise LimitExceeded("stopped", retry_after=1.0)
+            self._check_rpm_locked()
+
     @asynccontextmanager
-    async def slot(self):
-        await self.acquire()
+    async def slot(self, *, count_rpm=True):
+        await self.acquire(count_rpm=count_rpm)
         try:
             yield
         finally:

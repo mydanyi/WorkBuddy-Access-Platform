@@ -242,12 +242,27 @@ async def _iter_sse(resp):
         raise ChatStreamError("upstream stream ended without a terminator")
 
 
-async def _read_error_code(resp):
+async def _read_error_details(resp):
+    """Read a non-200 chat error body *once*: ``(code, limit_scope)``.
+
+    The business ``code`` is passed through untouched (no guessing at its
+    semantics).  ``limit_scope`` is only taken from an explicit ``root.scope`` /
+    ``error.scope`` string; anything else is ``None`` and is normalised again by
+    :class:`UpstreamError`.  The body itself is never stored on the exception.
+    """
     try:
         body = await resp.json(content_type=None)
     except Exception:
-        return None
-    return body.get("code") if isinstance(body, dict) else None
+        return None, None
+    if not isinstance(body, dict):
+        return None, None
+    scope = body.get("scope")
+    if not isinstance(scope, str):
+        error = body.get("error")
+        scope = error.get("scope") if isinstance(error, dict) else None
+    if not isinstance(scope, str):
+        scope = None
+    return body.get("code"), scope
 
 
 async def _read_json_body(resp):
@@ -535,9 +550,11 @@ class ChatService:
 
     The service owns the shared admission gate (default: 1 concurrent, 6 RPM,
     queue 2, queue timeout 30s) so a direct :meth:`complete` call and a gateway
-    request draw on *one* budget.  :meth:`stream` performs no admission of its
-    own -- the caller owns the slot -- so the gateway can acquire once and stream
-    without a second (deadlocking) acquisition.
+    request draw on *one* budget.  :meth:`complete` takes a concurrency slot but
+    deliberately does *not* spend a request permit at admission: :meth:`stream`
+    consumes exactly one permit per real upstream POST through the client's
+    ``before_post`` hook, so failover and refresh resends are counted once each.
+    :meth:`stream` performs no admission of its own -- the caller owns the slot.
     """
 
     def __init__(self, client, limits=None):
@@ -548,27 +565,38 @@ class ChatService:
 
     async def complete(self, payload):
         """Aggregate the streamed answer into one ``chat.completion``."""
-        async with self.limits.slot():
+        async with self.limits.slot(count_rpm=False):
             chunks = []
             async for chunk in self.stream(payload):
                 chunks.append(chunk)
             return aggregate_chunks(chunks, payload)
 
-    async def stream(self, payload):
+    async def stream(self, payload, *, observe_errors=True):
         """Yield OpenAI chunk dicts; raise on any malformed / failed upstream.
 
         The upstream response is closed (via the ``chat_stream`` context
         manager) when this generator is exhausted, closed early or cancelled,
         so a client disconnect tears the upstream read loop down too.  Transport
         failures are folded into a fixed, desensitized :class:`ChatStreamError`;
-        ``CancelledError`` / ``GeneratorExit`` are never swallowed.
+        ``CancelledError`` / ``GeneratorExit`` are never swallowed, and a local
+        :class:`core.limits.LimitExceeded` (budget spent) is passed through
+        untouched so the caller can answer 429 instead of a fake 502.
+
+        ``observe_errors=False`` is used for a routed candidate attempt whose
+        failure may be absorbed by the standby model: only *this* call is muted.
         """
         body = _build_upstream_body(payload)
         try:
-            async with self._client.chat_stream(body) as resp:
+            async with self._client.chat_stream(
+                body,
+                before_post=self.limits.consume_rpm,
+                observe_errors=observe_errors,
+            ) as resp:
                 if resp.status != 200:
-                    code = await _read_error_code(resp)
-                    raise UpstreamError(resp.status, code, parse_retry_after(resp))
+                    code, scope = await _read_error_details(resp)
+                    raise UpstreamError(
+                        resp.status, code, parse_retry_after(resp), limit_scope=scope
+                    )
                 content_type = resp.headers.get("Content-Type", "")
                 if "text/event-stream" not in content_type:
                     data = await _read_json_body(resp)

@@ -9,7 +9,8 @@ Pinned contract (see ``tests/test_scheduler.py``)::
 
     SigninScheduler(service, state, timezone="Asia/Shanghai",
                     primary="00:10", recovery="12:10", jitter=120,
-                    max_attempts=5, enabled=True, clock=None, on_success=None)
+                    max_attempts=5, enabled=True, clock=None, on_success=None,
+                    on_result=None)
 
     await run_once(manual=False) -> dict   # one round, serialized
     await tick() -> dict                    # one scheduler decision point
@@ -30,6 +31,13 @@ Semantics:
 * A verified success is attributed to the business date the round **started**
   under (``state["date"]``), never to the wall-clock day the response arrived.
   ``on_success`` fires once for that day.
+* ``on_result`` is an optional callback invoked *once per genuinely executed*
+  round (blocked ticks and same-day duplicates never call it), just before the
+  round's safe summary is returned.  It may be sync or async; a failing callback
+  never changes the business result while a ``CancelledError`` always propagates.
+  The summary carries ``outcome``/``verified``/``date``, a validated
+  ``reward_credits`` when signed, ``http_status`` for an upstream HTTP error and
+  ``retry_after`` for a rate-limit/backoff; no raw collaborator field leaks.
 * ``401``/``403`` pause all rounds until :meth:`resume`; ``notlogin`` waits for
   authorization the same way.
 * ``429`` installs a hard cooldown of at least ``Retry-After`` seconds which
@@ -51,6 +59,7 @@ from zoneinfo import ZoneInfo
 
 import aiohttp
 
+from .credits import is_finite_number
 from .errors import UpstreamError
 
 # Bounded automatic backoff after a network / 5xx failure (seconds).
@@ -60,6 +69,9 @@ _DEFAULT_COOLDOWN = 60.0
 # Length of one bounded sleep in the background loop.
 _TICK_INTERVAL = 60.0
 _STATE_SECTION = "scheduler"
+# The only failure categories the scheduler may carry from a handled service
+# result into its safe summary; every other value is dropped.
+_SAFE_ERROR_CATEGORIES = ("network", "upstream", "rate", "auth", "permission")
 
 
 def _parse_hhmm(value: str) -> tuple[int, int]:
@@ -93,6 +105,7 @@ class SigninScheduler:
         enabled=True,
         clock=None,
         on_success=None,
+        on_result=None,
     ):
         self._service = service
         self._state = state
@@ -104,6 +117,7 @@ class SigninScheduler:
         self._enabled = bool(enabled)
         self._clock = clock or time.time
         self._on_success = on_success
+        self._on_result = on_result
 
         self._lock = asyncio.Lock()
         self._loop_task = None
@@ -211,7 +225,11 @@ class SigninScheduler:
                 # Count the attempt *before* it runs: a cancellation is not a refund.
                 state["attempts"] = int(state.get("attempts", 0)) + 1
                 self._save(state)
-                return await self._execute(state, now)
+                summary = await self._execute(state, now)
+                # A genuinely executed round announces its safe summary exactly
+                # once, just before returning (never for a blocked round).
+                await self._fire_on_result(summary)
+                return summary
             finally:
                 self._inflight_task = None
 
@@ -231,7 +249,7 @@ class SigninScheduler:
         verified = bool(result.get("verified")) if isinstance(result, dict) else False
 
         if verified:
-            return await self._record_success(state, outcome or "signed")
+            return await self._record_success(state, outcome or "signed", result)
         if outcome in ("inactive", "unknown"):
             # A terminal, well-defined non-success: stop the day, do not spin.
             state["stopped"] = True
@@ -243,9 +261,16 @@ class SigninScheduler:
             self._save(state)
             return self._summary(state, "notlogin", False)
         # ``unconfirmed`` (and anything unrecognized) retries on a bounded backoff.
-        return self._on_backoff(state, now, outcome or "unconfirmed")
+        error_category = None
+        if isinstance(result, dict):
+            candidate = result.get("error_category")
+            if candidate in _SAFE_ERROR_CATEGORIES:
+                error_category = candidate
+        return self._on_backoff(
+            state, now, outcome or "unconfirmed", error_category=error_category
+        )
 
-    async def _record_success(self, state: dict, outcome: str) -> dict:
+    async def _record_success(self, state: dict, outcome: str, result=None) -> dict:
         # Success belongs to the business date the round *started* under, never
         # to the wall-clock day the (possibly post-midnight) response arrived.
         day = state.get("date") or self._local_date_str()
@@ -265,14 +290,44 @@ class SigninScheduler:
                 pass
         if outcome not in ("signed", "already_signed"):
             outcome = "signed"
-        return self._summary(state, outcome, True)
+        # Only a validated reward is surfaced; an unusable one is never guessed.
+        reward = self._safe_reward_credits(result)
+        return self._summary(state, outcome, True, reward_credits=reward)
+
+    @staticmethod
+    def _safe_reward_credits(result):
+        """Return a finite non-negative numeric ``reward_credits`` or ``None``.
+
+        Mirrors :func:`core.credits.is_finite_number` plus a ``>= 0`` bound;
+        ``bool``/``NaN``/``inf``/negatives/strings are rejected and ``0`` is kept.
+        """
+        if not isinstance(result, dict):
+            return None
+        value = result.get("reward_credits")
+        if is_finite_number(value) and value >= 0:
+            return value
+        return None
+
+    async def _fire_on_result(self, summary: dict) -> None:
+        """Invoke ``on_result`` once, safely; ``CancelledError`` always propagates."""
+        if self._on_result is None:
+            return
+        try:
+            outcome_obj = self._on_result(dict(summary))
+            if inspect.isawaitable(outcome_obj):
+                await outcome_obj
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - a callback failure never changes the round
+            pass
 
     def _on_upstream_error(self, state: dict, now: float, exc) -> dict:
         status = getattr(exc, "status", None)
+        http_status = status if isinstance(status, int) and not isinstance(status, bool) else None
         if status in (401, 403):
             state["paused"] = True
             self._save(state)
-            return self._summary(state, "paused", False)
+            return self._summary(state, "paused", False, http_status=http_status)
         if status == 429:
             retry_after = getattr(exc, "retry_after", None)
             if (
@@ -285,28 +340,45 @@ class SigninScheduler:
                 delay = _DEFAULT_COOLDOWN
             state["cooldown_until"] = now + delay
             self._save(state)
-            summary = self._summary(state, "rate_limited", False)
-            summary["retry_after"] = delay
-            return summary
+            return self._summary(
+                state, "rate_limited", False, http_status=http_status, retry_after=delay
+            )
         if isinstance(status, int) and status >= 500:
-            return self._on_backoff(state, now, "network")
+            return self._on_backoff(state, now, "network", http_status=http_status)
         # Unknown business error (including an HTTP 200 body code): no blind retry.
         state["stopped"] = True
         state["stop_reason"] = "error"
         self._save(state)
-        return self._summary(state, "error", False)
+        return self._summary(state, "error", False, http_status=http_status)
 
-    def _on_backoff(self, state: dict, now: float, outcome: str) -> dict:
+    def _on_backoff(
+        self, state: dict, now: float, outcome: str, http_status=None, error_category=None
+    ) -> dict:
         index = int(state.get("backoff_index", 0))
         delay = _BACKOFF_SECONDS[index] if index < len(_BACKOFF_SECONDS) else _BACKOFF_SECONDS[-1]
         state["retry_at"] = now + delay
         state["backoff_index"] = index + 1
         self._save(state)
-        summary = self._summary(state, outcome, False)
-        summary["retry_after"] = delay
-        return summary
+        return self._summary(
+            state,
+            outcome,
+            False,
+            http_status=http_status,
+            retry_after=delay,
+            error_category=error_category,
+        )
 
-    def _summary(self, state: dict, outcome: str, verified: bool, reason=None) -> dict:
+    def _summary(
+        self,
+        state: dict,
+        outcome: str,
+        verified: bool,
+        reason=None,
+        reward_credits=None,
+        http_status=None,
+        retry_after=None,
+        error_category=None,
+    ) -> dict:
         result = {
             "outcome": outcome,
             "verified": bool(verified),
@@ -314,6 +386,14 @@ class SigninScheduler:
         }
         if reason is not None:
             result["reason"] = reason
+        if is_finite_number(reward_credits) and reward_credits >= 0:
+            result["reward_credits"] = reward_credits
+        if isinstance(http_status, int) and not isinstance(http_status, bool):
+            result["http_status"] = http_status
+        if is_finite_number(retry_after) and retry_after > 0:
+            result["retry_after"] = retry_after
+        if error_category in _SAFE_ERROR_CATEGORIES:
+            result["error_category"] = error_category
         state["last_result"] = result
         self._save(state)
         return dict(result)

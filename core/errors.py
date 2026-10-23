@@ -12,19 +12,28 @@ class WorkBuddyError(Exception):
     """Base class for every error raised by this plugin."""
 
 
+# The only rate-limit scopes this plugin understands; anything else is dropped
+# rather than carried around as free-form upstream text.
+_LIMIT_SCOPES = ("account", "ip", "model")
+
+
 class UpstreamError(WorkBuddyError):
     """An upstream call failed.
 
     ``status`` is the HTTP status (``200`` when the envelope carried a non-zero
     business ``code``).  ``code`` is the business code when the body supplied
     one, else ``None``.  ``retry_after`` is the parsed ``Retry-After`` value in
-    seconds for a 429 (else ``None``).  The body itself is not retained.
+    seconds for a 429 (else ``None``).  ``limit_scope`` is the optional
+    rate-limit scope reported by the upstream and is limited to
+    ``"account"`` / ``"ip"`` / ``"model"`` (anything else becomes ``None``).
+    The body itself is not retained.
     """
 
-    def __init__(self, status, code=None, retry_after=None):
+    def __init__(self, status, code=None, retry_after=None, limit_scope=None):
         self.status = status
         self.code = code
         self.retry_after = retry_after
+        self.limit_scope = limit_scope if limit_scope in _LIMIT_SCOPES else None
         parts = ["upstream error (status={}".format(status)]
         if code is not None:
             parts.append(", code={}".format(code))

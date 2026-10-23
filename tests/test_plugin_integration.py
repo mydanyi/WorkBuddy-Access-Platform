@@ -842,6 +842,10 @@ class _PluginIntegrationTestCase(unittest.IsolatedAsyncioTestCase):
         before = self._credentials_blob()
         plugin = await self._make_plugin(**self._make_ready_plugin_config())
         self.assertTrue(plugin.ready)
+        # An authenticated startup reads the model catalog once for the native
+        # picker; that single read is the baseline the rejected commands must
+        # not extend.
+        reads_before = self.up.extra_hits
 
         rejected = [
             _make_event("wb login", admin=True, private=False),
@@ -857,7 +861,7 @@ class _PluginIntegrationTestCase(unittest.IsolatedAsyncioTestCase):
 
         # No upstream action was triggered at all, and credentials are untouched.
         self.assertEqual(self.up.hits[("POST", STATE_PATH)], 0)
-        self.assertEqual(self.up.extra_hits, 0)
+        self.assertEqual(self.up.extra_hits, reads_before)
         self.assertEqual(self._credentials_blob(), before)
 
         # help / status must not leak the key or raw credential state.
@@ -1218,6 +1222,10 @@ class _PluginIntegrationTestCase(unittest.IsolatedAsyncioTestCase):
         ]
         plugin = await self._make_plugin(**self._off_growth())
         self.assertTrue(plugin.ready)
+        # The authenticated startup already performed exactly one catalog read
+        # (plus its /v3/config supplement) for the native model picker.
+        catalog_reads = self.up.hits[("GET", MODELS_CATALOG_PATH)]
+        v3_reads = self.up.hits[("GET", V3_CONFIG_PATH)]
 
         text = _text_of(await _invoke(plugin.wb, _make_event("wb status"), "status", ""))
 
@@ -1231,9 +1239,10 @@ class _PluginIntegrationTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertIn("0/1", text)             # 任务进度
         self.assertIn("已领取", text)
 
-        # Read-only overview: model catalog / config / balance / tasks, once each.
-        self.assertEqual(self.up.hits[("GET", MODELS_CATALOG_PATH)], 1)
-        self.assertEqual(self.up.hits[("GET", V3_CONFIG_PATH)], 1)
+        # Read-only overview: model catalog / config / balance / tasks, once each
+        # (the overview adds exactly one read on top of the startup read).
+        self.assertEqual(self.up.hits[("GET", MODELS_CATALOG_PATH)], catalog_reads + 1)
+        self.assertEqual(self.up.hits[("GET", V3_CONFIG_PATH)], v3_reads + 1)
         self.assertEqual(self.up.hits[("POST", BALANCE_PATH)], 1)
         self.assertEqual(self.up.hits[("GET", GROWTH_LIST_PATH)], 1)
         # No side-effecting route is ever touched.

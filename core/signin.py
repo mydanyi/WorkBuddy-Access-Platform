@@ -14,6 +14,18 @@ Guarantees:
   so its ``Retry-After`` hint survives; ``10001``/``14001`` business errors are
   re-checked the same way before any outcome is reported.
 * 401/403 from the claim are re-raised, never swallowed by the re-check.
+* A handled claim failure that a re-check still cannot confirm keeps its source
+  as a fixed, leak-free ``error_category`` (``network`` for a 5xx/transport
+  failure, ``upstream`` for a business error) so the same fault can be
+  de-duplicated downstream; a signature that a re-check confirms never carries a
+  failure category.
+* ``reward_credits`` is attached **only** when a fresh claim returned a usable
+  ``credit`` (a finite, non-negative ``int``/``float``; ``bool`` excluded, ``0``
+  kept) *and* the follow-up status read confirmed a signature.  Only the
+  ``credit`` field is trusted -- ``reward``/``points``/``token`` and any other
+  raw upstream field are never echoed.  ``already_signed``, a signature that was
+  only confirmed by a re-check after a failed claim, and an unconfirmed round
+  never report a reward.
 * No network retries happen here -- per-day cross-round retry is a higher-layer
   scheduling concern, not a client concern.
 """
@@ -24,6 +36,7 @@ import asyncio
 
 import aiohttp
 
+from .credits import is_finite_number
 from .errors import UpstreamError
 
 CHECKIN_STATUS_PATH = "/v2/billing/meter/checkin-activity-status"
@@ -52,7 +65,7 @@ class SigninService:
             return {"outcome": "unknown", "verified": False}
 
         try:
-            await self._client.request_json(
+            claim = await self._client.request_json(
                 "POST", CHECKIN_CLAIM_PATH, base=self._client.billing_base, json={}
             )
         except UpstreamError as exc:
@@ -63,32 +76,68 @@ class SigninService:
                 # signature; never swallow the retry hint.
                 return await self._recheck_after_failed_claim(exc)
             if exc.status == 200 and exc.code not in _RECHECK_CODES:
-                # Envelope business error: claim did not succeed, do not double-claim.
-                return {"outcome": "unconfirmed", "verified": False}
-            return await self._recheck_after_failed_claim()
+                # Envelope business error: claim did not succeed, do not
+                # double-claim.  Preserve the source as a fixed category so the
+                # same failure merges with the client's own observation.
+                return {
+                    "outcome": "unconfirmed",
+                    "verified": False,
+                    "error_category": "upstream",
+                }
+            # Any other handled failure keeps its fixed, safe category so a
+            # re-check that still cannot confirm stays attributable.
+            category = (
+                "network"
+                if isinstance(exc.status, int) and exc.status >= 500
+                else "upstream"
+            )
+            return await self._recheck_after_failed_claim(error_category=category)
         except (aiohttp.ClientError, asyncio.TimeoutError, TimeoutError):
-            return await self._recheck_after_failed_claim()
+            return await self._recheck_after_failed_claim(error_category="network")
 
-        return await self._verify_after_claim()
+        # The claim's own payload is the only source of an attributable reward.
+        return await self._verify_after_claim(claim)
 
     async def _status(self) -> dict:
         return await self._client.request_json(
             "POST", CHECKIN_STATUS_PATH, base=self._client.billing_base, json={}
         )
 
-    async def _recheck_after_failed_claim(self, original=None) -> dict:
+    async def _recheck_after_failed_claim(self, original=None, error_category=None) -> dict:
         status = await self._status()
         if self._is_signed(status):
             return {"outcome": "already_signed", "verified": True}
         if original is not None:
             raise original
-        return {"outcome": "unconfirmed", "verified": False}
+        result = {"outcome": "unconfirmed", "verified": False}
+        if error_category is not None:
+            result["error_category"] = error_category
+        return result
 
-    async def _verify_after_claim(self) -> dict:
+    async def _verify_after_claim(self, claim=None) -> dict:
         status = await self._status()
         if self._is_signed(status):
-            return {"outcome": "signed", "verified": True}
+            result = {"outcome": "signed", "verified": True}
+            credit = self._claim_reward(claim)
+            if credit is not None:
+                result["reward_credits"] = credit
+            return result
         return {"outcome": "unconfirmed", "verified": False}
+
+    @staticmethod
+    def _claim_reward(claim):
+        """Return the claim's usable non-negative finite ``credit`` or ``None``.
+
+        Only the ``credit`` field is ever trusted; ``reward``/``points``/``token``
+        and every other raw upstream field are deliberately ignored.  A whole
+        ``0`` is a real (free) reward and is kept, never treated as "missing".
+        """
+        if not isinstance(claim, dict):
+            return None
+        value = claim.get("credit")
+        if is_finite_number(value) and value >= 0:
+            return value
+        return None
 
     @staticmethod
     def _is_signed(status) -> bool:

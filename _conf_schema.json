@@ -33,25 +33,83 @@
         "type": "int",
         "default": 1,
         "description": "并发上限",
-        "hint": "同时处理的聊天请求数上限，默认 1。"
+        "hint": "本地策略初始值：同时处理的聊天请求数上限，默认 1。这是插件自身的本地并发限制，不是官方配额，也不是对你账号实测容量的结论，可按需要自行调整。"
       },
       "rpm": {
         "type": "int",
         "default": 6,
         "description": "每分钟请求上限",
-        "hint": "与成长任务共享同一预算，默认 6。"
+        "hint": "本地策略初始值：与成长任务共享的每分钟请求上限，默认 6。这是插件自身的本地限速策略，不代表上游账号的真实额度，调大它不能提升上游限制。"
       },
       "queue_size": {
         "type": "int",
         "default": 2,
         "description": "等待队列长度",
-        "hint": "并发已满时最多排队数，默认 2。"
+        "hint": "本地策略初始值：并发已满时最多排队数，默认 2。"
       },
       "queue_timeout": {
         "type": "int",
         "default": 30,
         "description": "排队等待超时（秒）",
-        "hint": "排队超过该秒数返回 429，默认 30。"
+        "hint": "本地策略初始值：排队超过该秒数返回 429，默认 30。"
+      },
+      "max_request_body_mb": {
+        "type": "int",
+        "default": 16,
+        "description": "请求体大小上限（MiB）",
+        "hint": "本地请求体上限：单个聊天请求体的最大字节数（按 1 MiB = 1024 × 1024 字节计算），默认 16 MiB，且必须为正整数。这是插件侧的本地限制，不是上游服务的容量或官方额度。超出时直接返回 413，不会进入排队、不会占用并发或每分钟额度，也不会访问上游；遇到超限请缩减历史消息、工具定义或图片内容，或调大本项后重试。"
+      }
+    }
+  },
+  "routing": {
+    "type": "object",
+    "description": "按顺序调用模型",
+    "hint": "在模型列表中额外选择一个虚拟模型“按顺序调用”：第一项为主用，其余为备用，严格按列表顺序依次尝试；主用可用时不会用到备用。",
+    "items": {
+      "enabled": {
+        "type": "bool",
+        "default": false,
+        "description": "启用按顺序调用",
+        "hint": "默认关闭；关闭后虚拟入口“按顺序调用”直接报错，普通模型 ID 的请求不受影响。"
+      },
+      "models": {
+        "type": "list",
+        "default": [],
+        "options": [],
+        "labels": [],
+        "description": "模型顺序列表",
+        "hint": "候选来自你的 WorkBuddy 账号实时模型目录，选项是纯模型 ID，标签显示当前倍率与优惠。第一次使用请先在管理员私聊执行 /wb login，然后重新打开本配置页；之后执行 /wb models，或在提供商里“获取模型列表”，都会刷新候选，刷新后同样需要重新打开本配置页才能看到。列表中第一项为主用，其余依次为备用，严格按列表顺序尝试；顺序即优先级，取消后重新选中会把该项追加到末尾。启用时至少选择一项，且不能重复。已保存但当前目录中查不到的模型会标记为未确认并保留，不会被自动删除。"
+      },
+      "cooldown_seconds": {
+        "type": "int",
+        "default": 60,
+        "description": "失败冷却（秒）",
+        "hint": "某个模型返回 429/502/503/504 后暂停使用的秒数，默认 60；上游给出 Retry-After 时优先采用该值。"
+      },
+      "first_frame_timeout": {
+        "type": "int",
+        "default": 90,
+        "description": "首帧超时（秒）",
+        "hint": "本轮从开始到收到第一帧数据的最长等待秒数，默认 90；超时直接失败，不再切换备用。"
+      }
+    }
+  },
+  "model_refresh": {
+    "type": "object",
+    "description": "模型自动刷新",
+    "hint": "按本插件自己的本地轮询策略，定时重新读取你账号的模型目录，用来更新「模型顺序列表」的候选与倍率标签。它是插件侧的本地方案，不是官方配额、容量或限流结论；调小间隔只增加本地读取次数。关闭后仅停止这次定时读取，启动时的首次读取、登录成功后的读取以及 /wb models、「获取模型列表」等手动获取都不受影响。刷新后需要重新打开本配置页才能看到新的候选和标签；插件不会自动改写你已保存的顺序，也不会自动改写 AstrBot 提供商里的模型设置。",
+    "items": {
+      "enabled": {
+        "type": "bool",
+        "default": true,
+        "description": "启用模型自动刷新",
+        "hint": "仅控制定时刷新；关闭后初始读取、登录后读取与手动获取仍然有效，已保存的模型和主备顺序保持不变。"
+      },
+      "interval_minutes": {
+        "type": "int",
+        "default": 60,
+        "description": "刷新间隔（分钟）",
+        "hint": "相邻两次定时刷新的间隔，默认 60 分钟，必须为正整数。这是本地轮询策略，不是官方额度；读取失败时保留上一次成功的候选，不追加频繁重试。"
       }
     }
   },
@@ -218,6 +276,49 @@
         "default": 120,
         "description": "读取超时（秒）",
         "hint": "默认 120。"
+      }
+    }
+  },
+  "notifications": {
+    "type": "object",
+    "description": "管理员通知",
+    "hint": "通过 AstrBot 的 QQ（aiocqhttp）适配器，主动私聊提醒管理员签到结果与异常；默认关闭。",
+    "items": {
+      "enabled": {
+        "type": "bool",
+        "default": false,
+        "description": "启用管理员通知",
+        "hint": "总开关，默认关闭；关闭后不发送任何通知，也不查询余额。"
+      },
+      "signin_success": {
+        "type": "bool",
+        "default": true,
+        "description": "通知签到成功",
+        "hint": "每日签到成功后通知一次（含每日已签到）；已领取积分与当前可用总积分分别列出。"
+      },
+      "errors": {
+        "type": "bool",
+        "default": true,
+        "description": "通知异常",
+        "hint": "发生已知类别异常时通知管理员；同类异常在提醒间隔内只提醒一次。"
+      },
+      "admin_qq": {
+        "type": "string",
+        "default": "",
+        "description": "接收管理员QQ",
+        "hint": "接收通知的管理员 QQ 号，仅填纯数字。留空则不发送（其它功能不受影响）。"
+      },
+      "platform_id": {
+        "type": "string",
+        "default": "",
+        "description": "发送QQ机器人实例ID",
+        "hint": "用于发送的 QQ（aiocqhttp）机器人实例ID；只有一个 QQ 实例时可留空自动选择，多个实例时必须填写。"
+      },
+      "error_cooldown_seconds": {
+        "type": "int",
+        "default": 1800,
+        "description": "同类异常提醒间隔（秒）",
+        "hint": "同类异常在该秒数内只提醒一次，取值范围 60..86400，默认 1800。"
       }
     }
   }

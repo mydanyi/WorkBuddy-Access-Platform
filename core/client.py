@@ -13,8 +13,10 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import inspect
 import secrets
 from contextlib import asynccontextmanager
+from contextvars import ContextVar
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
@@ -30,13 +32,83 @@ from .credits import (
     promotion_note,
     select_promotion,
 )
-from .errors import UpstreamError
+from .errors import ChatStreamError, UpstreamError
+
+# Network/timeout failures collapsed into one observation category.
+_NETWORK_ERRORS = (aiohttp.ClientError, asyncio.TimeoutError, TimeoutError)
+
+
+def _observe_category(status=None, exc=None) -> str:
+    """Map a final failure to a fixed, leak-free observation category.
+
+    Never inspects the response body, URL, token or business ``code``; only the
+    HTTP status and the exception *class* matter.  A ``401`` that still failed
+    after the one refresh is ``auth``; ``403`` is ``permission``; ``429`` is
+    ``rate``; ``5xx`` / missing status / network / timeout are ``network``;
+    every other ``UpstreamError`` or a ``ChatStreamError`` is ``upstream``.
+    """
+    if isinstance(exc, ChatStreamError):
+        return "upstream"
+    if isinstance(exc, _NETWORK_ERRORS):
+        return "network"
+    if isinstance(exc, UpstreamError):
+        status = exc.status
+    elif exc is not None:
+        return "upstream"
+    if status == 401:
+        return "auth"
+    if status == 403:
+        return "permission"
+    if status == 429:
+        return "rate"
+    if status is None or (isinstance(status, int) and status >= 500):
+        return "network"
+    return "upstream"
 
 MODELS_PATH = "/console/enterprises/personal/models"
 BALANCE_PATH = "/v2/billing/meter/get-user-resource"
 CHECKIN_STATUS_PATH = "/v2/billing/meter/checkin-activity-status"
 CHECKIN_CLAIM_PATH = "/v2/billing/meter/daily-checkin"
 CHAT_PATH = "/v2/chat/completions"
+
+# The documented request-source keys handed to the error observer.  They are
+# fixed literals: a source never carries a URL, a payload, a token or any free
+# exception text, so nothing sensitive can leak through the notification layer.
+SOURCE_CHAT = "chat"
+SOURCE_MODELS = "models"
+SOURCE_BALANCE = "balance"
+SOURCE_SIGNIN = "signin"
+SOURCE_GROWTH = "growth"
+SOURCE_API = "api"
+
+# Fixed growth endpoints (kept as literals so this module never imports the
+# growth service; only the mapping matters here).
+_GROWTH_PATH_PREFIXES = ("/v2/activity/growth/", "/activity/growth/")
+_GROWTH_PATHS = (
+    "/v2/report",
+    "/v2/user-asset/appearance/set",
+    "/activity/growth/buddy/agreement",
+    "/activity/growth/buddy/first",
+)
+
+
+def _source_for_path(path) -> str:
+    """Map one fixed request path to its documented source key.
+
+    Only the module's own pinned path constants are compared; an unknown path is
+    the generic ``api`` source.  No URL, query or payload is ever inspected.
+    """
+    if not isinstance(path, str):
+        return SOURCE_API
+    if path in (MODELS_PATH, V3_CONFIG_PATH):
+        return SOURCE_MODELS
+    if path == BALANCE_PATH:
+        return SOURCE_BALANCE
+    if path in (CHECKIN_STATUS_PATH, CHECKIN_CLAIM_PATH):
+        return SOURCE_SIGNIN
+    if path in _GROWTH_PATHS or path.startswith(_GROWTH_PATH_PREFIXES):
+        return SOURCE_GROWTH
+    return SOURCE_API
 
 # Pinned WorkBuddy desktop client version (``X-IDE-Version`` / UA).
 _CHAT_CLIENT_VERSION = "5.5.4"
@@ -159,20 +231,81 @@ _MIN_CHAT_MAX_OUTPUT_TOKENS = 256
 class UpstreamClient:
     """Thin authenticated JSON client.  Owns no credentials of its own."""
 
-    def __init__(self, session, manager, *, chat_base, billing_base=None, web_base=None):
+    def __init__(
+        self,
+        session,
+        manager,
+        *,
+        chat_base,
+        billing_base=None,
+        web_base=None,
+        on_error=None,
+        on_models=None,
+    ):
         self._session = session
         self._manager = manager
         self.chat_base = chat_base.rstrip("/")
         self.billing_base = (billing_base or chat_base).rstrip("/")
         self.web_base = (web_base or chat_base).rstrip("/")
+        # Optional observer: called with one fixed category string (sync/async).
+        self._on_error = on_error
+        # Optional observer: called once with the successful model details
+        # (sync/async) so a consumer can publish the live catalog.  It never
+        # runs for a failed enterprise read, is never given a second argument,
+        # and never adds a request of its own.
+        self._on_models = on_models
+        # Per-instance, read-only request source.  It is set only while the
+        # observer runs and restored immediately afterwards, so a queued task
+        # can never read a stale value from another request.
+        self._error_source = ContextVar("workbuddy_error_source", default=None)
 
     @property
     def credentials(self) -> dict:
         return self._manager.credentials
 
     @property
+    def error_source(self):
+        """The documented source key of the failure currently being observed.
+
+        Read-only: ``chat`` / ``models`` / ``balance`` / ``signin`` / ``growth``
+        / ``api`` while the ``on_error`` callback runs, ``None`` otherwise.
+        """
+        return self._error_source.get()
+
+    @property
     def manager(self):
         return self._manager
+
+    async def _invoke(self, callback, *args) -> None:
+        """Run a sync/async observer without letting it affect the request.
+
+        A regular exception from the observer is swallowed; a ``CancelledError``
+        is always re-raised so cancellation keeps propagating.
+        """
+        try:
+            outcome = callback(*args)
+            if inspect.isawaitable(outcome):
+                await outcome
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - the observer must never change the request
+            pass
+
+    async def _notify_error(self, exc, *, observed=True, status=None, source=None) -> None:
+        """Report one fixed category for an authenticated request failure.
+
+        The fixed ``source`` key is scoped to the observer call itself through a
+        per-instance context variable: it is set right before the callback and
+        restored in ``finally``, so the callback's single-argument ``category``
+        contract is unchanged and no global mute / global state is involved.
+        """
+        if not observed or self._on_error is None:
+            return
+        token = self._error_source.set(source)
+        try:
+            await self._invoke(self._on_error, _observe_category(status=status, exc=exc))
+        finally:
+            self._error_source.reset(token)
 
     def _base_for(self, path: str, base) -> str:
         if base:
@@ -268,6 +401,28 @@ class UpstreamClient:
         return headers
 
     async def request_json(self, method, path, *, base=None, json=None, headers=None, auth=True):
+        """Public wrapper: observe the final failure of an authenticated call.
+
+        The request contract is entirely owned by :meth:`_request_json`; this
+        wrapper only reports one fixed category for an authenticated request that
+        carried a login ``accessToken`` and ultimately failed.  A successful
+        refresh never reports, and an unauthenticated call never reports.  The
+        fixed source key is derived from the pinned path constant only.
+        """
+        observed = bool(auth and self.credentials.get("accessToken"))
+        try:
+            return await self._request_json(
+                method, path, base=base, json=json, headers=headers, auth=auth
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - re-raised unchanged after observing
+            await self._notify_error(
+                exc, observed=observed, source=_source_for_path(path)
+            )
+            raise
+
+    async def _request_json(self, method, path, *, base=None, json=None, headers=None, auth=True):
         """Perform one request, refresh-and-resend once on 401, return ``data``."""
         url = self._base_for(path, base) + path
         token = self.credentials.get("accessToken") if auth else None
@@ -415,6 +570,11 @@ class UpstreamClient:
         metadata in place.  Each entry carries the raw base ``credits`` (number
         or ``None``), its canonical ``effective_credits`` string, and the active
         promotion's ``promo_label`` / ``promo_note`` (``""`` when none applies).
+
+        A successful call hands the finished list to the optional ``on_models``
+        observer exactly once (through :meth:`_invoke`, so a regular observer
+        error is isolated and cancellation still propagates).  No extra request
+        is made for it, and a failed read never invokes it.
         """
         data = await self.request_json("GET", MODELS_PATH)
         entries = self._select_chat_entries(data)
@@ -470,6 +630,10 @@ class UpstreamClient:
                     "promo_note": note,
                 }
             )
+        # Publish the finished catalog once; the observer owns no request and
+        # cannot change what this call returns.
+        if self._on_models is not None:
+            await self._invoke(self._on_models, details)
         return details
 
     async def balance(self) -> dict:
@@ -549,7 +713,56 @@ class UpstreamClient:
         )
 
     @asynccontextmanager
-    async def chat_stream(self, payload=None, *, base=None, headers=None):
+    async def chat_stream(
+        self,
+        payload=None,
+        *,
+        base=None,
+        headers=None,
+        before_post=None,
+        observe_errors=True,
+    ):
+        """Public wrapper: observe the final, un-rescued chat failure.
+
+        The response/refresh/release contract is owned by :meth:`_chat_stream`.
+        Only an authenticated request that carried a login ``accessToken`` and
+        finally failed is reported: an un-rescued ``HTTP >= 400`` response, an
+        ``UpstreamError`` / ``ChatStreamError``, or a network/timeout failure.
+        At most one report is emitted per call, and ``CancelledError`` always
+        propagates without being observed.
+
+        ``before_post`` is awaited right before every real chat POST (the first
+        attempt and the one resend after a 401 refresh), so a shared budget can
+        count an actual attempt; the token refresh itself is never counted.
+        ``observe_errors=False`` silences the observation for *this* call only
+        (a routed standby attempt that is expected to be absorbed) -- the shared
+        ``on_error`` observer and every other request stay untouched.  The
+        reported source is always the fixed ``chat`` key.
+        """
+        observed = bool(observe_errors and self.credentials.get("accessToken"))
+        reported = False
+        try:
+            async with self._chat_stream(
+                payload, base=base, headers=headers, before_post=before_post
+            ) as resp:
+                status = getattr(resp, "status", None)
+                if observed and isinstance(status, int) and status >= 400:
+                    reported = True
+                    await self._notify_error(
+                        None, observed=True, status=status, source=SOURCE_CHAT
+                    )
+                yield resp
+        except asyncio.CancelledError:
+            raise
+        except (UpstreamError, ChatStreamError) + _NETWORK_ERRORS as exc:
+            if not reported:
+                await self._notify_error(exc, observed=observed, source=SOURCE_CHAT)
+            raise
+
+    @asynccontextmanager
+    async def _chat_stream(
+        self, payload=None, *, base=None, headers=None, before_post=None
+    ):
         """Open an upstream chat completion response, refreshing once on 401.
 
         The upstream speaks SSE; ``core.chat`` forces ``stream: true``.  A 401
@@ -558,9 +771,16 @@ class UpstreamClient:
         caller to interpret.  The response is always released, including when
         the body is cancelled or the client disconnects.  ``X-Refresh-Token`` is
         never part of the chat headers.
+
+        ``before_post`` (optional, awaitable) runs immediately before each real
+        chat POST -- the first attempt and the resend after the refresh -- and
+        its failure aborts the call without sending anything; the refresh call
+        itself is not a chat attempt and is never counted.
         """
         url = self._base_for(CHAT_PATH, base) + CHAT_PATH
         token = self.credentials.get("accessToken")
+        if before_post is not None:
+            await before_post()
         resp = await self._session.post(
             url,
             json=payload,
@@ -577,6 +797,8 @@ class UpstreamClient:
                     # Refresh did not rescue the call: keep the auth failure visible.
                     raise UpstreamError(401, None) from None
                 token = self.credentials.get("accessToken")
+                if before_post is not None:
+                    await before_post()
                 resp = await self._session.post(
                     url,
                     json=payload,

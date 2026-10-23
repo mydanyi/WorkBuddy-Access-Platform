@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import inspect
 import secrets
 from datetime import datetime
 from urllib.parse import quote
@@ -115,6 +116,7 @@ class GrowthService:
         allow_telemetry=True,
         allow_theme_change=False,
         allow_adoption=False,
+        on_result=None,
     ):
         self._client = client
         self._chat = chat
@@ -131,6 +133,9 @@ class GrowthService:
         self._allow_telemetry = bool(allow_telemetry)
         self._allow_theme_change = bool(allow_theme_change)
         self._allow_adoption = bool(allow_adoption)
+        # Optional observer: called once with a safe summary (sync/async) after a
+        # real run finishes; never on a busy reject or a cancellation.
+        self._on_result = on_result
 
         self._busy = False
         self._cancelled = False
@@ -318,7 +323,29 @@ class GrowthService:
                 result["needs_attention"] or self._blocked() or result["unconfirmed"]
             )
             self._finish_run(result)
+        # 真实 _run 自然结束（未 busy 拒绝、未取消）后安全发一次摘要。
+        # 前台 run 与 start 后台都经 _run，故这里一个回调点即可。
+        await self._emit_result(result)
         return result
+
+    async def _emit_result(self, result: dict) -> None:
+        """Send one safe summary after a completed run; never leaks raw data."""
+        if self._on_result is None:
+            return
+        summary = {
+            "needs_attention": bool(result.get("needs_attention")),
+            "status": result.get("status"),
+            "code": result.get("code"),
+            "has_unconfirmed": bool(result.get("unconfirmed")),
+        }
+        try:
+            outcome = self._on_result(summary)
+            if inspect.isawaitable(outcome):
+                await outcome
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - the observer must never change the run result
+            pass
 
     async def _sleep_interval(self) -> None:
         if self._task_interval <= 0:
