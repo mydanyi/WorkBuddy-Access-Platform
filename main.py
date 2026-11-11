@@ -35,6 +35,7 @@ from .core.acp import (
     AcpTimeoutError,
     CliCredentials,
     default_argv,
+    default_env,
 )
 from .core.client import UpstreamClient
 from .core.config import ConfigError, load_settings
@@ -165,7 +166,15 @@ class WorkBuddyPlugin(Star):
             max_processes=acp["max_processes"],
             primary_model=acp["model"] or None,
         )
-        self.catalog = ModelCatalog(acp["cli_path"])
+        # 清单探针必须与聊天进程跑在同一套环境里：``codebuddy --help`` 会带上配置
+        # 目录里的自定义模型（``custom-local:``），探针若继承宿主 env，就会和聊天进程
+        # 报出两份不一样的清单。``config_path`` 同理——不给路径，``models.json`` 那条
+        # 回退永远是死代码：``_from_config`` 见到空路径直接返回空。
+        self.catalog = ModelCatalog(
+            acp["cli_path"],
+            config_path=self._models_path(),
+            env=default_env(config_dir=self._config_dir(), home_dir=self._home_dir()),
+        )
 
         # The ordered primary / standby route is a purely local decision layer
         # over the validated settings and the shared state store.  It is built
@@ -283,6 +292,16 @@ class WorkBuddyPlugin(Star):
         if not self.data_dir:
             return None
         return os.path.join(self.data_dir, "cli-home")
+
+    def _models_path(self):
+        """CLI 自己的模型清单文件（``--help`` 读不到时的回退来源）。
+
+        CLI 读的是 ``<配置目录>/models.json``（CLI 2.182.0 的产物里就是这个相对路径）。
+        配置目录由插件指定，所以这里能算准；算不出来时返回 ``None``，回退分支就按
+        "没这个文件"处理，而不是去读一个猜出来的路径。
+        """
+        config_dir = self._config_dir()
+        return None if config_dir is None else os.path.join(config_dir, "models.json")
 
     async def _build_gateway(self) -> None:
         s = self._settings["gateway"]

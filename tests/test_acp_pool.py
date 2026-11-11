@@ -62,6 +62,17 @@ class _FakeRuntime:
     async def logout(self, *, purge_config=False):
         self.logouts.append(purge_config)
 
+    def note_session_ok(self):
+        self.auth_state = True
+
+    def note_auth_failure(self):
+        self.auth_state = False
+
+    def note_logged_out(self):
+        """真运行时靠它把"凭据已删"和"这一轮撞了 401"分开记。"""
+        self.logged_out = getattr(self, "logged_out", 0) + 1
+        self.auth_state = False
+
 
 def _start(*runtimes):
     """把这几条标成"进程真的起来了"——池的 running 视图只看这个。"""
@@ -266,9 +277,12 @@ class TrimTests(_PoolCase):
                 )
                 self.assertEqual(alpha.shutdowns, 0)
                 self.assertEqual(beta.shutdowns, 0)
-        # 占用放开之后，下一次 trim 就能收掉。
-        self.assertEqual(await pool.trim(), 1)
-        self.assertEqual(alpha.shutdowns + beta.shutdowns, 1)
+        # 最后一条放开的那一刻就收掉了，不用等谁再来 trim 一次。
+        self.assertEqual(
+            alpha.shutdowns + beta.shutdowns, 1, "两条都放开之后只留一条"
+        )
+        self.assertEqual(len(pool.status()["running"]), 1, "回到上限以内")
+        self.assertEqual(await pool.trim(), 0, "已经在上限内，没有可收的")
 
     async def test_entering_a_lease_trims_the_idle_runtimes_first(self):
         pool = self.make_pool(max_processes=1)

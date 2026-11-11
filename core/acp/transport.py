@@ -267,16 +267,20 @@ class AcpTransport:
         payload = {"jsonrpc": JSONRPC_VERSION, "id": request_id, "method": method}
         if params is not None:
             payload["params"] = params
-        try:
+
+        async def round_trip():
             await self._send(payload)
-        except BaseException:
-            self._pending.pop(request_id, None)
-            raise
+            return await future
 
         try:
             if timeout is None:
-                return await future
-            return await asyncio.wait_for(future, timeout)
+                return await round_trip()
+            # 发送与等待共用一个期限。只给响应 future 设超时是不够的：CLI 不读
+            # stdin 时 ``drain()`` 会一直挂着——大 prompt 一旦超过管道缓冲，请求就
+            # 永远卡在发送这一步，连后端那个 600 秒的 prompt 超时都够不着它，并发
+            # 名额被长期占死。两段各自限时的叠法会凭空放大总预算，所以用一个
+            # ``wait_for`` 把整趟往返包住。
+            return await asyncio.wait_for(round_trip(), timeout)
         except (asyncio.TimeoutError, TimeoutError):
             raise AcpTimeoutError("acp request timed out") from None
         finally:

@@ -185,6 +185,11 @@ class AcpRuntimePool:
                 )
             if remaining == 0:
                 self._busy.pop(key, None)
+                # 释放之后再收一次：并发冷启动会让两条进程同时越过限额（谁都不空闲，
+                # trim 当时挑不出牺牲者），等它们陆续结束，这里才是真正能收的时候。
+                # 没超额时这一步只看一眼列表就返回，不 spawn、不关任何东西。
+                with contextlib.suppress(Exception):
+                    await self.trim()
             else:
                 self._busy[key] = remaining
 
@@ -210,16 +215,27 @@ class AcpRuntimePool:
         try:
             await self.close_all()
             await self.primary.logout(purge_config=purge_config)
+            if purge_config:
+                # 登录态是**每条**运行时各记一份的，成功聊过一轮的备用模型会是 True。
+                # 只更新主运行时的话，凭据已经删干净、网关也停了，而
+                # ``auth_state`` 因为"有一条 True"仍然报告已登录。
+                for runtime in list(self._runtimes.values()):
+                    runtime.note_logged_out()
         finally:
             self._logging_out = False
 
     # -- 回收 ---------------------------------------------------------------
 
     async def trim(self) -> int:
-        """把已启动的空闲进程收到上限以内，返回真正关掉的条数。
+        """把空闲进程收到上限以内，返回真正关掉的条数。
 
         选"最久未用的空闲进程"淘汰。挑不到（全在忙）就停手：宁可暂时超额，也不动
         正在出字的进程。主运行时永不淘汰。
+
+        **占位算的是"起来的 + 正在被领取的"。** 只数 ``runtime.started`` 会漏掉窗口：
+        ``lease`` 里先 ``trim`` 再交给调用方，而进程是调用方稍后
+        ``ensure_started()`` 才拉起来的。只数已启动的话，"先领 A 再领 B"两次都能通过
+        限额检查，最后两条进程一起活着；释放时又没人收，上限形同虚设。
 
         返回值只数**关成功**的：``shutdown()`` 抛异常的那条算没关掉，少报一条总比
         报一条假的强。
@@ -227,17 +243,18 @@ class AcpRuntimePool:
         victims = []
         async with self._trim_lock:
             while True:
-                running = [
+                occupied = [
                     model
                     for model, runtime in self._runtimes.items()
-                    if runtime.started
+                    if runtime.started or self._busy.get(model)
                 ]
-                if len(running) <= self._max:
+                if len(occupied) <= self._max:
                     break
                 idle = [
                     model
-                    for model in running
-                    if not self._busy.get(model)
+                    for model in occupied
+                    if self._runtimes[model].started
+                    and not self._busy.get(model)
                     and model != self._primary_model
                 ]
                 if not idle:

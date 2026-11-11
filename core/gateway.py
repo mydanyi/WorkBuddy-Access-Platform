@@ -47,6 +47,7 @@ from aiohttp import web
 from .chat import aggregate_chunks
 from .errors import ChatStreamError, UpstreamError
 from .limits import ConcurrencyGate, LimitExceeded
+from .models import strip_model_alias
 from .routing import ORDERED_MODEL_ID
 
 COMPLETIONS_PATH = "/v1/chat/completions"
@@ -413,10 +414,18 @@ class Gateway:
                 "both 'model' and a non-empty 'messages' list are required",
                 "invalid_request_error",
             )
-        # A plain id passes through untouched: the model *is* the process's
-        # ``--model`` argument, so there is nothing to translate or normalize.
+        # 旧版把倍率拼在模型 ID 后面（``wb-1 [0.11x]``），升级后 Provider 里存着的
+        # 可能还是这种别名。按同一条规则剥掉再往下走：不剥的话，清单非空时它是一个
+        # 本地 400（把升级前的配置直接打死），清单为空时又会带着后缀进 ``--model``。
+        # 剥完往后每一层（路由判断、目录校验、下发）都只见纯 ID。
         payload = dict(payload)
-        model = payload["model"]
+        model = strip_model_alias(payload["model"])
+        if not isinstance(model, str) or not model.strip():
+            return self._json_error(
+                400, "model must be a non-empty string", "invalid_request_error"
+            )
+        model = model.strip()
+        payload["model"] = model
         if model == ORDERED_MODEL_ID:
             if not self._route_enabled():
                 # The virtual id only exists with an enabled route: a fixed local

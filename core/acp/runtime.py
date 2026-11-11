@@ -71,6 +71,36 @@ def default_argv(cli_path="codebuddy", *, tools="", model=None):
     return argv
 
 
+def default_env(*, config_dir=None, home_dir=None, base=None):
+    """子进程的环境：PATH、配置目录、以及被重定向的 HOME 全家。
+
+    抽成公开函数是因为**模型清单的探针进程也要用同一份环境**。清单是
+    ``codebuddy --help`` 打出来的，而 ``--help`` 里那串 ``custom-local:`` 候选来自
+    CLI 的配置目录；聊天进程跑在 ``CODEBUDDY_CONFIG_DIR`` + 重定向后的 ``HOME`` 下，
+    探针却继承宿主的 env，两边就可能报出不同的模型集合——命令说"有 A、B"，聊天却
+    说"A 不认识"。
+
+    ``create_subprocess_exec`` 拿到 ``env`` 就整份替换，不继承父进程，所以 ``base``
+    默认是空的：只给 PATH 兜底，别的一概不带。
+    """
+    env = dict(base) if base else {}
+    env.setdefault("PATH", os.environ.get("PATH", os.defpath))
+    if config_dir:
+        env["CODEBUDDY_CONFIG_DIR"] = config_dir
+    if home_dir:
+        # 凭据不在 CODEBUDDY_CONFIG_DIR 里，而在 ~/.local/share 下，且
+        # XDG_DATA_HOME 对它无效——CLI 直接读 os.homedir()。所以必须改 HOME，
+        # 否则凭据落在镜像层：容器重建就丢，退出登录也删不干净。
+        env["HOME"] = home_dir
+        # Windows 的 os.homedir() 认的是 USERPROFILE，一并给上。
+        env["USERPROFILE"] = home_dir
+        # XDG 那几层跟着走，免得缓存散落到别处（与凭据路径无关）。
+        env["XDG_DATA_HOME"] = os.path.join(home_dir, ".local", "share")
+        env["XDG_CONFIG_HOME"] = os.path.join(home_dir, ".config")
+        env["XDG_CACHE_HOME"] = os.path.join(home_dir, ".cache")
+    return env
+
+
 class AcpRuntime:
     """一条 CLI 进程 + 一个 :class:`AcpClient`，外加登录态与配置目录。"""
 
@@ -93,33 +123,17 @@ class AcpRuntime:
         self._model = model
         self._config_dir = config_dir
         self._home_dir = home_dir
-        self._env = dict(env) if env else {}
 
         if home_dir and not os.path.isabs(home_dir):
             # 相对路径会让 realpath 按父进程 cwd 解析，与子进程实际写入的位置分叉：
             # 删的时候找错地方，还报"已退出登录"。宁可构造失败。
             raise ValueError("home_dir must be an absolute path")
 
-        # 子进程的 env 是整份替换（create_subprocess_exec 不继承父进程的），
-        # 而默认 cli_path 是相对名 "codebuddy"：没有 PATH 就只能靠 os.defpath
-        # 去 /bin:/usr/bin 里碰运气，npm 全局装的 CLI 通常不在那儿。
-        self._env.setdefault("PATH", os.environ.get("PATH", os.defpath))
-
         # 这几个键不用 setdefault：下面拿它们推导"子进程把凭据写在哪"，退出登录
         # 也照着删。调用方再塞一份同名值，就会变成"写的是一处、删的是另一处"。
-        if config_dir:
-            self._env["CODEBUDDY_CONFIG_DIR"] = config_dir
-        if home_dir:
-            # 凭据不在 CODEBUDDY_CONFIG_DIR 里，而在 ~/.local/share 下，且
-            # XDG_DATA_HOME 对它无效——CLI 直接读 os.homedir()。所以必须改 HOME，
-            # 否则凭据落在镜像层：容器重建就丢，退出登录也删不干净。
-            self._env["HOME"] = home_dir
-            # Windows 的 os.homedir() 认的是 USERPROFILE，一并给上。
-            self._env["USERPROFILE"] = home_dir
-            # XDG 那几层跟着走，免得缓存散落到别处（与凭据路径无关）。
-            self._env["XDG_DATA_HOME"] = os.path.join(home_dir, ".local", "share")
-            self._env["XDG_CONFIG_HOME"] = os.path.join(home_dir, ".config")
-            self._env["XDG_CACHE_HOME"] = os.path.join(home_dir, ".cache")
+        self._env = default_env(
+            config_dir=config_dir, home_dir=home_dir, base=env
+        )
         self._request_timeout = request_timeout
         self._login_timeout = login_timeout
 
@@ -325,6 +339,16 @@ class AcpRuntime:
 
     def note_session_ok(self) -> None:
         self._auth_state = True
+
+    def note_logged_out(self) -> None:
+        """登出成功后的统一收口。
+
+        和 :meth:`note_auth_failure` 的状态转换一模一样，但**名字必须分开**：那个
+        说的是"这一轮撞了 401"，这个说的是"凭据已经删掉了"。池子要靠它把**每一条**
+        运行时的登录态一起压成 False——只压主运行时的话，别的模型跑成功过一轮就仍然
+        报 True，``/wb status`` 会在凭据已经删干净之后继续显示"已登录（CLI）"。
+        """
+        self._auth_state = False
 
     # -- 内部 ---------------------------------------------------------------
 

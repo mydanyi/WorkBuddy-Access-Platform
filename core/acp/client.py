@@ -218,12 +218,14 @@ class AcpClient:
                 if item is done_marker:
                     break
                 if item is SESSION_CLOSED:
-                    # 响应可能已经到手，只是 done_marker 还没轮到入队：读循环在
-                    # EOF 分支里是同步关队列的，会抢在 runner 被唤醒之前。先看
-                    # outcome，已经完成就按正常收尾走，别把成功的一轮判成 502。
-                    if outcome.done() and not outcome.cancelled():
-                        break
-                    raise AcpProcessError("acp process exited during prompt")
+                    # EOF 分支里先 ``_fail_pending`` 再关队列：响应已经到手的那一轮，
+                    # ``request`` 的 future 早就带着结果了，只是 runner 还要经过
+                    # ``wait_for`` 的那几跳才能把结果写进 ``outcome``，可能排在这次
+                    # 唤醒之后。当场判死会把一次完整的回答丢成 502，所以这里只收摊、
+                    # 不判决——成功还是失败由下面的 ``await outcome`` 给出。进程真死
+                    # 了的话，``_fail_pending`` 已经把 ``AcpProcessError`` 挂在那个
+                    # future 上，异常照样会冒出来。
+                    break
                 params = item.get("params")
                 update = normalize_update(
                     params.get("update") if isinstance(params, dict) else None

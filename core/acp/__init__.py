@@ -37,6 +37,7 @@ from .runtime import (
     PRODUCT_DATA_DIR,
     AcpRuntime,
     default_argv,
+    default_env,
 )
 from .transport import SESSION_CLOSED, AcpTransport
 
@@ -50,6 +51,7 @@ __all__ = [
     "CliCredentials",
     "map_credentials",
     "default_argv",
+    "default_env",
     "KIND_DONE",
     "SESSION_CLOSED",
     "AcpError",
