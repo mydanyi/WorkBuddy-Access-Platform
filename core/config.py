@@ -11,11 +11,13 @@ Rules pinned by the task:
   pick a port" and is only meaningful for tests);
 * ``signin.timezone`` must be a valid IANA zone and ``primary`` / ``recovery``
   must be ``HH:MM``;
-* the public ``signin.max_attempts`` is capped at 5, and the growth request /
-  retry caps stay bounded;
-* ``routing.models`` is an ordered list of pure upstream ids (this plugin's
-  standard multiplier suffix is stripped), order preserved, no duplicates, no
-  empty entry and an enabled route needs at least one model;
+* the public ``signin.max_attempts`` is capped at 5;
+* ``routing.models`` is an ordered list of pure model ids (any legacy display
+  suffix this plugin used to append is stripped), order preserved, no
+  duplicates, no empty entry and an enabled route needs at least one model;
+* ``acp`` carries the CLI launch contract: a non-empty ``cli_path``, the tool
+  list (``""`` disables every built-in tool), the optional default model and the
+  process cap;
 * a bad value raises a *fixed* error that never echoes the raw setting (so a
   secret-looking value can never leak through a validation log line).
 """
@@ -25,12 +27,15 @@ from __future__ import annotations
 import math
 from zoneinfo import ZoneInfo
 
-from .credits import upstream_model_id
+from .models import strip_model_alias
 from .routing import ORDERED_MODEL_ID
 
 MAX_SIGNIN_ATTEMPTS = 5
-MAX_GROWTH_CHAT_REQUESTS = 100
-MAX_GROWTH_RETRIES = 5
+
+# 同时常驻的 CLI 进程数上限。每条都是一个 Node 运行时，默认给两个：默认模型一条，
+# 外加一个"另一个模型"的口子；再往上算力与内存都不划算。
+DEFAULT_MAX_PROCESSES = 2
+MAX_PROCESSES_CAP = 16
 
 
 class ConfigError(ValueError):
@@ -182,9 +187,9 @@ def _positive_seconds(value, name, default):
 
 
 def _routing_models(value) -> list:
-    """Normalize the ordered model list to pure upstream ids, keeping order.
+    """Normalize the ordered model list to pure model ids, keeping order.
 
-    A display alias loses only this plugin's standard multiplier suffix
+    A legacy value may still carry this plugin's old display suffix
     (``"wb-1 [0.11x · 夜间折扣]"`` -> ``"wb-1"``); a duplicate, an empty entry,
     a non-string entry or the virtual entry itself is rejected with a fixed
     message that never echoes the raw value.
@@ -195,7 +200,7 @@ def _routing_models(value) -> list:
     for item in items:
         if not isinstance(item, str):
             raise ConfigError("配置项 routing.models 只能包含模型 ID 字符串")
-        model = upstream_model_id(item).strip()
+        model = strip_model_alias(item).strip()
         if not model:
             raise ConfigError("配置项 routing.models 不能包含空模型 ID")
         if model == ORDERED_MODEL_ID:
@@ -227,18 +232,46 @@ def _routing(section) -> dict:
     }
 
 
-def _model_refresh(section) -> dict:
-    """The local periodic catalog refresh policy (polling, not an official quota).
+def _acp(section) -> dict:
+    """The CLI launch contract.
 
-    ``enabled`` defaults to on and is strictly a boolean; ``interval_minutes``
-    defaults to 60 and is a strictly positive whole number of minutes.  Both
-    reject a bad value with a fixed message that never echoes the raw setting.
+    ``cli_path`` must be non-empty (an empty one would only fail much later, as a
+    502 with no explanation). ``tools`` is a plain string passed through as
+    ``--tools``: the empty string is the safe default and disables every
+    built-in tool. ``model`` is what a request that carries no model falls back
+    to; an empty value means "let the CLI pick its own default", which is why it
+    is optional rather than required. ``max_processes`` bounds how many CLI
+    processes may stay resident at once.
     """
-    present, value = _field(section, "enabled")
-    enabled = _bool(value, "model_refresh.enabled", True)
-    present, value = _field(section, "interval_minutes")
-    interval = _int(value, "model_refresh.interval_minutes", 60, 1)
-    return {"enabled": enabled, "interval_minutes": interval}
+    present, value = _field(section, "cli_path")
+    cli_path = _str_present(value, "acp.cli_path", "codebuddy", present).strip()
+    if not cli_path:
+        raise ConfigError("配置项 acp.cli_path 不能为空")
+    present, value = _field(section, "tools")
+    tools = _str_present(value, "acp.tools", "", present)
+    present, value = _field(section, "model")
+    model = strip_model_alias(_str_present(value, "acp.model", "", present)).strip()
+    if model == ORDERED_MODEL_ID:
+        # 虚拟入口是网关的路由占位符，不是 CLI 认识的模型 ID；当默认模型存下来
+        # 只会让每条"没带模型"的请求都起一条注定失败的进程。
+        raise ConfigError("配置项 acp.model 不能是虚拟入口模型")
+    present, value = _field(section, "max_processes")
+    max_processes = _int(
+        value,
+        "acp.max_processes",
+        DEFAULT_MAX_PROCESSES,
+        1,
+        MAX_PROCESSES_CAP,
+    )
+    present, value = _field(section, "login_timeout")
+    login_timeout = _int(value, "acp.login_timeout", 120, 1)
+    return {
+        "cli_path": cli_path,
+        "tools": tools,
+        "model": model,
+        "max_processes": max_processes,
+        "login_timeout": login_timeout,
+    }
 
 
 def _section(raw, name) -> dict:
@@ -250,12 +283,10 @@ def load_settings(raw) -> dict:
     """Return a validated, normalized settings dict from the raw plugin config."""
     gateway = _section(raw, "gateway")
     signin = _section(raw, "signin")
-    growth = _section(raw, "growth")
-    auth = _section(raw, "auth")
+    acp = _section(raw, "acp")
     http = _section(raw, "http")
     notifications = _section(raw, "notifications")
     routing = _section(raw, "routing")
-    model_refresh = _section(raw, "model_refresh")
 
     return {
         "gateway": {
@@ -294,58 +325,7 @@ def load_settings(raw) -> dict:
                 MAX_SIGNIN_ATTEMPTS,
             ),
         },
-        "growth": {
-            "auto_after_signin": _bool(
-                growth.get("auto_after_signin"), "growth.auto_after_signin", False
-            ),
-            "auto_claim": _bool(growth.get("auto_claim"), "growth.auto_claim", True),
-            "max_chat_requests": _int(
-                growth.get("max_chat_requests"),
-                "growth.max_chat_requests",
-                20,
-                0,
-                MAX_GROWTH_CHAT_REQUESTS,
-            ),
-            "max_retries": _int(
-                growth.get("max_retries"),
-                "growth.max_retries",
-                2,
-                0,
-                MAX_GROWTH_RETRIES,
-            ),
-            "task_interval": _number(
-                growth.get("task_interval"), "growth.task_interval", 2, 0
-            ),
-            "poll_interval": _number(
-                growth.get("poll_interval"), "growth.poll_interval", 5, 0
-            ),
-            "progress_timeout": _number(
-                growth.get("progress_timeout"), "growth.progress_timeout", 120, 0
-            ),
-            "allowed_tasks": _list(
-                growth.get("allowed_tasks"), "growth.allowed_tasks", []
-            ),
-            "allow_telemetry": _bool(
-                growth.get("allow_telemetry"), "growth.allow_telemetry", True
-            ),
-            "allow_theme_change": _bool(
-                growth.get("allow_theme_change"), "growth.allow_theme_change", False
-            ),
-            "allow_adoption": _bool(
-                growth.get("allow_adoption"), "growth.allow_adoption", False
-            ),
-        },
-        "auth": {
-            "master_key_env": _str(
-                auth.get("master_key_env"), "auth.master_key_env", "WORKBUDDY_MASTER_KEY"
-            ),
-            "login_timeout": _int(
-                auth.get("login_timeout"), "auth.login_timeout", 120, 1
-            ),
-            "poll_interval": _int(
-                auth.get("poll_interval"), "auth.poll_interval", 1, 0
-            ),
-        },
+        "acp": _acp(acp),
         "http": {
             "total_timeout": _int(
                 http.get("total_timeout"), "http.total_timeout", 180, 1
@@ -359,5 +339,4 @@ def load_settings(raw) -> dict:
         },
         "notifications": _notifications(notifications),
         "routing": _routing(routing),
-        "model_refresh": _model_refresh(model_refresh),
     }

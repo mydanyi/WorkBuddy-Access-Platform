@@ -1,10 +1,11 @@
-"""Local OpenAI-compatible HTTP gateway in front of :class:`ChatService`.
+"""Local OpenAI-compatible HTTP gateway in front of the chat backend.
 
 Public endpoints (all local, no upstream account data ever leaks):
 
 * ``POST /v1/chat/completions`` -- bearer-authenticated; streams SSE or returns an
   aggregated JSON completion, exactly as the client asked;
-* ``GET /v1/models`` -- bearer-authenticated; the live upstream CLI-chat catalog;
+* ``GET /v1/models`` -- bearer-authenticated; the model list this install can
+  actually serve, read from the local CLI (never from an upstream account API);
 * ``GET /health`` / ``GET /healthz`` -- unauthenticated; a bare status, no
   account data.
 
@@ -13,12 +14,15 @@ Behaviour pinned by the contract tests:
 * with an empty ``api_key`` the chat listener is never opened;
 * admission is counted precisely against ``concurrency + queue_size``, a full
   queue or an expired queue wait answers 429 with ``Retry-After``, and the RPM
-  budget is judged before enqueueing but spent per *real* upstream chat POST
-  (shared with growth chat);
+  budget is judged before enqueueing but spent per *real* ACP prompt;
 * the virtual ordered model (``core.routing.ORDERED_MODEL_ID``) is only
   advertised/served while the route is enabled; its candidates are walked by
   the real :class:`core.routing.ModelRouter`, and the virtual Chinese id is
-  never forwarded upstream;
+  never forwarded to a CLI process;
+* a model id that the local catalog does not contain is a fixed local 400 (never
+  a spawned process that would fail later with a 502); when the catalog is empty
+  -- nothing has ever been read -- the check is skipped rather than refusing
+  every request;
 * the request body is capped by ``gateway.max_request_body_mb`` (default 16
   MiB) in real UTF-8 bytes -- Content-Length and chunked bodies alike -- with an
   OpenAI-compatible JSON ``413 request_too_large`` that echoes no request data;
@@ -39,11 +43,8 @@ import hmac
 import json
 import math
 
-import aiohttp
 from aiohttp import web
-
 from .chat import aggregate_chunks
-from .credits import display_model_id, upstream_model_id
 from .errors import ChatStreamError, UpstreamError
 from .limits import ConcurrencyGate, LimitExceeded
 from .routing import ORDERED_MODEL_ID
@@ -96,7 +97,6 @@ class Gateway:
     def __init__(
         self,
         chat,
-        client,
         *,
         api_key,
         host="127.0.0.1",
@@ -107,6 +107,7 @@ class Gateway:
         queue_timeout=30.0,
         limits=None,
         router=None,
+        catalog=None,
         max_request_body_mb=_DEFAULT_MAX_REQUEST_BODY_MB,
     ):
         # The body cap is a positive integer number of MiB: ``bool``, ``0``, a
@@ -119,16 +120,18 @@ class Gateway:
         ):
             raise ValueError("max_request_body_mb must be a positive integer")
         self._chat = chat
-        self._client = client
+        # 模型清单的来源。给 ``None`` 表示"这个网关不掌握清单"：``/v1/models``
+        # 就只报虚拟入口，聊天也不做未知模型校验。生产里一定是
+        # :class:`core.models.ModelCatalog`。
+        self._catalog = catalog
         self._router = router
         self._api_key = api_key or ""
         self._host = host
         self._port = port
         self._max_request_body_mb = max_request_body_mb
         self._max_request_body_bytes = max_request_body_mb * _MIB
-        # The gate lives on the ChatService so a direct call and the gateway
-        # share one budget; the gateway applies its configured budget to that
-        # same gate (default: 1 concurrent, 6 RPM, queue 2, timeout 30s).
+        # 并发门挂在**聊天后端**上，而不是网关自己：直连后端和走网关用的是同一个
+        # 预算。网关把自己配置的那份写上去（默认 1 并发、6 RPM、队列 2、等 30 秒）。
         if limits is not None:
             chat.limits = limits
         else:
@@ -321,39 +324,54 @@ class Gateway:
     async def _handle_health(self, request):
         return web.json_response({"status": "ok"})
 
+    async def _catalog_models(self) -> list:
+        """取本地模型清单；读不到就当空列表，绝不编一份出来。
+
+        ``ensure`` 自带保鲜期，所以这里不会每来一次请求就 spawn 一个 ``--help``。
+        读失败是"这台机器上没装 CLI / 还没读过"，只影响本接口与未知模型校验，不该
+        让 ``/v1/models`` 变成一个 5xx。
+        """
+        catalog = self._catalog
+        if catalog is None:
+            return []
+        try:
+            models = await catalog.ensure()
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - 清单读不出来不是网关故障
+            return []
+        if not isinstance(models, list):
+            return []
+        return [model for model in models if isinstance(model, str) and model]
+
+    def _known_model(self, model, models) -> bool:
+        """该模型能不能交给 CLI。
+
+        清单为空时一律放行：那说明这台机器还没成功读过清单（CLI 没装、装晚了一步），
+        此时拒绝所有请求只会把"还没准备好"变成"永远不能用"。清单非空才做校验——
+        此时一个不认识的 id 意味着 CLI 那边一定会失败，早点回 400 比让它变成一条
+        注定失败的进程 + 一条"上游异常"提醒好。
+        """
+        if not models:
+            return True
+        return model in models
+
     async def _handle_models(self, request):
         if not self._authorized(request):
             return self._auth_error()
-        try:
-            details = await self._client.model_details()
-        except UpstreamError as exc:
-            return self._failed_error(exc)
-        except (aiohttp.ClientError, asyncio.TimeoutError):
-            # A transport failure is a fixed JSON 502, never an unhandled 500.
-            return self._failed_error(ChatStreamError("upstream request failed"))
-        data = []
-        for detail in details or []:
-            if not isinstance(detail, dict):
-                continue
-            upstream_id = detail.get("id")
-            if not isinstance(upstream_id, str) or not upstream_id:
-                continue
-            data.append(
-                {
-                    "id": display_model_id(detail),
-                    "upstream_id": upstream_id,
-                    "object": "model",
-                    "created": 0,
-                    "owned_by": "workbuddy",
-                    "credits": detail.get("credits"),
-                    "effective_credits": detail.get("effective_credits"),
-                    "promo_label": detail.get("promo_label"),
-                    "promo_note": detail.get("promo_note"),
-                }
-            )
+        models = await self._catalog_models()
+        data = [
+            {
+                "id": model,
+                "object": "model",
+                "created": 0,
+                "owned_by": "workbuddy",
+            }
+            for model in models
+        ]
         if self._route_enabled():
-            # Appended after every live entry and without a fixed multiplier: the
-            # virtual id is a route, not a price-bearing model.
+            # Appended after every real entry: the virtual id is a route, never a
+            # model the CLI knows how to start.
             data.append(
                 {
                     "id": ORDERED_MODEL_ID,
@@ -395,21 +413,26 @@ class Gateway:
                 "both 'model' and a non-empty 'messages' list are required",
                 "invalid_request_error",
             )
-        # Shallow-copy and remap only ``model``: a display alias becomes the pure
-        # upstream id while messages / system / tools / persona / stream are left
-        # untouched.  A plain id -- and the virtual id -- passes through unchanged.
-        # Normalizing *once*, before the route check, is what makes the virtual
-        # id's own standard display alias land on the same fixed local 400.
+        # A plain id passes through untouched: the model *is* the process's
+        # ``--model`` argument, so there is nothing to translate or normalize.
         payload = dict(payload)
-        payload["model"] = upstream_model_id(payload["model"])
-        if payload["model"] == ORDERED_MODEL_ID and not self._route_enabled():
-            # The virtual id only exists with an enabled route: a fixed local 4xx
-            # and never a single upstream request.
+        model = payload["model"]
+        if model == ORDERED_MODEL_ID:
+            if not self._route_enabled():
+                # The virtual id only exists with an enabled route: a fixed local
+                # 4xx and never a single CLI process.
+                return self._json_error(
+                    400,
+                    "the '{}' model requires an enabled routing list".format(
+                        ORDERED_MODEL_ID
+                    ),
+                    "invalid_request_error",
+                )
+        elif not self._known_model(model, await self._catalog_models()):
             return self._json_error(
                 400,
-                "the '{}' model requires an enabled routing list".format(
-                    ORDERED_MODEL_ID
-                ),
+                "unknown model '{}': check /v1/models for the ids this install "
+                "can serve".format(model),
                 "invalid_request_error",
             )
         stream = bool(payload.get("stream"))

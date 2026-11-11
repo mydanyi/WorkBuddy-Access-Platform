@@ -8,7 +8,7 @@
         "type": "bool",
         "default": true,
         "description": "启用本地聊天网关",
-        "hint": "关闭后不会监听任何端口，也不会通过本网关接收聊天请求；但不会禁止由成长任务等已单独授权的聊天。"
+        "hint": "关闭后不会监听任何端口，也不会通过本网关接收聊天请求。"
       },
       "host": {
         "type": "string",
@@ -39,7 +39,7 @@
         "type": "int",
         "default": 6,
         "description": "每分钟请求上限",
-        "hint": "本地策略初始值：与成长任务共享的每分钟请求上限，默认 6。这是插件自身的本地限速策略，不代表上游账号的真实额度，调大它不能提升上游限制。"
+        "hint": "本地策略：每分钟请求上限，默认 6。这是插件自身的本地限速策略，不代表上游账号的真实额度，调大它不能提升上游限制。"
       },
       "queue_size": {
         "type": "int",
@@ -78,7 +78,7 @@
         "options": [],
         "labels": [],
         "description": "模型顺序列表",
-        "hint": "候选来自你的 WorkBuddy 账号实时模型目录，选项是纯模型 ID，标签显示当前倍率与优惠。第一次使用请先在管理员私聊执行 /wb login，然后重新打开本配置页；之后执行 /wb models，或在提供商里“获取模型列表”，都会刷新候选，刷新后同样需要重新打开本配置页才能看到。列表中第一项为主用，其余依次为备用，严格按列表顺序尝试；顺序即优先级，取消后重新选中会把该项追加到末尾。启用时至少选择一项，且不能重复。已保存但当前目录中查不到的模型会标记为未确认并保留，不会被自动删除。"
+        "hint": "候选来自本机 CodeBuddy CLI 的模型清单（codebuddy --help 里 --model 那一行），不需要登录、不需要联网。第一次使用请在管理员私聊执行 /wb models 刷新候选，然后重新打开本配置页；之后 CLI 或本地 models.json 有变动，同样执行一次 /wb models 并重新打开本页即可。列表中第一项为主用，其余依次为备用，严格按列表顺序尝试；顺序即优先级，取消后重新选中会把该项追加到末尾。启用时至少选择一项，且不能重复。已保存但当前清单里查不到的模型会标记为未确认并保留，不会被自动删除。"
       },
       "cooldown_seconds": {
         "type": "int",
@@ -94,22 +94,40 @@
       }
     }
   },
-  "model_refresh": {
+  "acp": {
     "type": "object",
-    "description": "模型自动刷新",
-    "hint": "按本插件自己的本地轮询策略，定时重新读取你账号的模型目录，用来更新「模型顺序列表」的候选与倍率标签。它是插件侧的本地方案，不是官方配额、容量或限流结论；调小间隔只增加本地读取次数。关闭后仅停止这次定时读取，启动时的首次读取、登录成功后的读取以及 /wb models、「获取模型列表」等手动获取都不受影响。刷新后需要重新打开本配置页才能看到新的候选和标签；插件不会自动改写你已保存的顺序，也不会自动改写 AstrBot 提供商里的模型设置。",
+    "description": "CodeBuddy CLI（ACP 通道）",
+    "hint": "聊天与登录都通过官方 CodeBuddy CLI 的 ACP 通道进行：插件以子进程方式拉起 CLI，用标准输入输出说 JSON-RPC。CLI 需要在运行 AstrBot 的环境里装好并能直接执行。",
     "items": {
-      "enabled": {
-        "type": "bool",
-        "default": true,
-        "description": "启用模型自动刷新",
-        "hint": "仅控制定时刷新；关闭后初始读取、登录后读取与手动获取仍然有效，已保存的模型和主备顺序保持不变。"
+      "cli_path": {
+        "type": "string",
+        "default": "codebuddy",
+        "description": "CLI 可执行文件",
+        "hint": "默认 codebuddy（走 PATH 查找）。装了别的版本或不在 PATH 里时，填绝对路径，例如 /usr/local/bin/codebuddy。"
       },
-      "interval_minutes": {
+      "tools": {
+        "type": "string",
+        "default": "",
+        "description": "允许的内置工具",
+        "hint": "原样传给 --tools。留空表示禁用全部内置工具——群聊消息永远不该驱动服务器执行命令，这是默认且推荐的值。只有在你确实需要 CLI 自带工具时才填。"
+      },
+      "model": {
+        "type": "string",
+        "default": "",
+        "description": "默认模型",
+        "hint": "请求里没带模型时的兜底模型；留空表示用 CLI 自己的默认模型。正常接入 AstrBot 时每个请求都会带模型，这里通常不用填。可用模型见 /wb models。"
+      },
+      "max_processes": {
         "type": "int",
-        "default": 60,
-        "description": "刷新间隔（分钟）",
-        "hint": "相邻两次定时刷新的间隔，默认 60 分钟，必须为正整数。这是本地轮询策略，不是官方额度；读取失败时保留上一次成功的候选，不追加频繁重试。"
+        "default": 2,
+        "description": "同时常驻的 CLI 进程数",
+        "hint": "模型是进程级参数（--model），所以不同模型要不同进程。本项限制同时留驻的进程数量，超出时回收最久未用的空闲进程（正在回答的不会被回收）。每条进程占几十 MB，默认 2，取值范围 1..16。"
+      },
+      "login_timeout": {
+        "type": "int",
+        "default": 120,
+        "description": "登录等待超时（秒）",
+        "hint": "从发出登录请求到扫码完成的最长等待，超时按未登录处理，默认 120。登录走 ACP：CLI 自己把登录链接推给插件，没有轮询间隔可调。"
       }
     }
   },
@@ -156,108 +174,10 @@
       }
     }
   },
-  "growth": {
-    "type": "object",
-    "description": "成长任务",
-    "hint": "仅执行白名单内、有真实动作链的任务；其余列明为 manual 不执行。",
-    "items": {
-      "auto_after_signin": {
-        "type": "bool",
-        "default": false,
-        "description": "签到成功后自动执行成长任务",
-        "hint": "默认关闭；仅在后台启动，不阻塞签到。"
-      },
-      "auto_claim": {
-        "type": "bool",
-        "default": true,
-        "description": "自动领取完成后奖励",
-        "hint": "普通轮次自动领奖；显式 /wb tasks claim 属人工授权，不受此开关限制。"
-      },
-      "max_chat_requests": {
-        "type": "int",
-        "default": 20,
-        "description": "每日成长聊天请求上限",
-        "hint": "按 Asia/Shanghai 日期统计，默认 20，可有限调整。"
-      },
-      "max_retries": {
-        "type": "int",
-        "default": 2,
-        "description": "失败重试上限",
-        "hint": "仅约束失败重试，不限制正常成功步骤，默认 2。"
-      },
-      "task_interval": {
-        "type": "int",
-        "default": 2,
-        "description": "任务间隔（秒）",
-        "hint": "相邻任务之间的等待秒数，默认 2。"
-      },
-      "poll_interval": {
-        "type": "int",
-        "default": 5,
-        "description": "进度轮询间隔（秒）",
-        "hint": "回读任务/奖励状态的轮询间隔，默认 5。"
-      },
-      "progress_timeout": {
-        "type": "int",
-        "default": 120,
-        "description": "进度确认超时（秒）",
-        "hint": "单步等待计分到账的最长时间，默认 120。"
-      },
-      "allowed_tasks": {
-        "type": "list",
-        "default": [],
-        "description": "允许的任务白名单",
-        "hint": "留空表示全部已支持白名单（不是不执行）；填写则仅执行列出的任务码。"
-      },
-      "allow_telemetry": {
-        "type": "bool",
-        "default": true,
-        "description": "允许行为指纹上报类动作",
-        "hint": "RichMeow / 资料库等需要客户端行为上报的动作，默认允许。"
-      },
-      "allow_theme_change": {
-        "type": "bool",
-        "default": false,
-        "description": "允许主题变更类动作",
-        "hint": "默认关闭，避免改动账号外观偏好。"
-      },
-      "allow_adoption": {
-        "type": "bool",
-        "default": false,
-        "description": "允许领养类动作",
-        "hint": "默认关闭。"
-      }
-    }
-  },
-  "auth": {
-    "type": "object",
-    "description": "登录与凭据",
-    "hint": "凭据以 AES 加密后保存在插件数据目录；主密钥仅从环境变量读取，不落盘、不入日志。",
-    "items": {
-      "master_key_env": {
-        "type": "string",
-        "default": "WORKBUDDY_MASTER_KEY",
-        "description": "主密钥环境变量名",
-        "hint": "插件只读取该环境变量的值（标准 base64、解码后 32 字节），从不保存其内容。"
-      },
-      "login_timeout": {
-        "type": "int",
-        "default": 120,
-        "description": "登录轮询超时（秒）",
-        "hint": "等待扫码/授权完成的最长时间，默认 120。"
-      },
-      "poll_interval": {
-        "type": "int",
-        "default": 1,
-        "description": "登录轮询间隔（秒）",
-        "hint": "默认 1。"
-      }
-    }
-  },
   "http": {
     "type": "object",
     "description": "HTTP 超时",
-    "hint": "对上游请求的超时设置（秒）。",
+    "hint": "签到请求的超时设置（秒）。聊天走 ACP 子进程，不使用这些值。",
     "items": {
       "total_timeout": {
         "type": "int",
@@ -288,13 +208,13 @@
         "type": "bool",
         "default": false,
         "description": "启用管理员通知",
-        "hint": "总开关，默认关闭；关闭后不发送任何通知，也不查询余额。"
+        "hint": "总开关，默认关闭；关闭后不发送任何通知。"
       },
       "signin_success": {
         "type": "bool",
         "default": true,
         "description": "通知签到成功",
-        "hint": "每日签到成功后通知一次（含每日已签到）；已领取积分与当前可用总积分分别列出。"
+        "hint": "每日签到成功后通知一次（含每日已签到），内容为本次领取的积分。"
       },
       "errors": {
         "type": "bool",

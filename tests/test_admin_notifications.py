@@ -10,7 +10,6 @@ Only the documented external boundaries are replaced:
   or raises);
 * the platform instance list / metadata (``context.platform_manager
   .platform_insts`` with real ``PlatformMetadata`` objects);
-* the balance *network* boundary (the ``client`` constructor argument);
 * the clock (an injectable callable).
 
 Everything else is real: the AstrBot ``MessageSession`` / ``MessageType`` /
@@ -74,7 +73,6 @@ VALID_CATEGORIES = (
     "network",
     "upstream",
     "signin",
-    "growth",
     "runtime",
 )
 
@@ -85,7 +83,7 @@ _MISSING = object()
 # External boundaries (replaced) and small fixture helpers.
 # ---------------------------------------------------------------------------
 class _Attrs(dict):
-    """A dict that also answers attribute access (result / balance shape)."""
+    """A dict that also answers attribute access (the signin result shape)."""
 
     def __getattr__(self, name):
         try:
@@ -131,28 +129,6 @@ class _FakeContext:
         return self.send_result
 
 
-class _FakeClient:
-    """The balance *network* boundary: returns a mapping or raises.
-
-    The implementation must reach the balance through the documented
-    ``balance()`` coroutine; any other attribute access is an error.
-    """
-
-    def __init__(self, result=_MISSING, error=None):
-        self._result = result
-        self._error = error
-        self.calls = 0
-
-    async def _fetch(self):
-        self.calls += 1
-        if self._error is not None:
-            raise self._error
-        return self._result
-
-    async def balance(self):
-        return await self._fetch()
-
-
 class _Clock:
     """Injectable clock: the notifier's ``clock`` contract is a callable."""
 
@@ -171,15 +147,6 @@ def _signin_result(date, status="signed", verified=True, reward=_MISSING, **extr
     if reward is not _MISSING:
         data["reward_credits"] = reward
     data.update(extra)
-    return _Attrs(data)
-
-
-def _balance(known=True, remaining=_MISSING, total=_MISSING):
-    data = {"known": known}
-    if remaining is not _MISSING:
-        data["remaining"] = remaining
-    if total is not _MISSING:
-        data["total"] = total
     return _Attrs(data)
 
 
@@ -207,10 +174,9 @@ def _settings(
 
 
 class _Harness:
-    def __init__(self, notifier, context, client, state, clock, settings, state_dir):
+    def __init__(self, notifier, context, state, clock, settings, state_dir):
         self.notifier = notifier
         self.context = context
-        self.client = client
         self.state = state
         self.clock = clock
         self.settings = settings
@@ -222,7 +188,6 @@ class _Harness:
             self.context,
             StateStore(self._state_dir),
             self.settings,
-            self.client,
             clock=self.clock,
         )
 
@@ -241,8 +206,6 @@ class _AdminNotificationsTestCase(unittest.IsolatedAsyncioTestCase):
         state=None,
         send_result=True,
         send_error=None,
-        balance=_balance(known=True, remaining=105, total=150),
-        balance_error=None,
         clock=None,
         settings=None,
     ):
@@ -255,11 +218,10 @@ class _AdminNotificationsTestCase(unittest.IsolatedAsyncioTestCase):
             send_result=send_result,
             send_error=send_error,
         )
-        client = _FakeClient(result=balance, error=balance_error)
         clock = clock or _Clock()
         settings = settings or _settings()
-        notifier = AdminNotifier(context, state, settings, client, clock=clock)
-        harness = _Harness(notifier, context, client, state, clock, settings, state_dir)
+        notifier = AdminNotifier(context, state, settings, clock=clock)
+        harness = _Harness(notifier, context, state, clock, settings, state_dir)
         return harness
 
     @staticmethod
@@ -369,25 +331,23 @@ class _AdminNotificationsTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("SECRET-COOLDOWN", str(caught.exception))
 
     # =====================================================================
-    # 6. master switch off: no message, no balance query
+    # 6. master switch off: no message at all
     # =====================================================================
     async def test_disabled_master_switch_sends_nothing(self):
         harness = self._make(settings=_settings(enabled=False))
         await harness.notifier.signin(_signin_result("2026-10-04", reward=10))
         await harness.notifier.error("network")
         self.assertEqual(harness.context.send_calls, 0)
-        self.assertEqual(harness.client.calls, 0)
         status = harness.notifier.status()
         self.assertIs(status["enabled"], False)
 
     # =====================================================================
-    # 7. signin switch off: no message, no balance query (errors still work)
+    # 7. signin switch off: no message (errors still work)
     # =====================================================================
     async def test_signin_switch_off_sends_nothing(self):
         harness = self._make(settings=_settings(signin_success=False))
         await harness.notifier.signin(_signin_result("2026-10-04", reward=10))
         self.assertEqual(harness.context.send_calls, 0)
-        self.assertEqual(harness.client.calls, 0)
         # The error switch is independent and still delivers.
         await harness.notifier.error("auth")
         self.assertEqual(harness.context.send_calls, 1)
@@ -420,7 +380,6 @@ class _AdminNotificationsTestCase(unittest.IsolatedAsyncioTestCase):
         harness = self._make(
             instances=[_Instance("qq-bot-1")],
             settings=_settings(admin_qq="10001", platform_id=""),
-            balance=_balance(known=True, remaining=105, total=150),
         )
         await harness.notifier.signin(_signin_result("2026-10-04", reward=0))
 
@@ -448,13 +407,12 @@ class _AdminNotificationsTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(harness.context.send_calls, 1)
         self.assertEqual(harness.notifier.status()["resolved_platform_id"], "qq-bot-1")
 
-        # Multiple candidates, unspecified -> must specify, no send, no balance.
+        # Multiple candidates, unspecified -> must specify, never guess.
         multi = self._make(
             instances=[_Instance("qq-bot-1"), _Instance("qq-bot-2")]
         )
         await multi.notifier.signin(_signin_result("2026-10-04", reward=1))
         self.assertEqual(multi.context.send_calls, 0)
-        self.assertEqual(multi.client.calls, 0)
         self.assertIsNone(multi.notifier.status()["resolved_platform_id"])
 
         # Multiple candidates, explicit -> routes to that exact instance id.
@@ -467,21 +425,19 @@ class _AdminNotificationsTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(chosen.context.sent[0][0].platform_name, "qq-bot-2")
         self.assertEqual(chosen.notifier.status()["resolved_platform_id"], "qq-bot-2")
 
-        # Unknown platform_id -> no guess, no send, no extra balance query.
+        # Unknown platform_id -> no guess, no send.
         unknown = self._make(
             instances=[_Instance("qq-bot-1")],
             settings=_settings(platform_id="does-not-exist"),
         )
         await unknown.notifier.signin(_signin_result("2026-10-04", reward=1))
         self.assertEqual(unknown.context.send_calls, 0)
-        self.assertEqual(unknown.client.calls, 0)
         self.assertIsNone(unknown.notifier.status()["resolved_platform_id"])
 
-        # Only a non-QQ platform -> unsupported, no send, no balance query.
+        # Only a non-QQ platform -> unsupported, no send.
         nonqq = self._make(instances=[_Instance("ding-bot-1", name="dingtalk")])
         await nonqq.notifier.signin(_signin_result("2026-10-04", reward=1))
         self.assertEqual(nonqq.context.send_calls, 0)
-        self.assertEqual(nonqq.client.calls, 0)
 
     # =====================================================================
     # 11. empty admin QQ keeps the API enabled but does not deliver
@@ -490,7 +446,6 @@ class _AdminNotificationsTestCase(unittest.IsolatedAsyncioTestCase):
         harness = self._make(settings=_settings(admin_qq="", platform_id=""))
         await harness.notifier.signin(_signin_result("2026-10-04", reward=1))
         self.assertEqual(harness.context.send_calls, 0)
-        self.assertEqual(harness.client.calls, 0)
         status = harness.notifier.status()
         self.assertIs(status["enabled"], True)
         self.assertEqual(status["admin_qq"], "")
@@ -505,10 +460,9 @@ class _AdminNotificationsTestCase(unittest.IsolatedAsyncioTestCase):
         await harness.notifier.signin(result)
         self.assertEqual(harness.context.send_calls, 1)
 
-        # Same date on the same notifier: no second message, no re-query.
+        # Same date on the same notifier: no second message.
         await harness.notifier.signin(result)
         self.assertEqual(harness.context.send_calls, 1)
-        self.assertEqual(harness.client.calls, 1)
 
         # Rebuild a notifier over the same real StateStore: still deduped.
         rebuilt = harness.new_notifier()
@@ -531,11 +485,11 @@ class _AdminNotificationsTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(concurrent.context.send_calls, 1)
 
     # =====================================================================
-    # 13. reward + balance rendering (0 preserved, invalid/unknown -> 未知)
+    # 13. reward rendering (0 preserved, invalid/unknown -> 未知)
     # =====================================================================
-    async def test_reward_and_balance_rendering(self):
+    async def test_reward_rendering_keeps_zero_and_rejects_junk(self):
         # reward 0 is preserved (not shown as unknown).
-        harness = self._make(balance=_balance(known=True, remaining=7, total=9))
+        harness = self._make()
         await harness.notifier.signin(_signin_result("2026-10-04", reward=0))
         text = self._text(harness)
         self.assertIn("0", text)
@@ -544,45 +498,28 @@ class _AdminNotificationsTestCase(unittest.IsolatedAsyncioTestCase):
         # missing / illegal reward -> 未知.
         for reward in (_MISSING, "abc", None, -1):
             with self.subTest(reward=reward):
-                harness = self._make(
-                    balance=_balance(known=True, remaining=7, total=9)
-                )
+                harness = self._make()
                 await harness.notifier.signin(
                     _signin_result("2026-10-04", reward=reward)
                 )
                 self.assertEqual(harness.context.send_calls, 1)
                 self.assertIn("未知", self._text(harness))
 
-        # known balance uses ``remaining`` (105), never ``total`` as available.
-        harness = self._make(balance=_balance(known=True, remaining=105, total=150))
-        await harness.notifier.signin(_signin_result("2026-10-04", reward=5))
-        text = self._text(harness)
-        self.assertIn("105", text)
-
-        # unknown / non-finite / negative remaining -> 未知.
-        for bad_balance in (
-            _balance(known=False, remaining=105, total=150),
-            _balance(known=True, remaining=float("inf"), total=150),
-            _balance(known=True, remaining=float("nan"), total=150),
-            _balance(known=True, remaining=-5, total=150),
-            _balance(known=True, remaining="x", total=150),
-        ):
-            with self.subTest(balance=bad_balance):
-                harness = self._make(balance=bad_balance)
-                await harness.notifier.signin(_signin_result("2026-10-04", reward=5))
-                self.assertEqual(harness.context.send_calls, 1)
+        # 非有限值同样落到"未知"：JSON 允许 NaN/Infinity，直接渲染会写出脏字。
+        for reward in (float("inf"), float("nan")):
+            with self.subTest(reward=reward):
+                harness = self._make()
+                await harness.notifier.signin(
+                    _signin_result("2026-10-04", reward=reward)
+                )
                 self.assertIn("未知", self._text(harness))
 
-        # balance failure still sends the real signin result and never recurses
-        # into a second (error) notification.
-        harness = self._make(
-            balance=_MISSING, balance_error=RuntimeError("RAW-BALANCE-SECRET")
-        )
+        # 消息里只有这一轮领取的积分，不再有"当前可用总积分"那一行。
+        harness = self._make()
         await harness.notifier.signin(_signin_result("2026-10-04", reward=5))
-        self.assertEqual(harness.context.send_calls, 1)
         text = self._text(harness)
-        self.assertIn("未知", text)
-        self.assertNotIn("RAW-BALANCE-SECRET", text)
+        self.assertIn("5", text)
+        self.assertNotIn("可用总积分", text)
 
     # =====================================================================
     # 14. send False / exception -> failed, never raises, no success record
@@ -717,11 +654,13 @@ class _AdminNotificationsTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(delivery["at"])
 
         # No raw response / token / exception text may appear in the status.
-        secret_client = self._make(
-            balance=_MISSING, balance_error=RuntimeError("TOKEN=RAW-STATUS-SECRET")
+        secret_send = self._make(send_error=RuntimeError("TOKEN=RAW-STATUS-SECRET"))
+        await secret_send.notifier.signin(_signin_result("2026-10-06", reward=1))
+        self.assertNotIn("RAW-STATUS-SECRET", repr(secret_send.notifier.status()))
+        # 失败只留一句固定原因，原文里那串 token 一个字都不出去。
+        self.assertEqual(
+            secret_send.notifier.status()["last_delivery"]["outcome"], "failed"
         )
-        await secret_client.notifier.signin(_signin_result("2026-10-06", reward=1))
-        self.assertNotIn("RAW-STATUS-SECRET", repr(secret_client.notifier.status()))
 
     # =====================================================================
     # 17. error cooldown tracks each category's own timestamp, never global
@@ -790,12 +729,11 @@ class _AdminNotificationsTestCase(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(delivery["outcome"], "failed")
             return delivery["reason"]
 
-        # 1) No receiving QQ configured: enabled API, no send, no balance read,
-        #    but a fixed failed reason is recorded.
+        # 1) No receiving QQ configured: enabled API, no send, but a fixed
+        #    failed reason is recorded.
         no_recipient = self._make(settings=_settings(admin_qq=""))
         await no_recipient.notifier.signin(_signin_result("2026-10-04", reward=1))
         self.assertEqual(no_recipient.context.send_calls, 0)
-        self.assertEqual(no_recipient.client.calls, 0)
         reason_no_recipient = failed_reason(no_recipient)
 
         # 2) Several QQ instances and none specified: still no guess, no send.
@@ -804,7 +742,6 @@ class _AdminNotificationsTestCase(unittest.IsolatedAsyncioTestCase):
         )
         await ambiguous.notifier.signin(_signin_result("2026-10-04", reward=1))
         self.assertEqual(ambiguous.context.send_calls, 0)
-        self.assertEqual(ambiguous.client.calls, 0)
         reason_ambiguous = failed_reason(ambiguous)
 
         # 3) An explicitly named instance that does not exist: no guess, no send.
@@ -814,7 +751,6 @@ class _AdminNotificationsTestCase(unittest.IsolatedAsyncioTestCase):
         )
         await unknown.notifier.signin(_signin_result("2026-10-04", reward=1))
         self.assertEqual(unknown.context.send_calls, 0)
-        self.assertEqual(unknown.client.calls, 0)
         reason_unknown = failed_reason(unknown)
 
         # Each route records its *own* fixed, safe reason: "fixed" means a
