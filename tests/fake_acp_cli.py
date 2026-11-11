@@ -25,6 +25,7 @@
 * ``stop_max_tokens`` prompt 吐一段后以 ``max_tokens`` 收尾
 * ``stop_refusal``  prompt 直接以 ``refusal`` 收尾（没有正文）
 * ``die_mid_prompt`` prompt 吐一段后进程自杀（测 SESSION_CLOSED 收口）
+* ``exit_after_answer`` 吐完正文与成功响应立刻退出（测"收尾和 EOF 撞在一起"）
 * ``overflow``      收到 ``session/new`` 后吐一行超长帧
 * ``big``           prompt 吐一段 2 MiB 文本（测大帧）
 * ``silent``        只握手，永不回应 prompt（测超时与回收）
@@ -147,6 +148,14 @@ def prompt_worker(scenario, session_id, request_id, prompt_text=""):
             chunk(session_id, "partial")
             time.sleep(0.02)
             os._exit(9)
+            return
+
+        if scenario == "exit_after_answer":
+            # 正文、成功响应、EOF 三件事挤在一起。客户端先看到 SESSION_CLOSED
+            # 也不能把一整条完整回答判成失败——收尾由 outcome 说了算。
+            chunk(session_id, "done")
+            ok(request_id, {"stopReason": "end_turn"})
+            os._exit(0)
             return
 
         if scenario == "stop_max_tokens":

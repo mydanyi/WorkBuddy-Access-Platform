@@ -424,6 +424,20 @@ class BackendProcessDeathTests(BackendTestCase):
         self.assertEqual(leftovers, [])
 
 
+class BackendExitAfterAnswerTests(BackendTestCase):
+    scenario = "exit_after_answer"
+
+    async def test_a_complete_answer_is_not_undone_by_eof_right_after_it(self):
+        # 进程写完最后一帧和成功响应就退出：这是正常收尾，不是上游故障。
+        # 客户端若把先到的 SESSION_CLOSED 当判决，会把完整回答误判成 502。
+        chunks = await self._collect(_payload())
+        text = "".join(
+            c["choices"][0]["delta"].get("content", "") for c in chunks
+        )
+        self.assertEqual(text, "done")
+        self.assertEqual(chunks[-1]["choices"][0]["finish_reason"], "stop")
+
+
 class BackendAuthTests(BackendTestCase):
     scenario = "auth_required"
 

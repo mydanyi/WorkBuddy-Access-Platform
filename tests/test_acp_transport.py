@@ -30,6 +30,7 @@ from astrbot_plugin_workbuddy.core.acp import (  # noqa: E402
     AcpRpcError,
     AcpTimeoutError,
     AcpTransport,
+    SESSION_CLOSED,
 )
 from astrbot_plugin_workbuddy.core.acp import protocol  # noqa: E402
 
@@ -414,6 +415,72 @@ class LifecycleTests(TransportTestCase):
         self.transport._close_session_queues()
         self.assertIs(await asyncio.wait_for(queue.get(), 1.0), SESSION_CLOSED)
         self.transport.unsubscribe("sess-x", queue)
+
+
+class _ResultRacingEofTransport:
+    """假传输层：把「EOF 排在结果前面被消费」这个时序钉死。
+
+    真实管道上这靠运气——CLI 写完最后一帧和成功响应就退出时，读循环有可能
+    先读到 EOF、先往会话队列里塞 ``SESSION_CLOSED``，轮到等待方把结果写进
+    ``outcome`` 已经是下一轮事件循环的事。这里按最坏顺序投喂，确定性复现。
+    """
+
+    def __init__(self, result):
+        self.queue = asyncio.Queue()
+        self.result = result
+        self.methods = []
+        self.unsubscribed = False
+
+    def subscribe(self, session_id):
+        return self.queue
+
+    def unsubscribe(self, session_id, queue):
+        self.unsubscribed = True
+
+    async def request(self, method, params, timeout=None):
+        self.methods.append(method)
+        if len(self.methods) == 1:  # 第一次是 session/new
+            return {"sessionId": "sess-1"}
+        # 先把 SESSION_CLOSED 塞进队列，再让结果落地。
+        self.queue.put_nowait(SESSION_CLOSED)
+        await asyncio.sleep(0)
+        return self.result
+
+    async def notify(self, method, params, timeout=None):
+        return None
+
+
+class EofBeforeResultTests(unittest.IsolatedAsyncioTestCase):
+    async def test_a_closed_session_does_not_discard_a_finished_turn(self):
+        transport = _ResultRacingEofTransport({"stopReason": "end_turn"})
+        client = AcpClient(transport, cwd=str(_HERE.parent))
+        transport.queue.put_nowait(
+            {
+                "jsonrpc": "2.0",
+                "method": "session/update",
+                "params": {
+                    "sessionId": "sess-1",
+                    "update": {
+                        "sessionUpdate": "agent_message_chunk",
+                        "messageId": "msg-1",
+                        "content": {"type": "text", "text": "partial"},
+                    },
+                },
+            }
+        )
+        # 旧实现会在看到 SESSION_CLOSED 时当场抛 AcpProcessError，把一条已经
+        # 拿到成功响应的回答判成 502。
+        done = None
+        text = []
+        async for item in client.prompt_once("hi", timeout=1.0):
+            if item.get("kind") == KIND_DONE:
+                done = item
+            else:
+                text.append(item.get("text"))
+        self.assertEqual("".join(t for t in text if t), "partial")
+        self.assertIsNotNone(done, "完整的一轮必须收尾成 done，而不是抛错")
+        self.assertEqual(done["stop_reason"], "end_turn")
+        self.assertTrue(transport.unsubscribed)
 
 
 if __name__ == "__main__":
