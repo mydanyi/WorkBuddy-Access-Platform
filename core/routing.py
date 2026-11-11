@@ -25,7 +25,13 @@ Contract pinned by ``tests/test_routing.py``:
   upstream for that round;
 * one absolute first-frame deadline covers the whole round (it is *not* reset
   per candidate) and only guards the pre-commit window; a timeout raises a
-  fixed :class:`ChatStreamError` and stops the route;
+  fixed :class:`ChatStreamError` and stops the route.  **After the first frame
+  this deadline no longer applies** -- the round is then bounded only by the
+  backend's own prompt timeout (600 s for ACP).  That is deliberate: from here
+  a stalled stream and a slowly growing long answer look identical, and the one
+  thing worse than waiting is replaying a turn the client has already started
+  receiving.  Note "first frame" includes a reasoning block, so a model that
+  thinks and then stalls waits out the prompt timeout instead of failing over;
 * cooldowns are persisted in the ``routing`` section of the real
   :class:`core.storage.StateStore` as absolute wall-clock deadlines (only the
   visible ``status()`` view reports remaining seconds), so a rebuilt router

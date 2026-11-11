@@ -471,6 +471,14 @@ class BackendErrorTests(BackendTestCase):
 
 
 class BackendDeadProcessTests(BackendTestCase):
+    """传输在请求**之前**就已经关了。
+
+    与 ``BackendProcessDeathTests``（进程在 prompt 中途死掉、由读循环发现）命中的是
+    两条不同的路径：这里 ``session/new`` 直接写不进去，抛 ``AcpProcessError``；那边是
+    prompt 进行到一半时连接断掉。断言恰好相同（都是 ``UpstreamError`` + 502），所以
+    两个用例都得留着——删掉任意一个，另一条分支就没人看着了。
+    """
+
     scenario = "happy"
 
     async def test_dead_process_maps_to_502(self):

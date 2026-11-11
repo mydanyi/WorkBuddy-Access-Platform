@@ -391,7 +391,12 @@ class AcpChatBackend:
                     if runtime is not None:
                         runtime.note_auth_failure()
                     raise UpstreamError(401, "acp_auth") from None
-                # 上游明确拒了这一轮（限流、模型不可用等）：给路由一个机会换候选。
+                # 上游明确拒了这一轮（限流、模型不可用、模型名不认等）：给路由一个
+                # 机会换候选。但**必须留一行日志**：`UpstreamError` 到网关只剩一句
+                # 固定的 "upstream request failed"，如果这里也静默，那么"模型名填错"
+                # 和"上游真的挂了"对管理员就是同一件事。ACP 的错误文本只含 code 与
+                # category，是固定投影，不含上游报文。
+                _log.warning("acp: upstream rejected the turn: %s", exc)
                 raise UpstreamError(502) from None
             except AcpTimeoutError:
                 raise UpstreamError(504) from None
