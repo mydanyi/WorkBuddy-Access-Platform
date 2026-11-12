@@ -438,6 +438,32 @@ class CloseAllTests(_PoolCase):
         self.assertEqual(alpha.logouts, [True])
         self.assertEqual(beta.logouts, [], "登出只在主运行时上做一次")
 
+    async def test_logout_waits_for_a_lease_taken_before_the_gate(self):
+        # 闸门只拦新请求。已经进来的那条还握着运行时，它的 ensure_started() 会在
+        # close_all 之后把 CLI 重新拉起来——握着还没删的 token，然后凭据被删。
+        pool = self.make_pool(max_processes=2)
+        alpha = pool.get(ALPHA)
+        _start(alpha)
+        entered = asyncio.Event()
+        release = asyncio.Event()
+
+        async def _hold_the_lease():
+            async with pool.lease(ALPHA):
+                entered.set()
+                await release.wait()
+
+        holder = asyncio.ensure_future(_hold_the_lease())
+        await entered.wait()
+
+        logging_out = asyncio.ensure_future(pool.logout(purge_config=True))
+        await asyncio.sleep(0.05)
+        self.assertEqual(alpha.closes, 0, "在手租约还没退，不能先关进程")
+
+        release.set()
+        await holder
+        await logging_out
+        self.assertEqual(alpha.closes, 1, "租约退了之后照常关")
+
 
 class ShutdownTests(_PoolCase):
     """``shutdown`` 是永久的：之后一律拒绝。"""

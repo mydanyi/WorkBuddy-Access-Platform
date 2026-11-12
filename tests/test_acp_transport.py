@@ -94,6 +94,17 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(err.category, "auth")
         self.assertEqual(err.code, -32000)
 
+    def test_category_decides_auth_and_the_code_is_only_a_fallback(self):
+        # ``-32000`` 是 CLI 的通用业务错误码。只按它判鉴权的话，一次"会话不存在"
+        # 就会被当成没登录：回 401、把登录态压成 False，还跳过备用模型。
+        other = protocol.rpc_error_from(
+            {"id": 3, "error": {"code": -32000, "data": {"category": "session"}}}
+        )
+        self.assertFalse(other.is_auth_required)
+        # 没有分类时才退回看码——老版本 CLI 不带 ``data.category``。
+        bare = protocol.rpc_error_from({"id": 4, "error": {"code": -32000}})
+        self.assertTrue(bare.is_auth_required)
+
     def test_normalize_text_thought_tool_other(self):
         text = protocol.normalize_update(
             {
@@ -212,6 +223,42 @@ class CloseCancellationTests(unittest.IsolatedAsyncioTestCase):
             proc.returncode, "取消把 terminate/kill 一起跳过了：进程还活着"
         )
         self.assertFalse(transport.alive)
+
+
+class _DeafStdin:
+    """写得进去、drain 报管道已断：CLI 关掉了读端，stdout 却还开着。"""
+
+    def is_closing(self):
+        return False
+
+    def write(self, data):
+        pass
+
+    async def drain(self):
+        raise BrokenPipeError
+
+
+class _DeafProcess:
+    """只提供 ``request()`` 会碰到的那几个属性的子进程替身。"""
+
+    returncode = None
+    pid = 4243
+
+    def __init__(self):
+        self.stdin = _DeafStdin()
+
+
+class SendFailureTests(unittest.IsolatedAsyncioTestCase):
+    async def test_a_broken_stdin_fails_the_request_instead_of_waiting(self):
+        # stdout 还开着，读循环不会失败，没人来兑现这个请求的 future。要是把 drain
+        # 的异常吞掉，调用方就得一直等到超时——prompt 那一档是 600 秒。
+        transport = AcpTransport(_argv("happy"), request_timeout=5.0)
+        transport._proc = _DeafProcess()
+        loop = asyncio.get_running_loop()
+        started = loop.time()
+        with self.assertRaises(AcpProcessError):
+            await transport.request("test/echo", {}, timeout=5.0)
+        self.assertLess(loop.time() - started, 1.0, "不该傻等到超时")
 
 
 class InitializeTests(TransportTestCase):

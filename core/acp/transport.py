@@ -248,13 +248,22 @@ class AcpTransport:
             raise AcpProtocolError("outgoing acp frame was too large")
         stdin.write(data)
 
-    async def _send(self, payload) -> None:
+    async def _send(self, payload, *, strict=False) -> None:
+        """写一帧；``strict`` 时把 ``drain`` 失败当成传输层错误抛出。
+
+        ``notify()`` 是尽力而为，写不出去无所谓。``request()`` 不行：CLI 关掉 stdin
+        读端、stdout 却还开着时，读循环不会失败，这个请求就会一直挂到超时——prompt
+        用的是 600 秒那一档，并发名额被白白占满十分钟。直接失败，立刻把名额放出来。
+        """
         self._send_sync(payload)
         proc = self._proc
         stdin = None if proc is None else proc.stdin
         if stdin is not None:
-            with contextlib.suppress(Exception):
+            try:
                 await stdin.drain()
+            except OSError as exc:
+                if strict:
+                    raise AcpProcessError("acp stdin write failed") from exc
 
     def _allocate_id(self) -> int:
         self._next_id += 1
@@ -287,7 +296,7 @@ class AcpTransport:
             payload["params"] = params
 
         async def round_trip():
-            await self._send(payload)
+            await self._send(payload, strict=True)
             return await future
 
         try:

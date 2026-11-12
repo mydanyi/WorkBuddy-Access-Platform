@@ -306,6 +306,27 @@ class CatalogProcessTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await catalog.refresh(), [CUSTOM_PREFIX + GAMMA])
         self.assertEqual(catalog.source, "config")
 
+    async def test_a_slow_failed_read_restarts_the_backoff_from_its_end(self):
+        # 读一次要吃满 20 秒超时。只在读之前盖章的话，等它失败返回，5 秒退避期早过
+        # 了，排在锁上的调用方会一个接一个地再吃满一次——正是退避闸门要堵的事。
+        now = [0.0]
+        catalog = ModelCatalog(
+            "codebuddy", clock=lambda: now[0], max_age=60, retry_after=5
+        )
+        calls = []
+
+        async def _slow_empty():
+            calls.append(1)
+            now[0] += 20.0
+            return [], "none"
+
+        catalog._discover = _slow_empty
+
+        self.assertEqual(await catalog.refresh(), [])
+        now[0] += 1.0  # 距这次失败结束才 1 秒，退避期还没过
+        self.assertEqual(await catalog.ensure(), [])
+        self.assertEqual(len(calls), 1, "退避期没过就重读了")
+
     async def test_a_hanging_cli_is_killed_and_the_list_stays_empty(self):
         tmp = _case_dir(self)
         cli = tmp / "codebuddy-slow"

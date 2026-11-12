@@ -376,6 +376,17 @@ class WorkBuddyPlugin(Star):
         # 复用它，聊天从此恒 502。
         self.chat = None
 
+        # Stop the scheduler *before* the runtime and before cancelling the notice
+        # tasks. Before the runtime: an in-flight signin would hit the pool while it
+        # is being shut down, 401 out of `CliCredentials.refresh()`, and persist
+        # `paused=True` — so a reload leaves signin paused until an admin resumes it.
+        # Before the notices: nothing new is queued while the pending ones drain.
+        scheduler = self.scheduler
+        self.scheduler = None
+        if scheduler is not None:
+            with contextlib.suppress(Exception):
+                await scheduler.stop()
+
         # ACP 的 CLI 子进程必须在这里收掉：登录任务已经取消，再没人用它。
         acp = self.acp
         self.acp = None
@@ -386,14 +397,6 @@ class WorkBuddyPlugin(Star):
 
         # 本地清单只是个内存快照，跟着运行时一起丢，下次重读。
         self.catalog = None
-
-        # Stop the scheduler *before* cancelling the notice tasks, so nothing
-        # new is queued while the pending notices are drained.
-        scheduler = self.scheduler
-        self.scheduler = None
-        if scheduler is not None:
-            with contextlib.suppress(Exception):
-                await scheduler.stop()
 
         notify_tasks = [t for t in self._notify_tasks if not t.done()]
         self._notify_tasks.clear()

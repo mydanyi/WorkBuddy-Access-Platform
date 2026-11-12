@@ -25,9 +25,15 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import logging
 from contextlib import asynccontextmanager
 
 from .protocol import AcpError
+
+_log = logging.getLogger(__name__)
+
+# 登出前等在手租约退出的上限（秒）。一轮长输出不该把 ``/wb logout`` 拖到它结束。
+_LOGOUT_DRAIN_SECONDS = 5.0
 
 
 def _sort_key(model):
@@ -213,6 +219,7 @@ class AcpRuntimePool:
         """
         self._logging_out = True
         try:
+            await self._drain_leases()
             await self.close_all()
             await self.primary.logout(purge_config=purge_config)
             if purge_config:
@@ -223,6 +230,28 @@ class AcpRuntimePool:
                     runtime.note_logged_out()
         finally:
             self._logging_out = False
+
+    async def _drain_leases(self) -> None:
+        """等**已经进了闸门**的租约退出，再开始关进程、删凭据。
+
+        闸门只拦新请求。先前已经进来的那条仍握着运行时，``close_all()`` 关不掉它
+        手里那一步"稍后 ``ensure_started()``"——那一步会在凭据被删之前把 CLI 重新
+        拉起、握着还没删的 token，然后凭据被删，而进程活着，下次刷新又把凭据写回来。
+        闸门既已置位，计数只降不升，等一等就一定收敛。
+
+        也不能无限等：一轮长输出会把登出拖到它自己结束为止。超时就照常往下关——
+        那条请求本来也要被登出打断。
+        """
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + _LOGOUT_DRAIN_SECONDS
+        while any(self._busy.values()):
+            if loop.time() >= deadline:
+                _log.warning(
+                    "pool: logout proceeded with %d model(s) still leased",
+                    len(self._busy),
+                )
+                return
+            await asyncio.sleep(0.02)
 
     # -- 回收 ---------------------------------------------------------------
 

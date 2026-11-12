@@ -110,7 +110,14 @@ class AcpRpcError(AcpError):
 
     @property
     def is_auth_required(self) -> bool:
-        return self.category == CATEGORY_AUTH or self.code == ERROR_AUTH_REQUIRED
+        # ``category`` 是 CLI 自己给的分类，比错误码更能说明问题。``-32000`` 只是它的
+        # 通用业务错误码：拿这个数字单独判鉴权，会把"会话不存在"之类也认成没登录，
+        # 于是回 401、把 ``auth_state`` 压成 False，还跳过了备用模型那一步。有分类就
+        # 听分类的，没有分类才退回看码——实测鉴权失败带的是 ``data.category="auth"``
+        # （见 evidence/P0-acp-probe.md）。
+        if self.category is not None:
+            return self.category == CATEGORY_AUTH
+        return self.code == ERROR_AUTH_REQUIRED
 
 
 class AcpProcessError(AcpError):

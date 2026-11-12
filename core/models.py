@@ -234,6 +234,10 @@ class ModelCatalog:
         其余部分一步都走不到；若把盖章放在读之后，一次取消就会让退避闸门失效，
         之后每次 ``ensure()`` 都重新 spawn、重新吃满一次超时——正是那个闸门要堵的
         事。``_read_at`` 仍然记在成功之后，因为它回答的是"这份清单有多新"。
+
+        **失败之后再盖一次。** 读一次可能要吃掉 ``--help`` 那 20 秒超时。只在读之前
+        盖章的话，等它失败返回，5 秒的退避期早过了；排在 ``_refresh_lock`` 上的调用方
+        会一个接一个地再吃满一次超时。从"这次失败结束"开始算，闸门才真的挡得住。
         """
         self._last_attempt = self._clock()
         models, source = await self._discover()
@@ -241,6 +245,8 @@ class ModelCatalog:
             self._models = models
             self._source = source
             self._read_at = self._clock()
+        else:
+            self._last_attempt = self._clock()
         return self.models
 
     async def ensure(self) -> list:
