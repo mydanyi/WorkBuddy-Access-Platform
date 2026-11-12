@@ -32,6 +32,7 @@ from astrbot_plugin_workbuddy.core.acp.pool import AcpRuntimePool  # noqa: E402
 ALPHA = "wb-alpha"
 BETA = "wb-beta"
 GAMMA = "wb-gamma"
+DELTA = "wb-delta"
 
 
 class _FakeRuntime:
@@ -436,6 +437,8 @@ class TrimTests(_PoolCase):
         trimming = asyncio.ensure_future(pool.trim())
         await asyncio.sleep(0.05)
         trimming.cancel()
+        await asyncio.sleep(0)
+        self.assertFalse(trimming.done(), "取消也要等整批关完再抛")
         gate.set()
         with self.assertRaises(asyncio.CancelledError):
             await trimming
@@ -478,9 +481,46 @@ class TrimTests(_PoolCase):
 
         self.assertEqual(await pool.trim(), 1, "这一轮先重试账上那条，收掉就平账")
         self.assertFalse(gamma.started)
+        self.assertEqual(len(attempts), 2, "每轮只关一次")
         self.assertEqual(
             beta.shutdowns, 0, "账上那条收得掉，就不该拿待命的 BETA 抵数"
         )
+
+    async def test_a_trim_reclaims_every_stray_not_just_the_first(self):
+        # 账上同时躺着两条活口时，"只试一条就收手"和"都试一遍"看起来一样。收口要
+        # 全试：留一条就是留一条活进程，下一轮它还会占着位子。
+        pool = self.make_pool(max_processes=2, primary_model=ALPHA)
+        alpha = pool.get(ALPHA)
+        beta = pool.get(BETA)  # 先领的先淘汰
+        gamma = pool.get(GAMMA)
+        delta = pool.get(DELTA)
+        _start(alpha, beta, gamma, delta)
+
+        async def _stubborn():
+            pass  # 关不掉：started 保持真
+
+        beta.shutdown = _stubborn
+        gamma.shutdown = _stubborn
+
+        self.assertEqual(await pool.trim(), 0, "两条都没关掉，这一轮不报数")
+        self.assertTrue(beta.started)
+        self.assertTrue(gamma.started)
+        self.assertTrue(delta.started, "映射已经到上限，不该再牵连待命的 DELTA")
+
+        attempts = []
+
+        async def _dies():
+            attempts.append(1)
+            beta.started = False
+            gamma.started = False
+
+        beta.shutdown = _dies
+        gamma.shutdown = _dies
+
+        self.assertEqual(await pool.trim(), 2, "账上两条都得试，不能只收第一条")
+        self.assertEqual(len(attempts), 2)
+        self.assertFalse(beta.started)
+        self.assertFalse(gamma.started)
 
     async def test_two_overlapping_trims_count_the_same_close_only_once(self):
         # 关闭只能在锁外 await，所以另一个 trim 会在这段里看见"账上还有一条活着的"。
@@ -781,6 +821,27 @@ class CloseAllTests(_PoolCase):
         await trimmer
 
 
+    async def test_logout_refuses_to_purge_while_a_child_in_the_mapping_refuses_to_close(
+        self,
+    ):
+        # 不变量 4 那个陷阱对映射里的孩子一样成立：``close()`` 正常返回、进程还活着，
+        # 它仍在映射里。存活检查要是只看 ``_evicting``，凭据就被删了。
+        pool = self.make_pool(max_processes=2, primary_model=ALPHA)
+        alpha = pool.get(ALPHA)
+        beta = pool.get(BETA)
+        _start(alpha, beta)
+
+        async def _returns_without_killing():
+            return None
+
+        beta.close = _returns_without_killing
+
+        with mock.patch.object(pool_module, "_LOGOUT_DRAIN_SECONDS", 0.05):
+            with self.assertRaises(AcpError):
+                await pool.logout(purge_config=True)
+        self.assertTrue(beta.started, "它没死")
+        self.assertEqual(alpha.logouts, [], "没关干净就不许删凭据")
+
     async def test_a_lease_waiting_inside_trim_is_refused_after_the_gate_closes(self):
         # 租约进门时查过一次闸门，可 ``trim()`` 会等很久：等到登出把凭据删掉、
         # 闸门重新放开。回来时不认这件事，调用方紧接着的 ensure_started() 就会在
@@ -888,6 +949,7 @@ class ShutdownTests(_PoolCase):
         gate.set()
         with self.assertRaises(asyncio.CancelledError):
             await stopper
+        self.assertFalse(alpha.started, "取消也要等整批关完再抛")
         self.assertTrue(beta.started, "这一条没关掉")
 
         attempts = []
@@ -991,6 +1053,37 @@ class ShutdownTests(_PoolCase):
 
         await pool.shutdown()
         self.assertEqual(len(attempts), 2, "账本清了，第三轮不该再碰它")
+
+    async def test_a_second_shutdown_closes_every_survivor(self):
+        # 一批里两条都关不掉时，第二次要全收——"收第一条就收手"会留下一条活进程，
+        # 而它已经不在映射里，之后没人会再看见它。
+        pool = self.make_pool()
+        alpha = pool.get(ALPHA)
+        beta = pool.get(BETA)
+        _start(alpha, beta)
+
+        attempts = []
+
+        async def _stubborn():
+            attempts.append(1)
+
+        alpha.shutdown = _stubborn
+        beta.shutdown = _stubborn
+
+        await pool.shutdown()
+        self.assertTrue(alpha.started)
+        self.assertTrue(beta.started)
+        self.assertEqual(len(attempts), 2, "第一次要把两条都试过")
+
+        for runtime in (alpha, beta):
+            async def _dies(runtime=runtime):
+                runtime.started = False
+
+            runtime.shutdown = _dies
+
+        await pool.shutdown()
+        self.assertFalse(alpha.started, "第二条也得收，不能试一条就收手")
+        self.assertFalse(beta.started)
 
     async def test_shutdown_survives_a_runtime_that_refuses_to_stop(self):
         pool = self.make_pool()
