@@ -8,7 +8,7 @@
 
 聊天、签到、管理员通知，在 AstrBot 里一起打理。
 
-[![版本](https://img.shields.io/badge/WorkBuddy-0.2.0-6d7fe8)](https://github.com/mydanyi/WorkBuddy-Access-Platform/releases)
+[![版本](https://img.shields.io/badge/WorkBuddy-0.3.0-6d7fe8)](https://github.com/mydanyi/WorkBuddy-Access-Platform/releases)
 [![AstrBot](https://img.shields.io/badge/AstrBot-%3E%3D4.27.4%2C%3C5-52b9b2)](https://github.com/AstrBotDevs/AstrBot)
 [![许可](https://img.shields.io/badge/License-MIT-f0bc68)](LICENSE)
 

@@ -50,6 +50,10 @@ from .core.storage import StateStore
 
 PLUGIN_NAME = "astrbot_plugin_workbuddy"
 
+# 命令回复前最多等这么久把登录链接拿到手：拿到就把链接放进回复里；拿不到就先回
+# 一句"稍后查看"，等链接后到时再补一条通知。测试替换这个常量，不睡真 5 秒。
+_LOGIN_LINK_SECONDS = 5.0
+
 # 模块级 logger 只用于"本该有人看见"的意外：用户可见文案是固定中文，不该承载
 # 诊断信息。
 _log = logging.getLogger(PLUGIN_NAME)
@@ -89,7 +93,7 @@ HELP_TEXT = """WorkBuddy 指令（仅管理员私聊）：
     "astrbot_plugin_workbuddy",
     "mydanyi",
     "将 WorkBuddy 接入 AstrBot：通过官方 CodeBuddy CLI 的 ACP 通道提供 OpenAI 兼容 API（普通/流式）、扫码登录、自动签到、模型列表与主备模型按顺序调用，以及可配置管理员 QQ 的签到与异常通知。",
-    "0.2.0",
+    "0.3.0",
 )
 class WorkBuddyPlugin(Star):
     """The single WorkBuddy entry point."""
@@ -802,13 +806,19 @@ class WorkBuddyPlugin(Star):
         self._notify_umo = event.unified_msg_origin
         captured = {"url": None}
         ready = asyncio.Event()
+        # 这条命令的回复一旦交出去，再推一次链接就是第二份。只有"回复里没有链接"的
+        # 那种情况才需要补发，见下面 ``_on_auth_url``。
+        answered = {"done": False}
 
         def _on_auth_url(url: str) -> None:
             captured["url"] = url
             ready.set()
-            # 链接同时推到管理员 QQ：私聊窗口关掉也不至于卡在等链接。
-            task = asyncio.create_task(self._notify("登录链接：\n" + url))
-            task.add_done_callback(self._consume_task)
+            # 链接赶在回复之前到：回复里会带它，这里再推一遍，同一个会话就收到两条
+            # 一模一样的链接（真机上就是这么弹了两个）。回复已经交出去了才要补一条：
+            # 那种情况下用户手里只有"稍后查看"，不补就永远等不到。
+            if answered["done"]:
+                task = asyncio.create_task(self._notify("登录链接：\n" + url))
+                task.add_done_callback(self._consume_task)
 
         task = asyncio.create_task(
             self._run_acp_login(runtime, _on_auth_url), name="wb-acp-login"
@@ -816,13 +826,13 @@ class WorkBuddyPlugin(Star):
         self._login_task = task
         task.add_done_callback(self._consume_task)
 
-        # 链接通常几百毫秒内到达；最多等 5 秒，拿到就回复，拿不到也先把登录任务
+        # 链接通常几百毫秒内到达；最多等几秒，拿到就回复，拿不到也先把登录任务
         # 留着等扫码，不重复发起第二次 authenticate。
         waiter = asyncio.create_task(ready.wait())
         with contextlib.suppress(Exception):
             await asyncio.wait(
                 {waiter, task},
-                timeout=5.0,
+                timeout=_LOGIN_LINK_SECONDS,
                 return_when=asyncio.FIRST_COMPLETED,
             )
         if not waiter.done():
@@ -830,6 +840,8 @@ class WorkBuddyPlugin(Star):
         with contextlib.suppress(BaseException):
             await waiter
 
+        # 从这行起，链接再到达就只能走通知。中间没有 await，回调插不进来。
+        answered["done"] = True
         if self.acp is not pool:
             return "插件状态已变化，请重新执行 /wb login。"
         if captured["url"]:

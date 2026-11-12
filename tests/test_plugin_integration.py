@@ -41,6 +41,7 @@ import tempfile
 import unittest
 import uuid
 from pathlib import Path
+from unittest import mock
 
 import aiohttp
 
@@ -356,9 +357,16 @@ class _StubAcpRuntime:
     覆盖，两边不重复。
     """
 
-    def __init__(self, url="https://example.com/login?state=stub", *, block=False):
+    def __init__(
+        self,
+        url="https://example.com/login?state=stub",
+        *,
+        block=False,
+        link_delay=0.0,
+    ):
         self.url = url
         self.block = block
+        self.link_delay = link_delay
         self.calls = 0
         self.closed = False
         self._gate = asyncio.Event()
@@ -377,6 +385,8 @@ class _StubAcpRuntime:
     async def login(self, *, on_auth_url=None, timeout=None):
         self.calls += 1
         if on_auth_url is not None:
+            if self.link_delay:
+                await asyncio.sleep(self.link_delay)
             on_auth_url(self.url)
         if self.block:
             await self._gate.wait()
@@ -886,6 +896,43 @@ class _PluginIntegrationTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(first_task.done())
 
         # Let the replacement finish so no task outlives the test.
+        runtime._gate.set()
+        await asyncio.wait_for(plugin._login_task, timeout=5)
+
+    async def test_login_link_is_not_pushed_a_second_time(self):
+        # 链接已经写在命令回复里了；再推一条通知，同一个会话就会收到两份一模一样
+        # 的链接（真机上看到的就是"弹了两个登录链接"）。
+        plugin = await self._make_plugin(**self._make_ready_plugin_config())
+        runtime = _StubAcpRuntime(block=True)
+        plugin.acp = _StubAcpPool(runtime)
+
+        text = _text_of(await _invoke(plugin.wb, _make_event("wb login"), "login", ""))
+        self.assertIn("https", text)
+        # 通知是 create_task 排上去的，让出一轮再断言。
+        await asyncio.sleep(0)
+        self.assertEqual(plugin.context.sent, [], "回复里已经有链接，不许再推一条")
+
+        runtime._gate.set()
+        await asyncio.wait_for(plugin._login_task, timeout=5)
+
+    async def test_a_late_login_link_is_pushed_exactly_once(self):
+        # 反过来那一半：回复里只能写"稍后查看"时，链接后到必须补一条通知，且只补
+        # 一条——不补，用户永远拿不到链接；补两条，又回到重复推送。
+        plugin = await self._make_plugin(**self._make_ready_plugin_config())
+        runtime = _StubAcpRuntime(block=True, link_delay=0.3)
+        plugin.acp = _StubAcpPool(runtime)
+
+        with mock.patch.object(wb_main, "_LOGIN_LINK_SECONDS", 0.05):
+            text = _text_of(
+                await _invoke(plugin.wb, _make_event("wb login"), "login", "")
+            )
+        self.assertIn("暂时没拿到链接", text, "等不到链接时先回一句，别空等")
+        self.assertEqual(plugin.context.sent, [], "这一刻链接还没到，没什么可推")
+
+        await asyncio.sleep(0.5)
+        self.assertEqual(len(plugin.context.sent), 1, "后到的链接要补一条，且只补一条")
+        self.assertIn("https", str(plugin.context.sent[0][1]))
+
         runtime._gate.set()
         await asyncio.wait_for(plugin._login_task, timeout=5)
 
