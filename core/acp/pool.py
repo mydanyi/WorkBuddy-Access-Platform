@@ -297,6 +297,9 @@ class AcpRuntimePool:
         上限跟 :meth:`_drain_leases` 共用同一个常量：两者都是"等一件本该很快的事"，
         没有任何理由为它们各调一个魔数。
         """
+        # 账上可能只剩尸体：淘汰那次 `shutdown()` 超时返回，之后进程自己慢慢退了。
+        # 那没什么可等的，先划掉——否则每次登出都白等满 5 秒再说"还在飞"。
+        self._forget_dead()
         loop = asyncio.get_running_loop()
         deadline = loop.time() + _LOGOUT_DRAIN_SECONDS
         while self._evicting:
@@ -309,6 +312,17 @@ class AcpRuntimePool:
             await asyncio.sleep(0.02)
 
     # -- 回收 ---------------------------------------------------------------
+
+    def _forget_dead(self) -> None:
+        """把账上已经死掉的划掉。
+
+        进程会自己退：淘汰那次 `shutdown()` 超时返回，过一会儿它还是走了。尸体留在
+        账上没有用处——它不占位（占位只看 ``started``），却会让 ``_drain_evictions``
+        以为还有事在飞，白等满一个窗口。
+        """
+        self._evicting.difference_update(
+            runtime for runtime in list(self._evicting) if not runtime.started
+        )
 
     def _strays(self):
         """账上那几条：已经摘出映射、子进程却还活着。
@@ -376,6 +390,7 @@ class AcpRuntimePool:
         的活进程。关干净了才出账；关不掉的那条**留在账上**，让登出照样看得见它。
         """
         # 上一轮没关掉的那几条先收拾一遍，它们和下面的淘汰一起算进上限。
+        self._forget_dead()
         reclaimed = await self._reclaim_strays()
         victims = []
         async with self._trim_lock:
@@ -470,6 +485,9 @@ class AcpRuntimePool:
         **关完才出账，而且只出真关掉的。** 提前清空等于把"没关掉"改写成"没有这条"：
         这次仍然杀不掉的话，引用就跟着清单一起没了，连再试一次的把手都不剩。映射里
         来的那几条尤其要注意：清单已经清空，不把它们记到账上就是两头都没有。
+
+        因此**这个方法可以重复调用**：第一次没关掉的留在账上，第二次接着收。别把它
+        改成"关过一次就早退"——那会让账上那条永远没人认领。
 
         与正在进行的淘汰撞上也没事：``AcpRuntime.close`` 持 ``_start_lock``，
         后到的那次会等前一次关完再看一眼，已经死透就什么都不做。

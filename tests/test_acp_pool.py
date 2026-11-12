@@ -419,6 +419,54 @@ class TrimTests(_PoolCase):
         self.assertEqual(len(attempts), 2)
         self.assertEqual(alpha.shutdowns, 0, "重试就能收掉，不必动待命的那条")
 
+    async def test_a_stray_is_reclaimed_before_a_standby_runtime_is_evicted(self):
+        # 顺序要钉住：账上那条谁都领不走，关掉就是白赚；待命的那条还能马上干活。
+        # 先淘汰再重试，结果看起来一样（都只关掉一条），代价是多杀一个能用的进程。
+        pool = self.make_pool(max_processes=2, primary_model=ALPHA)
+        alpha = pool.get(ALPHA)
+        gamma = pool.get(GAMMA)  # 先领 GAMMA，让它在 LRU 里排在 BETA 前面
+        beta = pool.get(BETA)
+        _start(alpha, gamma, beta)
+
+        attempts = []
+
+        async def _dies_on_the_second_try():
+            attempts.append(1)
+            if len(attempts) > 1:
+                gamma.started = False
+
+        gamma.shutdown = _dies_on_the_second_try
+
+        self.assertEqual(await pool.trim(), 0, "第一轮挑最久未用的 GAMMA 走，它没死")
+        self.assertTrue(gamma.started)
+        self.assertEqual(pool.status()["models"], [ALPHA, BETA])
+
+        self.assertEqual(await pool.trim(), 1, "这一轮先重试账上那条，收掉就平账")
+        self.assertFalse(gamma.started)
+        self.assertEqual(
+            beta.shutdowns, 0, "账上那条收得掉，就不该拿待命的 BETA 抵数"
+        )
+
+    async def test_logout_does_not_wait_for_a_ledger_entry_that_already_died(self):
+        # 账上剩一具尸体时，登出会以为还有事在飞，白等满 `_LOGOUT_DRAIN_SECONDS`
+        # （5 秒）再往下走。等的是"进程还活着"，不是"集合非空"。
+        pool = self.make_pool(max_processes=1, primary_model=ALPHA)
+        alpha = pool.get(ALPHA)
+        beta = pool.get(BETA)
+        _start(alpha, beta)
+
+        async def _returns_without_killing():
+            return None
+
+        beta.shutdown = _returns_without_killing
+
+        self.assertEqual(await pool.trim(), 0)
+        beta.started = False  # 进程随后自己退了
+
+        # 修之前这里会卡满 5 秒的 drain 再放行。
+        await asyncio.wait_for(pool.logout(purge_config=True), timeout=1.0)
+        self.assertEqual(alpha.logouts, [True])
+
 
 class CloseAllTests(_PoolCase):
     """``close_all`` 只关不摘：登出后仍要能重新拉起同一条。"""
@@ -774,6 +822,7 @@ class ShutdownTests(_PoolCase):
         await pool.shutdown()
         self.assertTrue(beta.started, "关不掉就是关不掉，账本要说实话")
         self.assertEqual(len(attempts), 2, "卸载时试过一次")
+        self.assertEqual(alpha.shutdowns, 1, "映射里那条该关的还是要关")
 
         await pool.shutdown()
         self.assertFalse(beta.started, "第二次还得能顺着账本找到它")
@@ -801,6 +850,7 @@ class ShutdownTests(_PoolCase):
         await pool.shutdown()
         self.assertTrue(beta.started, "第一次没关掉")
         self.assertEqual(len(attempts), 1)
+        self.assertEqual(alpha.shutdowns, 1, "清映射不等于不用关它")
 
         await pool.shutdown()
         self.assertFalse(beta.started, "映射清空之后，还得顺着账本找回它")
