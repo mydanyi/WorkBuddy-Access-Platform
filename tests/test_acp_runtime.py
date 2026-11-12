@@ -241,6 +241,22 @@ class StartTests(RuntimeTestCase):
         with self.assertRaises(AcpError):
             await runtime.ensure_started()
 
+    async def test_a_restart_is_refused_while_the_previous_child_is_alive(self):
+        # ``_discard`` 关不掉时会把引用留在身上（那条进程还握着 token）。若这里照旧
+        # 拉一条新的，引用一被顶掉，旧的那条就再也没人认领：池子数不到、关不掉。
+        runtime = self.make_runtime()
+        await runtime.ensure_started()
+        await runtime.close()
+        runtime._transport = _SurvivingTransport()
+
+        with self.assertRaises(AcpError):
+            await runtime.ensure_started()
+        self.assertIsInstance(
+            runtime.transport,
+            _SurvivingTransport,
+            "拒绝重启之后引用必须还在，下一轮才收得掉",
+        )
+
 
 class LoginTests(RuntimeTestCase):
     async def test_login_relays_url_and_marks_state(self):

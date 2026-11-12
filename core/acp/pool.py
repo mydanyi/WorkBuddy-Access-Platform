@@ -86,6 +86,10 @@ class AcpRuntimePool:
         # 已经不可见，登出前必须单独盯一眼，否则"淘汰正撞上登出"就是漏网之鱼：
         # 凭据删掉了，而那条进程还握着 token。真关掉了才从这里出账。
         self._evicting = set()
+        # 每次登出自增一次。租约进门时记一份，``trim()`` 回来再比一次：登出可能在
+        # 它等的这段时间里开始、甚至已经跑完（闸门又放开了），只查 ``_logging_out``
+        # 看不出来——而那一刻放行，调用方随后就会在"已退出登录"之后拉起一条 CLI。
+        self._epoch = 0
 
     # -- 只读视图 -----------------------------------------------------------
 
@@ -175,12 +179,19 @@ class AcpRuntimePool:
             # 进程还活着，下次刷新会把凭据原样写回来。
             raise AcpError("acp runtime pool is logging out")
         key = _normalize(model)
+        epoch = self._epoch
         runtime = self.get(key)
         self._busy[key] = self._busy.get(key, 0) + 1
         try:
             # 先淘汰再交出去：这样"新起一条"与"收掉一条空闲"在同一轮里完成，
             # 稳态下进程数不会越过上限。
             await self.trim()
+            if self._logging_out or self._epoch != epoch:
+                # 进门之后才开始、甚至已经跑完的登出。``trim()`` 可能等了很久，
+                # 久到凭据已经被删、闸门重新放开——只查 ``_logging_out`` 会漏掉
+                # 后半段，而这一刻放行，调用方下一次 ``ensure_started()`` 就会在
+                # 用户看到"已退出登录"之后拉起一条 CLI。
+                raise AcpError("acp runtime pool is logging out")
             yield runtime
         finally:
             remaining = self._busy.get(key, 1) - 1
@@ -222,6 +233,9 @@ class AcpRuntimePool:
         就只删目录。所以 ``close_all`` 之后直接调它是安全的，不会反过来又 spawn 一条。
         """
         self._logging_out = True
+        # 先记这一笔，再开始关：在飞的租约回来时比的是"有没有登出过"，而不是
+        # "此刻是不是正在登出"。见 :meth:`lease`。
+        self._epoch += 1
         try:
             await self._drain_leases()
             await self.close_all()
@@ -369,7 +383,11 @@ class AcpRuntimePool:
             for runtime in runtimes:
                 with contextlib.suppress(Exception):
                     await getattr(runtime, how)()
-                    count += 1
+                    # 没抛异常不等于关掉了：``close()`` 在子进程死活不退时会正常
+                    # 返回、把引用留在运行时身上。只数真停下来的那几条，否则池子
+                    # 会报出一个根本不存在的空位。
+                    if not runtime.started:
+                        count += 1
             return count
 
         cleanup = asyncio.ensure_future(_run())

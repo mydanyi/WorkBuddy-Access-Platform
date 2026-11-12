@@ -234,6 +234,12 @@ class AcpRuntime:
             ):
                 return self._client
             await self._discard()
+            if self._transport is not None:
+                # ``_discard`` 只在进程真的死了才摘引用。这里还留着一条，说明上一次
+                # 关不掉：再拉一条新的就把它从 ``self._transport`` 上顶掉，那条进程
+                # 从此没人认领——池子既数不到它、也关不掉它，而它手里握着 token。
+                # 宁可这一轮失败（下一轮 ``_discard`` 会接着收），也不能丢下它。
+                raise AcpError("previous acp child is still alive")
             new_transport = AcpTransport(
                 self._argv,
                 env=self._env,

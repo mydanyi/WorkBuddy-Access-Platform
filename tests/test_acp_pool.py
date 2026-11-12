@@ -353,6 +353,22 @@ class TrimTests(_PoolCase):
         self.assertEqual(beta.shutdowns, 0)
 
 
+    async def test_an_eviction_that_leaves_the_child_alive_is_not_counted(self):
+        # ``shutdown()`` 正常返回不等于进程没了：``AcpRuntime.close()`` 在子进程死活
+        # 不退时就是这么返回的。把它算成"关掉了"，池子就会报出一个不存在的空位。
+        pool = self.make_pool(max_processes=1, primary_model=ALPHA)
+        alpha = pool.get(ALPHA)
+        beta = pool.get(BETA)
+        _start(alpha, beta)
+
+        async def _returns_without_killing():
+            return None  # 进程还在：started 保持真
+
+        beta.shutdown = _returns_without_killing
+
+        self.assertEqual(await pool.trim(), 0, "进程还在，不许报成关掉了")
+
+
 class CloseAllTests(_PoolCase):
     """``close_all`` 只关不摘：登出后仍要能重新拉起同一条。"""
 
@@ -575,6 +591,44 @@ class CloseAllTests(_PoolCase):
 
         gate.set()
         await trimmer
+
+
+    async def test_a_lease_waiting_inside_trim_is_refused_after_the_gate_closes(self):
+        # 租约进门时查过一次闸门，可 ``trim()`` 会等很久：等到登出把凭据删掉、
+        # 闸门重新放开。回来时不认这件事，调用方紧接着的 ensure_started() 就会在
+        # 用户看到"已退出登录"之后拉起一条 CLI。
+        pool = self.make_pool(max_processes=1, primary_model=ALPHA)
+        alpha = pool.get(ALPHA)
+
+        gate = asyncio.Event()
+        real_trim = pool.trim
+
+        async def _slow_trim():
+            await gate.wait()
+            return await real_trim()
+
+        pool.trim = _slow_trim
+
+        outcome = []
+
+        async def _hold():
+            try:
+                async with pool.lease(BETA):
+                    outcome.append("ok")
+            except AcpError as exc:
+                outcome.append(str(exc))
+
+        holder = asyncio.ensure_future(_hold())
+        await asyncio.sleep(0.05)  # 让它停在 trim 里
+
+        with mock.patch.object(pool_module, "_LOGOUT_DRAIN_SECONDS", 0.05):
+            await pool.logout(purge_config=True)
+        self.assertEqual(alpha.logouts, [True], "登出照常删了凭据")
+
+        gate.set()
+        await holder
+        self.assertEqual(len(outcome), 1)
+        self.assertIn("logging out", outcome[0], "闸门关了之后不许再放行")
 
 
 class ShutdownTests(_PoolCase):
