@@ -82,6 +82,10 @@ class AcpRuntimePool:
         # 登出期间为真。见 :meth:`logout`：光把进程关掉不够，这中间进来的请求会
         # 把进程重新拉起来、握着 token，然后凭据被删——用户看到"已退出"而账号还在。
         self._logging_out = False
+        # 已经摘出 ``_runtimes``、但子进程还没死的那几条。它们对 ``_runtimes``
+        # 已经不可见，登出前必须单独盯一眼，否则"淘汰正撞上登出"就是漏网之鱼：
+        # 凭据删掉了，而那条进程还握着 token。真关掉了才从这里出账。
+        self._evicting = set()
 
     # -- 只读视图 -----------------------------------------------------------
 
@@ -227,7 +231,14 @@ class AcpRuntimePool:
                 # 会看 ``transport.alive``），备用进程没有——所以这里统一验一遍。
                 # 关不掉就不删：宁可这次登出失败，也不要留一条"已经退出登录"却仍握着
                 # token 的进程。
-                if any(runtime.started for runtime in self._runtimes.values()):
+                #
+                # 验之前先等在飞淘汰落地：``trim()`` 是**先摘、后关**，那一段里子进程
+                # 还活着而对 ``_runtimes`` 已经不可见，只查映射就是把它放过去了。
+                await self._drain_evictions()
+                if any(
+                    runtime.started
+                    for runtime in list(self._runtimes.values()) + list(self._evicting)
+                ):
                     raise AcpError("acp process is still running")
             await self.primary.logout(purge_config=purge_config)
             if purge_config:
@@ -261,6 +272,28 @@ class AcpRuntimePool:
                 return
             await asyncio.sleep(0.02)
 
+    async def _drain_evictions(self) -> None:
+        """等在飞淘汰落地，再让登出去验存活。
+
+        ``trim()`` 先把运行时摘出 ``_runtimes``、再去 ``await`` 关进程——中间那一段
+        子进程还活着，而 ``close_all()`` 已经看不见它了。正常情况下淘汰几十毫秒就完
+        （CLI 收到 stdin EOF 自己退），等一等就能照常删凭据；等不到就把判断交给调用方
+        的存活检查，那一步会拒绝删。宁可多等这几秒，也不要留一条握着 token 的活进程。
+
+        上限跟 :meth:`_drain_leases` 共用同一个常量：两者都是"等一件本该很快的事"，
+        没有任何理由为它们各调一个魔数。
+        """
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + _LOGOUT_DRAIN_SECONDS
+        while self._evicting:
+            if loop.time() >= deadline:
+                _log.warning(
+                    "pool: logout proceeded with %d eviction(s) still in flight",
+                    len(self._evicting),
+                )
+                return
+            await asyncio.sleep(0.02)
+
     # -- 回收 ---------------------------------------------------------------
 
     async def trim(self) -> int:
@@ -276,6 +309,10 @@ class AcpRuntimePool:
 
         返回值只数**关成功**的：``shutdown()`` 抛异常的那条算没关掉，少报一条总比
         报一条假的强。
+
+        摘出映射的同时把这条记进 ``_evicting``。它从此对 ``_runtimes`` 不可见，而
+        关闭还没落地——登出那一刻正好落在这段里，就会删掉凭据、留下一条握着 token
+        的活进程。关干净了才出账；关不掉的那条**留在账上**，让登出照样看得见它。
         """
         victims = []
         async with self._trim_lock:
@@ -298,11 +335,20 @@ class AcpRuntimePool:
                     break
                 victim = min(idle, key=lambda model: self._last_used.get(model, 0))
                 # 先从映射里摘掉再关：这样并发的 ``get`` 不会拿回一条正在关的运行时。
-                victims.append(self._runtimes.pop(victim))
+                evicted = self._runtimes.pop(victim)
+                victims.append(evicted)
+                self._evicting.add(evicted)
                 self._busy.pop(victim, None)
                 self._last_used.pop(victim, None)
 
-        return await self._close_batch(victims, "shutdown")
+        try:
+            return await self._close_batch(victims, "shutdown")
+        finally:
+            # 只把真关掉的出账。还活着的留在账上：它已经不在映射里，除这份账之外
+            # 没有任何地方还能看见"这条进程还没死"。
+            self._evicting.difference_update(
+                runtime for runtime in victims if not runtime.started
+            )
 
     async def _close_batch(self, runtimes, how) -> int:
         """把一批运行时关完再放行取消，返回关成功的条数。

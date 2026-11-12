@@ -16,6 +16,7 @@ import asyncio
 import sys
 import unittest
 from pathlib import Path
+from unittest import mock
 
 _HERE = Path(__file__).resolve()
 _PLUGIN_ROOT = _HERE.parents[1]
@@ -24,6 +25,7 @@ for _path in (str(_PLUGIN_ROOT), str(_SOURCE_ROOT)):
     if _path not in sys.path:
         sys.path.insert(0, _path)
 
+import astrbot_plugin_workbuddy.core.acp.pool as pool_module  # noqa: E402
 from astrbot_plugin_workbuddy.core.acp import AcpError  # noqa: E402
 from astrbot_plugin_workbuddy.core.acp.pool import AcpRuntimePool  # noqa: E402
 
@@ -480,6 +482,66 @@ class CloseAllTests(_PoolCase):
         await holder
         await logging_out
         self.assertEqual(alpha.closes, 1, "租约退了之后照常关")
+
+    async def test_logout_waits_for_an_eviction_that_is_still_closing(self):
+        # trim() 先把运行时摘出映射、再去 await 关进程。摘掉之后 close_all() 就看不见
+        # 它了，而那一刻子进程还活着——登出正好落在这段里，就会删掉凭据、留下一条
+        # 握着 token 的活进程。所以摘的同时要记账，登出照着账等。
+        pool = self.make_pool(max_processes=1, primary_model=ALPHA)
+        alpha = pool.get(ALPHA)
+        beta = pool.get(BETA)
+        _start(alpha, beta)
+
+        gate = asyncio.Event()
+        real_shutdown = beta.shutdown
+
+        async def _slow_shutdown():
+            await gate.wait()  # 正在关，但还没关掉：started 仍是真
+            await real_shutdown()
+
+        beta.shutdown = _slow_shutdown
+
+        trimmer = asyncio.ensure_future(pool.trim())
+        await asyncio.sleep(0.05)
+        self.assertEqual(pool.status()["models"], [ALPHA], "它已经从映射里摘掉了")
+        self.assertTrue(beta.started, "可这一刻子进程还活着")
+
+        logging_out = asyncio.ensure_future(pool.logout(purge_config=True))
+        await asyncio.sleep(0.05)
+        self.assertEqual(alpha.logouts, [], "淘汰没落地之前不许删凭据")
+
+        gate.set()
+        await trimmer
+        await logging_out
+        self.assertEqual(alpha.logouts, [True], "关干净了才删")
+        self.assertFalse(beta.started)
+
+    async def test_logout_refuses_to_purge_while_an_eviction_never_dies(self):
+        # 等不到就交给存活检查：那条进程真的死不了，凭据就一个字节也不许删。
+        pool = self.make_pool(max_processes=1, primary_model=ALPHA)
+        alpha = pool.get(ALPHA)
+        beta = pool.get(BETA)
+        _start(alpha, beta)
+
+        gate = asyncio.Event()
+
+        async def _stuck_shutdown():
+            await gate.wait()  # 关不掉：started 保持真
+
+        beta.shutdown = _stuck_shutdown
+
+        trimmer = asyncio.ensure_future(pool.trim())
+        await asyncio.sleep(0.05)
+        self.assertTrue(beta.started)
+
+        # 等的时间压缩到 0.05 秒：这里验的是"等不到之后怎么办"，不是等多久。
+        with mock.patch.object(pool_module, "_LOGOUT_DRAIN_SECONDS", 0.05):
+            with self.assertRaises(AcpError):
+                await pool.logout(purge_config=True)
+        self.assertEqual(alpha.logouts, [], "没关干净就不许删凭据")
+
+        gate.set()
+        await trimmer
 
 
 class ShutdownTests(_PoolCase):
