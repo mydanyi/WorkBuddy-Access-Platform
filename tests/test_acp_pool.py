@@ -368,6 +368,57 @@ class TrimTests(_PoolCase):
 
         self.assertEqual(await pool.trim(), 0, "进程还在，不许报成关掉了")
 
+    async def test_a_child_that_survives_eviction_still_counts_against_the_cap(self):
+        # 漏网的那条已经不在映射里，可它还是占着一条进程位。只数映射，池子就会以为
+        # 还有一个空位：于是它不再收别的进程，超出去的那部分一直挂在那儿，而且每漏
+        # 一次就多放宽一条。
+        pool = self.make_pool(max_processes=2, primary_model=ALPHA)
+        alpha = pool.get(ALPHA)
+        beta = pool.get(BETA)
+        gamma = pool.get(GAMMA)
+        _start(alpha, beta, gamma)
+
+        async def _never_dies():
+            return None  # 进程还在：started 保持真
+
+        beta.shutdown = _never_dies
+
+        self.assertEqual(await pool.trim(), 0, "淘汰这条没关掉，不许报成关掉了")
+        self.assertTrue(beta.started, "杀不掉的那条仍然占着位子")
+        self.assertEqual(pool.status()["models"], [ALPHA, GAMMA])
+
+        # 第二轮到它算账：映射里只剩两条、看起来正好到上限，可账上那条还活着。
+        self.assertEqual(await pool.trim(), 1, "它也算位子，所以还得再收一条")
+        self.assertEqual(gamma.shutdowns, 1)
+        self.assertEqual(alpha.shutdowns, 0, "主运行时永远不动")
+        self.assertEqual(pool.status()["models"], [ALPHA])
+
+    async def test_the_next_trim_retries_a_stray_instead_of_leaving_it_there(self):
+        # 留在账上不是留个纪念：下一轮超编时先把它再关一次。它已经不在映射里、谁也
+        # 领不走，关掉就是白赚一个位子——比再淘汰一条正在待命的进程划算。
+        pool = self.make_pool(max_processes=1, primary_model=ALPHA)
+        alpha = pool.get(ALPHA)
+        beta = pool.get(BETA)
+        _start(alpha, beta)
+
+        attempts = []
+
+        async def _dies_on_the_second_try():
+            attempts.append(1)
+            if len(attempts) > 1:
+                beta.started = False
+
+        beta.shutdown = _dies_on_the_second_try
+
+        self.assertEqual(await pool.trim(), 0, "第一次没关掉，不许报成关掉了")
+        self.assertTrue(beta.started)
+        self.assertEqual(pool.status()["models"], [ALPHA])
+
+        self.assertEqual(await pool.trim(), 1, "下一轮超编时再试一次，这次关掉了")
+        self.assertFalse(beta.started)
+        self.assertEqual(len(attempts), 2)
+        self.assertEqual(alpha.shutdowns, 0, "重试就能收掉，不必动待命的那条")
+
 
 class CloseAllTests(_PoolCase):
     """``close_all`` 只关不摘：登出后仍要能重新拉起同一条。"""
@@ -701,6 +752,32 @@ class ShutdownTests(_PoolCase):
         self.assertFalse(beta.started, "卸载时要把它也关掉，不然没人再认领这条进程")
         self.assertEqual(len(attempts), 2, "淘汰那次失败，关停要再试一次")
         self.assertEqual(alpha.shutdowns, 1)
+
+    async def test_a_second_shutdown_can_still_close_what_the_first_one_missed(self):
+        # 第一次关不掉时，那条进程得留在账上：清单提前清空等于把"没关掉"改写成
+        # "没有这条"，连再试一次的把手都不剩。
+        pool = self.make_pool(max_processes=1, primary_model=ALPHA)
+        alpha = pool.get(ALPHA)
+        beta = pool.get(BETA)
+        _start(alpha, beta)
+
+        attempts = []
+
+        async def _dies_on_the_third_try():
+            attempts.append(1)
+            if len(attempts) >= 3:
+                beta.started = False
+
+        beta.shutdown = _dies_on_the_third_try
+
+        self.assertEqual(await pool.trim(), 0, "淘汰那一次没关掉")
+        await pool.shutdown()
+        self.assertTrue(beta.started, "关不掉就是关不掉，账本要说实话")
+        self.assertEqual(len(attempts), 2, "卸载时试过一次")
+
+        await pool.shutdown()
+        self.assertFalse(beta.started, "第二次还得能顺着账本找到它")
+        self.assertEqual(len(attempts), 3)
 
     async def test_shutdown_survives_a_runtime_that_refuses_to_stop(self):
         pool = self.make_pool()

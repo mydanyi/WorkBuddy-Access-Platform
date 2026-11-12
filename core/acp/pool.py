@@ -310,16 +310,67 @@ class AcpRuntimePool:
 
     # -- 回收 ---------------------------------------------------------------
 
+    def _strays(self):
+        """账上那几条：已经摘出映射、子进程却还活着。
+
+        它们仍然占着一条进程位，只是没人能从池子里领取它们。
+        """
+        return [runtime for runtime in self._evicting if runtime.started]
+
+    def _occupied(self, exclude=()):
+        """占着进程位的两拨，返回 ``(映射里的模型, 账上还活着的条数)``。
+
+        只数映射会把上限悄悄放宽成"上限 + 漏网的条数"，而每漏一次就多放宽一条：
+        淘汰失败之后，池子以为自己有空位，接着拉起新进程，超出的部分再也没人收。
+
+        ``exclude`` 是**本次调用正在关**的那几条。它们还没死，但已经在收尾队列里，
+        再算进占位就成了自己逼自己：一边关一边把自己算成超额，最后把池子清空。
+
+        调用方必须持 ``_trim_lock``。
+        """
+        models = [
+            model
+            for model, runtime in self._runtimes.items()
+            if runtime.started or self._busy.get(model)
+        ]
+        strays = [
+            runtime
+            for runtime in self._evicting
+            if runtime.started and runtime not in exclude
+        ]
+        return models, len(strays)
+
+    async def _reclaim_strays(self) -> int:
+        """超编时把账上那几条再关一次，返回这次真关掉的条数。
+
+        它们已经不在映射里、没有调用方还能领取，关掉就是白赚一个位子。**只在超编
+        时试**：正常流量不该为一个罕见的分支付一整个关闭超时。关不掉的照旧留在账
+        上，下一轮或 :meth:`shutdown` 接着来。
+        """
+        async with self._trim_lock:
+            models, stray = self._occupied()
+            if len(models) + stray <= self._max:
+                return 0
+            strays = self._strays()
+        if not strays:
+            return 0
+        closed = await self._close_batch(strays, "shutdown")
+        self._evicting.difference_update(
+            runtime for runtime in strays if not runtime.started
+        )
+        return closed
+
     async def trim(self) -> int:
         """把空闲进程收到上限以内，返回真正关掉的条数。
 
         选"最久未用的空闲进程"淘汰。挑不到（全在忙）就停手：宁可暂时超额，也不动
         正在出字的进程。主运行时永不淘汰。
 
-        **占位算的是"起来的 + 正在被领取的"。** 只数 ``runtime.started`` 会漏掉窗口：
-        ``lease`` 里先 ``trim`` 再交给调用方，而进程是调用方稍后
+        **占位算的是"起来的 + 正在被领取的 + 账上还没死的"。** 只数 ``runtime.started``
+        会漏掉窗口：``lease`` 里先 ``trim`` 再交给调用方，而进程是调用方稍后
         ``ensure_started()`` 才拉起来的。只数已启动的话，"先领 A 再领 B"两次都能通过
-        限额检查，最后两条进程一起活着；释放时又没人收，上限形同虚设。
+        限额检查，最后两条进程一起活着；释放时又没人收，上限形同虚设。账上那几条同理
+        ——它们不在映射里，但子进程确实还在占内存。
 
         返回值只数**关成功**的：``shutdown()`` 抛异常的那条算没关掉，少报一条总比
         报一条假的强。
@@ -328,15 +379,13 @@ class AcpRuntimePool:
         关闭还没落地——登出那一刻正好落在这段里，就会删掉凭据、留下一条握着 token
         的活进程。关干净了才出账；关不掉的那条**留在账上**，让登出照样看得见它。
         """
+        # 上一轮没关掉的那几条先收拾一遍，它们和下面的淘汰一起算进上限。
+        reclaimed = await self._reclaim_strays()
         victims = []
         async with self._trim_lock:
             while True:
-                occupied = [
-                    model
-                    for model, runtime in self._runtimes.items()
-                    if runtime.started or self._busy.get(model)
-                ]
-                if len(occupied) <= self._max:
+                occupied, stray = self._occupied(victims)
+                if len(occupied) + stray <= self._max:
                     break
                 idle = [
                     model
@@ -356,7 +405,7 @@ class AcpRuntimePool:
                 self._last_used.pop(victim, None)
 
         try:
-            return await self._close_batch(victims, "shutdown")
+            return reclaimed + await self._close_batch(victims, "shutdown")
         finally:
             # 只把真关掉的出账。还活着的留在账上：它已经不在映射里，除这份账之外
             # 没有任何地方还能看见"这条进程还没死"。
@@ -422,6 +471,9 @@ class AcpRuntimePool:
         里；池一散，除 ``_evicting`` 之外再没人看着它们，留着就是一条活过插件生命
         周期的 CLI。淘汰那一次失败不代表这一次也失败——重试一次比放弃强。
 
+        **关完才出账，而且只出真关掉的。** 提前清空等于把"没关掉"改写成"没有这条"：
+        这次仍然杀不掉的话，引用就跟着清单一起没了，连再试一次的把手都不剩。
+
         与正在进行的淘汰撞上也没事：``AcpRuntime.close`` 持 ``_start_lock``，
         后到的那次会等前一次关完再看一眼，已经死透就什么都不做。
         """
@@ -432,8 +484,10 @@ class AcpRuntimePool:
             self._runtimes.clear()
             self._last_used.clear()
             self._busy.clear()
-            self._evicting.clear()
         await self._close_batch(runtimes, "shutdown")
+        self._evicting.difference_update(
+            runtime for runtime in runtimes if not runtime.started
+        )
 
 
 __all__ = ["AcpRuntimePool"]
