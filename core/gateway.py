@@ -41,6 +41,7 @@ import asyncio
 import contextlib
 import hmac
 import json
+import logging
 import math
 
 from aiohttp import web
@@ -54,6 +55,8 @@ COMPLETIONS_PATH = "/v1/chat/completions"
 MODELS_PATH = "/v1/models"
 HEALTH_PATH = "/health"
 HEALTHZ_PATH = "/healthz"
+
+_log = logging.getLogger(__name__)
 
 _MIB = 1024 * 1024
 # Approved default body cap; ``0`` never means "unlimited".
@@ -473,6 +476,10 @@ class Gateway:
             except (UpstreamError, ChatStreamError) as exc:
                 return self._failed_error(exc)
             except Exception:
+                # 未预料的异常到调用方只剩一句固定的 502，不打日志根因就彻底消失了。
+                # 真实踩过：Path 混进 JSON 报 TypeError，外面看到的就是没头没尾的
+                # "upstream request failed"。异常原文只进日志，绝不进响应。
+                _log.warning("gateway: unexpected chat failure", exc_info=True)
                 return self._failed_error(ChatStreamError("upstream chat request failed"))
             finally:
                 await _aclose(agen)
@@ -492,6 +499,8 @@ class Gateway:
             return self._failed_error(exc)
         except Exception:
             await _aclose(agen)
+            # 同上：首帧之前的未预知失败也要留下根因，不能再是无声的 502。
+            _log.warning("gateway: unexpected chat failure before the first frame", exc_info=True)
             return self._failed_error(ChatStreamError("upstream chat request failed"))
         except BaseException:
             await _aclose(agen)

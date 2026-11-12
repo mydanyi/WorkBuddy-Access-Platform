@@ -11,6 +11,7 @@ Python 3.12 环境里独立跑。真 AstrBot 集成另有 P4 阶段。
 from __future__ import annotations
 
 import asyncio
+import json
 import sys
 import unittest
 from pathlib import Path
@@ -481,6 +482,43 @@ class EofBeforeResultTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(done, "完整的一轮必须收尾成 done，而不是抛错")
         self.assertEqual(done["stop_reason"], "end_turn")
         self.assertTrue(transport.unsubscribed)
+
+
+class _CapturingTransport:
+    """只把报文记下来的假传输层，不发任何东西。"""
+
+    def __init__(self):
+        self.sent = []
+
+    async def request(self, method, params, timeout=None):
+        self.sent.append((method, params))
+        return {"sessionId": "sess-1"}
+
+
+class PathCwdTests(unittest.IsolatedAsyncioTestCase):
+    """``cwd`` 可能是 ``pathlib.Path``（AstrBot 的 ``get_data_dir()`` 就是）。
+
+    真管道上 Path 进 JSON 会炸 ``TypeError: Object of type PosixPath is not JSON
+    serializable``，而网关只会把它压成一句 "upstream request failed"，从外部
+    完全看不出根因。用例只要求一件事：发出去的报文原样能序列化。
+    """
+
+    async def test_a_path_cwd_is_serialised_as_a_string(self):
+        transport = _CapturingTransport()
+        client = AcpClient(transport, cwd=Path("/tmp/wb-cwd"))
+        self.assertEqual(await client._create_session(), "sess-1")
+        params = transport.sent[-1][1]
+        self.assertIsInstance(params["cwd"], str)
+        self.assertEqual(params["cwd"], "/tmp/wb-cwd")
+        json.dumps(params)  # 不抛，才算真能在管道上过
+
+    async def test_an_explicit_path_cwd_wins(self):
+        transport = _CapturingTransport()
+        client = AcpClient(transport, cwd="/tmp/default")
+        await client._create_session(cwd=Path("/tmp/override"))
+        params = transport.sent[-1][1]
+        self.assertEqual(params["cwd"], "/tmp/override")
+        json.dumps(params)
 
 
 if __name__ == "__main__":

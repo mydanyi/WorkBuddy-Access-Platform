@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import os
 
 from .protocol import (
     M_AUTHENTICATE,
@@ -148,9 +149,18 @@ class AcpClient:
 
     async def _create_session(self, cwd=None) -> str:
         """建一个 ACP 会话并返回 id；不落进任何映射。"""
+        # ``cwd`` 可能是 ``pathlib.Path``——AstrBot 的 ``StarTools.get_data_dir()``
+        # 返回的就是它。原样塞进 JSON 会在 ``json.dumps`` 里炸成
+        # ``TypeError: Object of type PosixPath is not JSON serializable``，而网关
+        # 只会把它压成一句 "upstream request failed"，从外面完全看不出是这里。
+        # JSON 里只能是字符串，所以在报文边界统一转一次。
+        target = cwd or self._cwd
         result = await self._transport.request(
             M_SESSION_NEW,
-            {"cwd": cwd or self._cwd, "mcpServers": []},
+            {
+                "cwd": None if target is None else os.fspath(target),
+                "mcpServers": [],
+            },
         )
         session_id = result.get("sessionId")
         if not isinstance(session_id, str) or not session_id:

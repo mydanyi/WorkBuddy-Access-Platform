@@ -226,6 +226,9 @@ class WorkBuddyPlugin(Star):
                 on_result=self._on_signin_result,
             )
         except Exception:
+            # 这条 except 把任何构造期异常都压成一句"初始化失败"。不打日志，日志里
+            # 就真的只剩这一句——真实踩过：网关端口被占和字段读错长得一模一样。
+            _log.exception("workbuddy: runtime construction failed")
             await self._release_runtime()
             self._fail("插件初始化失败，请查看日志后重载。")
             return
