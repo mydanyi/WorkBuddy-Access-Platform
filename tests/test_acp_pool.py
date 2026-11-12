@@ -417,7 +417,42 @@ class TrimTests(_PoolCase):
         self.assertEqual(await pool.trim(), 1, "下一轮超编时再试一次，这次关掉了")
         self.assertFalse(beta.started)
         self.assertEqual(len(attempts), 2)
-        self.assertEqual(alpha.shutdowns, 0, "重试就能收掉，不必动待命的那条")
+        self.assertEqual(alpha.shutdowns, 0, "账上那条收掉就够了，主运行时更不该动")
+
+    async def test_a_cancelled_trim_leaves_the_stray_findable(self):
+        # 取消落在关进程那一段时，那条进程既没死、也不在映射里。账本要是跟着被清掉，
+        # 下一轮就再没人认领它，上限从此永久少一个名额。
+        pool = self.make_pool(max_processes=1, primary_model=ALPHA)
+        alpha = pool.get(ALPHA)
+        beta = pool.get(BETA)
+        _start(alpha, beta)
+        gate = asyncio.Event()
+
+        async def _stubborn_beta():
+            await gate.wait()  # 起来之后也不死
+
+        beta.shutdown = _stubborn_beta
+
+        trimming = asyncio.ensure_future(pool.trim())
+        await asyncio.sleep(0.05)
+        trimming.cancel()
+        gate.set()
+        with self.assertRaises(asyncio.CancelledError):
+            await trimming
+        self.assertTrue(beta.started, "这一条没关掉")
+        self.assertEqual(pool.status()["models"], [ALPHA])
+
+        attempts = []
+
+        async def _dies_on_the_second_try():
+            attempts.append(1)
+            beta.started = False
+
+        beta.shutdown = _dies_on_the_second_try
+        self.assertEqual(await pool.trim(), 1, "账本还在，下一轮还能找回它")
+        self.assertFalse(beta.started)
+        self.assertEqual(len(attempts), 1)
+        self.assertEqual(alpha.shutdowns, 0, "主运行时本来就不该动")
 
     async def test_a_stray_is_reclaimed_before_a_standby_runtime_is_evicted(self):
         # 顺序要钉住：账上那条谁都领不走，关掉就是白赚；待命的那条还能马上干活。
@@ -898,6 +933,10 @@ class ShutdownTests(_PoolCase):
         await pool.shutdown()
         self.assertFalse(beta.started, "第二次还得能顺着账本找到它")
         self.assertEqual(len(attempts), 3)
+        self.assertEqual(alpha.shutdowns, 1, "已经死透的就别再关一遍")
+
+        await pool.shutdown()
+        self.assertEqual(len(attempts), 3, "账本清了，第三轮不该再碰它")
 
     async def test_a_second_shutdown_also_finds_a_child_that_came_from_the_mapping(
         self,
@@ -926,6 +965,10 @@ class ShutdownTests(_PoolCase):
         await pool.shutdown()
         self.assertFalse(beta.started, "映射清空之后，还得顺着账本找回它")
         self.assertEqual(len(attempts), 2)
+        self.assertEqual(alpha.shutdowns, 1, "已经死透的就别再关一遍")
+
+        await pool.shutdown()
+        self.assertEqual(len(attempts), 2, "账本清了，第三轮不该再碰它")
 
     async def test_shutdown_survives_a_runtime_that_refuses_to_stop(self):
         pool = self.make_pool()

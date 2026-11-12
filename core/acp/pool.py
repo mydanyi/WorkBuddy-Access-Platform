@@ -450,6 +450,11 @@ class AcpRuntimePool:
         再来一次，那个 ``await`` 同样会被打断，单次 ``suppress`` 就只能放行——方法
         抛出去而 ``cleanup`` 还在跑，之后事件循环若把它一并取消，剩下几条就没人关。
         所以循环等到 ``done()`` 为止，循环本身也扛得住反复取消。
+
+        **同一批可能同时被别人关着。** ``shutdown`` 与 ``_reclaim_strays`` 各自快照，
+        会捞到同一条进程；谁的 ``finally`` 先撤 ``_closing`` 戳，第三方就可能再关一遍。
+        这里不做互斥，靠的是 ``AcpRuntime.close`` / ``shutdown`` 持 ``_start_lock``、
+        对已经死透的那条是 no-op——池这边只负责不重复记账。
         """
         async def _run():
             count = 0
