@@ -942,7 +942,6 @@ class _PluginIntegrationTestCase(unittest.IsolatedAsyncioTestCase):
         runtime._gate.set()
         await asyncio.wait_for(plugin._login_task, timeout=5)
 
-    # -- 5b. logout revokes; manual signin allowed when auto is off -------
     async def test_a_cancelled_command_still_pushes_the_link_that_arrives_later(self):
         # 命令被取消（插件重载、上层超时）时回复根本交不出去，但登录协程按不变量还
         # 留着等扫码。这时后到的链接只能走通知——门如果在取消路径上漏成 False，
@@ -989,6 +988,59 @@ class _PluginIntegrationTestCase(unittest.IsolatedAsyncioTestCase):
 
         runtime._gate.set()
         await asyncio.wait_for(plugin._login_task, timeout=5)
+
+    async def test_a_cancelled_command_pushes_the_link_it_already_holds(self):
+        # 链接已经到手、回调却还没推过（那一刻门还是 False）——它本来要跟着回复一起
+        # 交出去。命令这时被取消，回复没了，链接也就跟着没了：收尾时得补一条。
+        plugin = await self._make_plugin(**self._make_ready_plugin_config())
+        holder = {}
+        runtime = _StubAcpRuntime(
+            block=True,
+            link_delay=0.05,
+            after_link=lambda: holder["pending"].cancel(),
+        )
+        plugin.acp = _StubAcpPool(runtime)
+
+        pending = asyncio.create_task(
+            _invoke(plugin.wb, _make_event("wb login"), "login", "")
+        )
+        holder["pending"] = pending
+        with self.assertRaises(asyncio.CancelledError):
+            await pending
+
+        await asyncio.sleep(0.05)
+        self.assertEqual(
+            len(plugin.context.sent), 1, "链接已经到手了，不能跟着回复一起消失"
+        )
+        self.assertIn("https", str(plugin.context.sent[0][1]))
+
+        runtime._gate.set()
+        await asyncio.wait_for(plugin._login_task, timeout=5)
+
+    async def test_a_cancelled_logout_does_not_leave_the_alert_gate_closed(self):
+        # ``_logout_in_progress`` 是管理员告警的闸门。收尸那步被取消时，登出还什么
+        # 都没做——进程没关、凭据没删；闸门要是留在 True 上，此后每一次失败都不再
+        # 上报，直到下次登录成功才被解开。
+        plugin = await self._make_plugin(**self._make_ready_plugin_config())
+
+        async def _slow_to_die():
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                # 拖一下，好让取消落在"等在登录任务收尸"那一步。
+                await asyncio.sleep(0.2)
+                raise
+
+        plugin._login_task = asyncio.create_task(_slow_to_die())
+        pending = asyncio.create_task(
+            _invoke(plugin.wb, _make_event("wb logout"), "logout", "")
+        )
+        await asyncio.sleep(0.05)
+        pending.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await pending
+
+        self.assertFalse(plugin._logout_in_progress, "登出没做成，闸门不许关上")
 
     # -- 5b. logout revokes; manual signin allowed when auto is off -------
     async def test_logout_revokes_and_manual_signin_allowed_when_auto_disabled(self):

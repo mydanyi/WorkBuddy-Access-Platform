@@ -813,6 +813,8 @@ class WorkBuddyPlugin(Star):
         # 这条命令的回复一旦交出去，再推一次链接就是第二份。只有"回复里没有链接"的
         # 那种情况才需要补发，见下面 ``_on_auth_url``。
         answered = {"done": False}
+        # 回调有没有真把这条链接推出去过。取消除草时靠它判断"手上这条还需不需要补发"。
+        pushed = {"sent": False}
 
         def _on_auth_url(url: str) -> None:
             captured["url"] = url
@@ -821,6 +823,7 @@ class WorkBuddyPlugin(Star):
             # 一模一样的链接（真机上就是这么弹了两个）。回复已经交出去了才要补一条：
             # 那种情况下用户手里只有"稍后查看"，不补就永远等不到。
             if answered["done"]:
+                pushed["sent"] = True
                 task = asyncio.create_task(self._notify("登录链接：\n" + url))
                 task.add_done_callback(self._consume_task)
 
@@ -847,8 +850,12 @@ class WorkBuddyPlugin(Star):
         except BaseException:
             # 取消路径上没有"回复"这回事——命令已经结束了。但登录协程还留着等扫码，
             # 这时不把通道切到通知，后到的链接会以为"回复里带了"，一条也不发，用户
-            # 只能干等到超时。
+            # 只能干等到超时。已经到手、回调却还没推过的那条（那一刻门还是 False）
+            # 同样要在这里补一次：它本来要跟着回复一起交出去的，回复没了它也就没了。
             answered["done"] = True
+            if captured["url"] and not pushed["sent"]:
+                late = asyncio.create_task(self._notify("登录链接：\n" + captured["url"]))
+                late.add_done_callback(self._consume_task)
             waiter.cancel()
             raise
 
@@ -939,9 +946,6 @@ class WorkBuddyPlugin(Star):
         return True
 
     async def _logout(self) -> str:
-        # Mark the intentional logout first: credentials are cleared on purpose,
-        # so even a failure mid-logout must never raise a spurious error notice.
-        self._logout_in_progress = True
         existing = self._login_task
         self._login_task = None
         if existing is not None and not existing.done():
@@ -952,6 +956,11 @@ class WorkBuddyPlugin(Star):
             # 退出登录处会边被取消边删凭据）。``gather`` 把前者的 ``CancelledError``
             # 收成返回值，后者照常往外抛。
             await asyncio.gather(existing, return_exceptions=True)
+        # 标记"这次登出是有意的"：凭据是被主动清掉的，中途出岔子也不该弹一条假的
+        # 告警。**置在这里而不是函数开头**——上面那步被取消时进程没关、凭据也没删，
+        # 什么都不该留下；而这个标志是告警的闸门，漏在 True 上就等于从此不再报任何
+        # 失败，直到下一次登录成功才被 ``_on_login_success`` 解开。
+        self._logout_in_progress = True
         # 退出登录要删两处：CLI 配置目录，以及真正的凭据目录（在 ~/.local/share
         # 下，只有改了 HOME 才圈得住）。只删配置等于没退。
         purge_failed = False
