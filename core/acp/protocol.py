@@ -90,6 +90,15 @@ class AcpProtocolError(AcpError):
     """线协议被破坏（非 JSON 行、帧过大、结构不符）。不可恢复。"""
 
 
+class AcpFrameTooLarge(AcpError):
+    """要发出去的那一帧超过了单帧上限，**根本没发出去**。
+
+    和 :class:`AcpProtocolError` 分开，因为责任方不一样：坏帧是上游发来的，超长帧
+    是调用方给的 prompt 太大。混成同一句 "stream was malformed" 会把人往 CLI 上引，
+    而真正该做的是让调用方把请求改小——所以它映射成 413，不是一个查不出原因的 502。
+    """
+
+
 class AcpRpcError(AcpError):
     """JSON-RPC 错误响应。
 

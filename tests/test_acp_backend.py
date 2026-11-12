@@ -23,6 +23,7 @@ if str(_SOURCE_ROOT) not in sys.path:
 from astrbot_plugin_workbuddy.core.acp import (  # noqa: E402
     AcpClient,
     AcpError,
+    AcpFrameTooLarge,
     AcpTransport,
 )
 from astrbot_plugin_workbuddy.core.acp.backend import (  # noqa: E402
@@ -288,6 +289,25 @@ class StreamShapeTests(BackendTestCase):
         self.assertIn("用户：第一句", text)
         self.assertIn("助手：第一答", text)
         self.assertTrue(text.rstrip().endswith("第二句"))
+
+
+class FrameTooLargeTests(unittest.IsolatedAsyncioTestCase):
+    """帧发不出去时，错误要指向调用方，不能甩给上游。"""
+
+    async def test_an_oversized_prompt_is_a_413_not_a_502(self):
+        class _Client:
+            def prompt_once(self, text, *, timeout=None):
+                async def _nothing():
+                    raise AcpFrameTooLarge("outgoing acp frame was too large")
+                    yield  # pragma: no cover - 走不到，只是让它成为异步生成器
+
+                return _nothing()
+
+        backend = AcpChatBackend(_Client(), model="glm-5.2", prompt_timeout=3.0)
+        with self.assertRaises(UpstreamError) as ctx:
+            async for _chunk in backend.stream(_payload("hi")):
+                pass
+        self.assertEqual(ctx.exception.status, 413, "这一帧没发出去，不是上游的错")
 
 
 class BackendUserEchoTests(BackendTestCase):

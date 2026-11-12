@@ -25,6 +25,7 @@ from .protocol import (
     ERROR_METHOD_NOT_FOUND,
     JSONRPC_VERSION,
     M_SESSION_REQUEST_PERMISSION,
+    AcpFrameTooLarge,
     AcpProcessError,
     AcpProtocolError,
     AcpRpcError,
@@ -245,7 +246,7 @@ class AcpTransport:
             raise AcpProcessError("acp stdin is closed")
         data = encode_message(payload)
         if len(data) > MAX_FRAME_BYTES:
-            raise AcpProtocolError("outgoing acp frame was too large")
+            raise AcpFrameTooLarge("outgoing acp frame was too large")
         stdin.write(data)
 
     async def _send(self, payload, *, strict=False) -> None:

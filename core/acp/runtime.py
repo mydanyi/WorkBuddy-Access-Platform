@@ -168,7 +168,14 @@ class AcpRuntime:
 
     @property
     def started(self) -> bool:
-        return self._transport is not None and self._transport.running
+        """这条运行时是否还占着一个进程位。
+
+        **不能只看"管道还能不能用"。** 读循环因坏帧退出之后 ``transport.running``
+        立刻变假，可子进程还活着：只按它数，这条进程既不计入上限、也永远不会被挑成
+        淘汰对象，几轮坏帧就能把池子撑到上限之外。``alive`` 把"管道已死、进程还在"
+        也算上，``trim()`` 才有机会把它收掉。
+        """
+        return self._transport is not None and self._transport.alive
 
     @property
     def auth_state(self):

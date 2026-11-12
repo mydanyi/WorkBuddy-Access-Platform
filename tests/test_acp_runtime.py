@@ -28,6 +28,7 @@ from astrbot_plugin_workbuddy.core.acp import (  # noqa: E402
     CONFIG_DIR_NAME,
     AcpError,
     AcpProcessError,
+    AcpProtocolError,
     AcpRuntime,
     AcpTimeoutError,
     AcpTransport,
@@ -124,6 +125,23 @@ class ShutdownCancellationTests(RuntimeTestCase):
             await closer
         self.assertIsNotNone(proc.returncode, "取消之后进程还活着")
         self.assertIsNone(runtime.transport, "关干净了就该摘掉引用")
+
+
+class WedgedProcessTests(RuntimeTestCase):
+    """管道坏了但进程还活着：它仍然占着一个名额，不能被当成"没启动"。"""
+
+    async def test_a_wedged_child_still_counts_as_occupied(self):
+        runtime = self.make_runtime("malformed")
+        await runtime.ensure_started()
+        with self.assertRaises(AcpProtocolError):
+            await runtime.transport.request(
+                "session/new", {"cwd": str(self.root), "mcpServers": []}
+            )
+        self.assertFalse(runtime.transport.running, "这条管道已经废了")
+        self.assertTrue(runtime.transport.alive, "但子进程还在跑")
+        self.assertTrue(
+            runtime.started, "不计入上限的话，几轮坏帧就能把进程数撑到上限之外"
+        )
 
 
 class StartTests(RuntimeTestCase):

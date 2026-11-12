@@ -60,6 +60,7 @@ from .protocol import (
     STOP_END_TURN,
     STOP_MAX_TOKENS,
     AcpError,
+    AcpFrameTooLarge,
     AcpProcessError,
     AcpProtocolError,
     AcpRpcError,
@@ -400,6 +401,11 @@ class AcpChatBackend:
                 raise UpstreamError(502) from None
             except AcpTimeoutError:
                 raise UpstreamError(504) from None
+            except AcpFrameTooLarge:
+                # 这一帧**没发出去**：不是上游坏了，是调用方这段 prompt 编码后超过了
+                # 单帧上限（网关的请求体上限比它宽松，所以放得进来）。回 413 让它把
+                # 请求改小，而不是丢一句 "stream was malformed" 让人去查 CLI。
+                raise UpstreamError(413) from None
             except AcpProcessError:
                 raise UpstreamError(502) from None
             except AcpProtocolError:

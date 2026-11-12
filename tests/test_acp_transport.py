@@ -26,6 +26,7 @@ from astrbot_plugin_workbuddy.core.acp import (  # noqa: E402
     KIND_TEXT,
     KIND_THOUGHT,
     AcpClient,
+    AcpFrameTooLarge,
     AcpProcessError,
     AcpProtocolError,
     AcpRpcError,
@@ -34,6 +35,7 @@ from astrbot_plugin_workbuddy.core.acp import (  # noqa: E402
     SESSION_CLOSED,
 )
 from astrbot_plugin_workbuddy.core.acp import protocol  # noqa: E402
+from astrbot_plugin_workbuddy.core.acp.transport import MAX_FRAME_BYTES  # noqa: E402
 
 _FAKE = str(_HERE.parent / "fake_acp_cli.py")
 
@@ -259,6 +261,17 @@ class SendFailureTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(AcpProcessError):
             await transport.request("test/echo", {}, timeout=5.0)
         self.assertLess(loop.time() - started, 1.0, "不该傻等到超时")
+
+    async def test_an_oversized_frame_blames_the_caller_not_the_upstream(self):
+        # 网关的请求体上限（默认 16 MB）比单帧上限（8 MiB）宽松，所以"体量大到发不
+        # 出去"的请求能走进来。这一帧根本没发出去，报成"上游流坏了"是甩锅，还会让
+        # 人去查 CLI；它该是一个能让调用方改小请求的 413。
+        transport = AcpTransport(_argv("happy"), request_timeout=5.0)
+        transport._proc = _DeafProcess()
+        with self.assertRaises(AcpFrameTooLarge):
+            await transport.request(
+                "session/prompt", {"text": "x" * (MAX_FRAME_BYTES + 1024)}
+            )
 
 
 class InitializeTests(TransportTestCase):
