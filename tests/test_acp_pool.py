@@ -426,6 +426,39 @@ class CloseAllTests(_PoolCase):
         await pool.close_all()  # 一条关不掉不能拖累另一条
         self.assertEqual(beta.closes, 1)
 
+    async def test_a_second_cancellation_still_waits_for_the_batch(self):
+        # 第一次取消之后我们在等收尾；等的过程中再来一次，单次 suppress 就会放行——
+        # 方法抛出去而剩下那几条还在关，之后事件循环把它们一并取消就没人管了。
+        pool = self.make_pool()
+        alpha = pool.get(ALPHA)
+        beta = pool.get(BETA)
+        _start(alpha, beta)
+
+        gate = asyncio.Event()
+        entered = asyncio.Event()
+        real_close = alpha.close
+
+        async def _slow_close():
+            entered.set()
+            await gate.wait()
+            await real_close()
+
+        alpha.close = _slow_close
+
+        closer = asyncio.ensure_future(pool.close_all())
+        await entered.wait()
+        closer.cancel()
+        await asyncio.sleep(0.05)  # 让第一次取消落地，走进"等收尾"那一段
+        closer.cancel()
+        await asyncio.sleep(0.05)
+        self.assertFalse(closer.done(), "第二次取消也不许提前抛出去")
+
+        gate.set()
+        with self.assertRaises(asyncio.CancelledError):
+            await closer
+        self.assertEqual(alpha.closes, 1)
+        self.assertEqual(beta.closes, 1, "排在后面的不能因为二次取消就留下")
+
     async def test_logout_closes_everything_before_purging_credentials(self):
         pool = self.make_pool(primary_model=ALPHA)
         alpha = pool.get(ALPHA)

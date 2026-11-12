@@ -358,6 +358,11 @@ class AcpRuntimePool:
         取消时等它跑完再把 ``CancelledError`` 往外传。
 
         ``how`` 是方法名：淘汰与永久关闭用 ``shutdown``，登录后重启用 ``close``。
+
+        **取消可能来不止一次。** 第一次取消之后我们在这儿等 ``cleanup``；等的过程中
+        再来一次，那个 ``await`` 同样会被打断，单次 ``suppress`` 就只能放行——方法
+        抛出去而 ``cleanup`` 还在跑，之后事件循环若把它一并取消，剩下几条就没人关。
+        所以循环等到 ``done()`` 为止，循环本身也扛得住反复取消。
         """
         async def _run():
             count = 0
@@ -371,8 +376,9 @@ class AcpRuntimePool:
         try:
             return await asyncio.shield(cleanup)
         except asyncio.CancelledError:
-            with contextlib.suppress(BaseException):
-                await asyncio.shield(cleanup)
+            while not cleanup.done():
+                with contextlib.suppress(BaseException):
+                    await asyncio.shield(cleanup)
             raise
 
     async def close_all(self) -> None:
