@@ -390,8 +390,9 @@ class AcpRuntimePool:
         限额检查，最后两条进程一起活着；释放时又没人收，上限形同虚设。账上那几条同理
         ——它们不在映射里，但子进程确实还在占内存。
 
-        返回值只数**关成功**的：``shutdown()`` 抛异常的那条算没关掉，少报一条总比
-        报一条假的强。
+        返回值只数**真关掉**的：``shutdown()`` 抛异常的那条算没关掉；正常返回但子进程
+        还活着的（``started`` 仍为真）也算没关掉。少报一条总比报一条假的强，而且和
+        下面出账用的是同一个判据——不能账本说它活着、返回值说它关掉了。
 
         摘出映射的同时把这条记进 ``_evicting``。它从此对 ``_runtimes`` 不可见，而
         关闭还没落地——登出那一刻正好落在这段里，就会删掉凭据、留下一条握着 token
@@ -494,12 +495,13 @@ class AcpRuntimePool:
         里；池一散，除 ``_evicting`` 之外再没人看着它们，留着就是一条活过插件生命
         周期的 CLI。淘汰那一次失败不代表这一次也失败——重试一次比放弃强。
 
-        **关完才出账，而且只出真关掉的。** 提前清空等于把"没关掉"改写成"没有这条"：
-        这次仍然杀不掉的话，引用就跟着清单一起没了，连再试一次的把手都不剩。映射里
-        来的那几条尤其要注意：清单已经清空，不把它们记到账上就是两头都没有。
+        **先在锁内入账，关完只销真关掉的。** 映射里那几条一摘出来就得记到账上：
+        ``_close_batch`` 被取消时会**等整批关完再把异常往外抛**，所以 await 之后的
+        记账一行都执行不到。真到那一步，映射已经清空、账上又没有它们，活下来的进程
+        就两头都没有了——连再试一次的把手都不剩。在锁内入账是同步的，取消插不进来。
 
-        因此**这个方法可以重复调用**：第一次没关掉的留在账上，第二次接着收。别把它
-        改成"关过一次就早退"——那会让账上那条永远没人认领。
+        **这个方法可以重复调用**：第一次没关掉的留在账上，第二次接着收。别把它改成
+        "关过一次就早退"——那会让账上那条永远没人认领。
 
         与正在进行的淘汰撞上也没事：``AcpRuntime.close`` 持 ``_start_lock``，
         后到的那次会等前一次关完再看一眼，已经死透就什么都不做。
@@ -507,18 +509,25 @@ class AcpRuntimePool:
         self._closed = True
         async with self._trim_lock:
             runtimes = list(self._runtimes.values())
-            runtimes.extend(self._evicting)
             self._runtimes.clear()
             self._last_used.clear()
             self._busy.clear()
-        await self._close_batch(runtimes, "shutdown")
-        # 一条一条改账本，不整体覆盖：这期间可能还有淘汰在收尾，它记的那几条不能
-        # 被我这一笔抹掉。
-        for runtime in runtimes:
-            if runtime.started:
-                self._evicting.add(runtime)
-            else:
-                self._evicting.discard(runtime)
+            # 摘出映射的同一笔就记到账上，中间没有可取消的点。
+            self._evicting.update(runtimes)
+            runtimes = list(self._evicting)
+            # 收尾期间对并发调用不可见：``_reclaim_strays`` 不该再关一遍、也不该把
+            # 它们算成占位。池已作废，少算不算错；重复关才是白等一次关闭超时。
+            self._closing.update(runtimes)
+        try:
+            await self._close_batch(runtimes, "shutdown")
+        finally:
+            self._closing.difference_update(runtimes)
+            # 只销真关掉的。还活着的留在账上：它已经不在映射里，除这份账之外没有
+            # 任何地方还能看见"这条进程还没死"——第二次 ``shutdown()`` 要顺着它
+            # 再试一次，登出的存活检查也要看得见它才敢删凭据。
+            self._evicting.difference_update(
+                runtime for runtime in runtimes if not runtime.started
+            )
 
 
 __all__ = ["AcpRuntimePool"]

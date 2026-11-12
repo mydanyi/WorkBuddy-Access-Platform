@@ -805,6 +805,45 @@ class ShutdownTests(_PoolCase):
         self.assertEqual(alpha.shutdowns, 1, "被打断的那条也要关完")
         self.assertEqual(beta.shutdowns, 1, "排在后面的不能因为取消就不关了")
 
+    async def test_a_cancelled_shutdown_leaves_the_survivor_on_the_ledger(self):
+        # ``_close_batch`` 被取消时会等整批关完再把异常抛出去，所以 await 之后那段
+        # 记账一行都执行不到。映射已经清空，账上再没有它，这条活进程就两头都没有；
+        # 第二次 shutdown 也找不回来。
+        pool = self.make_pool()
+        alpha = pool.get(ALPHA)
+        beta = pool.get(BETA)
+        _start(alpha, beta)
+        gate = asyncio.Event()
+
+        async def _slow_alpha():
+            await gate.wait()
+            alpha.started = False
+
+        async def _stubborn_beta():
+            await gate.wait()  # 起来之后也不死：进程拒绝退出
+
+        alpha.shutdown = _slow_alpha
+        beta.shutdown = _stubborn_beta
+
+        stopper = asyncio.ensure_future(pool.shutdown())
+        await asyncio.sleep(0.05)
+        stopper.cancel()
+        gate.set()
+        with self.assertRaises(asyncio.CancelledError):
+            await stopper
+        self.assertTrue(beta.started, "这一条没关掉")
+
+        attempts = []
+
+        async def _dies_on_the_second_call():
+            attempts.append(1)
+            beta.started = False
+
+        beta.shutdown = _dies_on_the_second_call
+        await pool.shutdown()
+        self.assertFalse(beta.started, "取消跳过了记账，第二次就找不回来了")
+        self.assertEqual(len(attempts), 1)
+
     async def test_shutdown_retries_an_eviction_that_could_not_be_closed(self):
         # 淘汰关不掉的那条留在 ``_evicting`` 上：它已经不在映射里，池一散就再没人
         # 看着它。卸载/重载时必须把它也带上，而且**再试一次**——上一次失败不等于
