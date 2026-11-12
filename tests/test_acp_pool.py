@@ -521,6 +521,9 @@ class TrimTests(_PoolCase):
         self.assertEqual(len(attempts), 2)
         self.assertFalse(beta.started)
         self.assertFalse(gamma.started)
+        self.assertTrue(delta.started, "收够数就停，别拿待命的 DELTA 抵数")
+        self.assertEqual(delta.shutdowns, 0)
+        self.assertEqual(pool.status()["models"], [ALPHA, DELTA])
 
     async def test_two_overlapping_trims_count_the_same_close_only_once(self):
         # 关闭只能在锁外 await，所以另一个 trim 会在这段里看见"账上还有一条活着的"。
@@ -576,8 +579,9 @@ class TrimTests(_PoolCase):
 
     async def test_a_ledger_entry_that_died_on_its_own_frees_its_slot(self):
         # 护栏，不是旧实现的回归用例：`_forget_dead()` 在计数之前先清账，尸体到不了
-        # `_occupied()`，所以这条在当前实现下恒绿。它挡的是"把占位简化成只数集合、
-        # 顺手把清理当成冗余删掉"那种联动改动——那时这条会红。
+        # `_occupied()`，所以单处改动下它恒绿。两段断言各盯一件事：第一轮那句盯"占位
+        # 裸数集合"——淘汰循环每轮重算 `_occupied()`，本轮被淘汰的那批靠 `_closing` 戳
+        # 豁免占位，裸数就会在同一轮级联到待命的 GAMMA；第二轮那句盯"把清理当冗余删掉"。
         pool = self.make_pool(max_processes=2, primary_model=ALPHA)
         alpha = pool.get(ALPHA)
         beta = pool.get(BETA)  # 先领 BETA，让它成为最久未用的那条
@@ -946,11 +950,14 @@ class ShutdownTests(_PoolCase):
         stopper = asyncio.ensure_future(pool.shutdown())
         await asyncio.sleep(0.05)
         stopper.cancel()
+        await asyncio.sleep(0)
+        self.assertFalse(stopper.done(), "取消也要等整批关完再抛")
         gate.set()
         with self.assertRaises(asyncio.CancelledError):
             await stopper
         self.assertFalse(alpha.started, "取消也要等整批关完再抛")
         self.assertTrue(beta.started, "这一条没关掉")
+        self.assertEqual(pool.status()["models"], [], "映射要清干净，找回只能走账本")
 
         attempts = []
 
@@ -1045,6 +1052,7 @@ class ShutdownTests(_PoolCase):
         self.assertTrue(beta.started, "第一次没关掉")
         self.assertEqual(len(attempts), 1)
         self.assertEqual(alpha.shutdowns, 1, "清映射不等于不用关它")
+        self.assertEqual(pool.status()["models"], [], "映射要清，找回只能走账本")
 
         await pool.shutdown()
         self.assertFalse(beta.started, "映射清空之后，还得顺着账本找回它")
