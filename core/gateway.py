@@ -66,6 +66,12 @@ _DEFAULT_MAX_REQUEST_BODY_MB = 16
 # refusal is a *local* 429 rate limit, never a plain upstream failure.
 _ROUTING_COOLING_CODE = "routing_cooling"
 
+# 模型 ID 的长度上限。真实 ID 是 ``wb-…`` 这种短串，128 个字符已经松得离谱。
+# 不设限的话，``model`` 能顶满整个请求体上限（默认 16 MB），而这里**没有任何
+# 长度检查**：它会被原样拼进 400 的错误文本（等于把网关当放大器），也会进
+# ``--model`` 的 argv 和日志行。这道检查排在限流之前，所以必须先掐住长度。
+_MAX_MODEL_ID_CHARS = 128
+
 _SSE_HEADERS = {
     "Content-Type": "text/event-stream",
     "Cache-Control": "no-cache",
@@ -428,6 +434,12 @@ class Gateway:
                 400, "model must be a non-empty string", "invalid_request_error"
             )
         model = model.strip()
+        if len(model) > _MAX_MODEL_ID_CHARS:
+            # 固定文案，**不回声**：这个值来自请求体，可以有几 MB，原样拼回去就把
+            # 网关变成了放大器。而且这道检查在限流之前，回显等于免费放大。
+            return self._json_error(
+                400, "model id is too long", "invalid_request_error"
+            )
         payload["model"] = model
         if model == ORDERED_MODEL_ID:
             if not self._route_enabled():

@@ -415,6 +415,20 @@ class RoutingThroughGatewayTests(_GatewayCase):
         self.assertIn("/v1/models", body["error"]["message"])
         self.assertEqual(self.chat.sent_models, [])
 
+    async def test_an_oversized_model_id_is_rejected_without_echoing_it(self):
+        # ``model`` 能顶满整个请求体上限（默认 16 MB），而这道检查排在限流之前：
+        # 原样拼进错误文本就等于把网关当放大器；不掐长度它还会进 argv 和日志。
+        huge = "wb-" + "x" * 4096
+        resp = await self.post_chat(self.chat_payload(model=huge))
+        try:
+            self.assertEqual(resp.status, 400)
+            body = await resp.json()
+        finally:
+            await resp.release()
+        self.assertEqual(body["error"]["type"], "invalid_request_error")
+        self.assertNotIn("x" * 64, body["error"]["message"], "错误文本不许回声请求体")
+        self.assertEqual(self.chat.sent_models, [], "本地 400 不碰后端")
+
     async def test_an_empty_catalog_does_not_reject_anything(self):
         # 清单还没读成过（CLI 没装 / 装晚了一步）：此时拒绝一切请求只会把"还没准备好"
         # 变成"永远不能用"。
