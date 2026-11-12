@@ -937,6 +937,48 @@ class _PluginIntegrationTestCase(unittest.IsolatedAsyncioTestCase):
         ):
             self.assertNotIn(secret, text)
 
+    # -- 5c. 从 v0.1.3 升上来的机器，退登要连旧凭据一起删 ----------------
+    async def test_logout_removes_the_credential_file_a_previous_version_left(self):
+        """旧版把令牌写在 ``data_dir/credentials.enc``；退登后它必须消失。
+
+        这条路径早就没人读了，但文件还在原地、里面是加密过的 access /
+        refresh token。留着就是一句谎话：命令回"已退出登录"，而拿到这个文件
+        的人只要再拿到当初那把 master key，令牌照样解得出来。
+        """
+        self._seed_credentials()
+        # 升级现场的次序：文件先在那儿，然后才启动、才退登。
+        legacy = _PLUGIN_DATA / "credentials.enc"
+        legacy.write_bytes(b"LEGACY-ENCRYPTED-TOKENS")
+        plugin = await self._make_plugin(**self._make_ready_plugin_config())
+        plugin.acp = _StubAcpPool()
+        self.assertTrue(legacy.is_file())
+
+        text = _text_of(await _invoke(plugin.wb, _make_event("wb logout"), "logout", ""))
+
+        self.assertFalse(legacy.exists(), "旧版凭据文件必须跟着退登一起删掉")
+        self.assertIn("已退出登录", text)
+        self.assertNotIn("未能清除", text)
+
+    async def test_logout_reports_a_legacy_credential_file_it_could_not_remove(self):
+        """删不掉时不许回"已退出登录"——那句谎话正是这次要堵的。
+
+        ``credentials.enc`` 做成同名目录：``os.remove`` 对目录在 POSIX 和
+        Windows 上都抛 ``OSError``，又不必把全局的 ``os.remove`` mock 掉——
+        退登途中还有别的删除要照常走。
+        """
+        self._seed_credentials()
+        legacy = _PLUGIN_DATA / "credentials.enc"
+        legacy.mkdir()
+        plugin = await self._make_plugin(**self._make_ready_plugin_config())
+        plugin.acp = _StubAcpPool()
+        self.assertTrue(legacy.is_dir())
+
+        text = _text_of(await _invoke(plugin.wb, _make_event("wb logout"), "logout", ""))
+
+        self.assertTrue(legacy.is_dir(), "删不掉的东西不该凭空消失")
+        self.assertIn("未能清除", text)
+        self.assertNotIn("已退出登录", text)
+
     # -- 6. the retired growth commands fall back to help ------------------
     async def test_retired_growth_commands_answer_help_and_touch_no_upstream(self):
         self._seed_credentials()

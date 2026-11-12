@@ -887,6 +887,26 @@ class WorkBuddyPlugin(Star):
             self._publish_model_options()
         await self._notify("登录成功，服务已恢复。")
 
+    def _purge_legacy_credential_file(self) -> bool:
+        """删掉 v0.1.3 留下的 ``credentials.enc``；删不掉就返回 ``False``。
+
+        那条路径早就没人读了——登录凭据改由 CLI 自己落盘——但**文件还在原地**，
+        里面是加密过的 access / refresh token。不删就是一句谎话：命令回复"已退出
+        登录"，而谁拿到这个文件、再加上当初那把 master key，谁还能把令牌解出来。
+        删不掉要如实报告，理由同 ``AcpRuntime._purge_credential_dir``。
+        """
+        if not self.data_dir:
+            return True
+        path = os.path.join(str(self.data_dir), "credentials.enc")
+        try:
+            os.remove(path)
+        except FileNotFoundError:
+            return True
+        except OSError:
+            _log.warning("legacy credential file could not be removed")
+            return False
+        return True
+
     async def _logout(self) -> str:
         # Mark the intentional logout first: credentials are cleared on purpose,
         # so even a failure mid-logout must never raise a spurious error notice.
@@ -924,6 +944,9 @@ class WorkBuddyPlugin(Star):
                 await self.gateway.stop()
         with contextlib.suppress(Exception):
             await self.account.logout()
+        # 旧版那份额外凭据不归池管，得单独删；删不掉也算"没清干净"。
+        if not self._purge_legacy_credential_file():
+            purge_failed = True
         if purge_failed:
             return "已断开连接，但登录凭据未能清除，请检查插件数据目录权限或查看日志。"
         return "已退出登录，本地网关已停止监听。"
