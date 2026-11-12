@@ -824,6 +824,35 @@ class CloseAllTests(_PoolCase):
         gate.set()
         await trimmer
 
+    async def test_logout_retries_a_stray_the_eviction_failed_to_close(self):
+        # 淘汰那次没关掉的那条留在账上。``close_all`` 只看映射里的，
+        # ``_drain_evictions`` 只等不关，``_reclaim_strays`` 又只在超编时才试——池子
+        # 闲下来之后它再也没人碰。登出要是也不重试，那条进程就算这次能关也永远等不到
+        # 第二次机会，凭据一个字节都删不掉。
+        pool = self.make_pool(max_processes=1, primary_model=ALPHA)
+        alpha = pool.get(ALPHA)
+        beta = pool.get(BETA)
+        _start(alpha, beta)
+
+        attempts = []
+
+        async def _dies_on_the_second_try():
+            attempts.append(1)
+            if len(attempts) > 1:
+                beta.started = False
+
+        beta.shutdown = _dies_on_the_second_try
+
+        self.assertEqual(await pool.trim(), 0, "第一次没关掉，不许报成关掉了")
+        self.assertTrue(beta.started)
+        self.assertEqual(pool.status()["models"], [ALPHA], "映射里只剩主运行时")
+
+        with mock.patch.object(pool_module, "_LOGOUT_DRAIN_SECONDS", 0.05):
+            await pool.logout(purge_config=True)
+
+        self.assertEqual(len(attempts), 2, "登出要自己再试一次，不能干等")
+        self.assertFalse(beta.started)
+        self.assertEqual(alpha.logouts, [True], "关干净了才许删凭据")
 
     async def test_logout_refuses_to_purge_while_a_child_in_the_mapping_refuses_to_close(
         self,

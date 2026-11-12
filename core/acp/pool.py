@@ -252,6 +252,13 @@ class AcpRuntimePool:
                 #
                 # 验之前先等在飞淘汰落地：``trim()`` 是**先摘、后关**，那一段里子进程
                 # 还活着而对 ``_runtimes`` 已经不可见，只查映射就是把它放过去了。
+                #
+                # 账上那几条（淘汰时没关掉的）先自己再关一次，再开始等：
+                # ``close_all`` 只管映射里的，``_drain_evictions`` 只等不关。淘汰那次
+                # 失败不代表这次也失败；不试的话，只要那条进程迟迟不退，每次登出都会
+                # 撞在"还有活进程"上，凭据永远删不掉。正在被别的任务关的那几条由
+                # ``_strays`` 跳过，两边不会抢同一笔。
+                await self._retry_evictions()
                 await self._drain_evictions()
                 if any(
                     runtime.started
@@ -367,7 +374,23 @@ class AcpRuntimePool:
             models, stray = self._occupied()
             if len(models) + stray <= self._max:
                 return 0
+        return await self._retry_evictions()
+
+    async def _retry_evictions(self) -> int:
+        """把账上还没死、也没人在关的那几条再关一次，返回真关掉的条数。
+
+        跟 :meth:`_reclaim_strays` 只差一个条件：**这里不看是否超编**。登出关心的是
+        "还有没有活进程"，与池子挤不挤没关系——只按超编重试的话，池子闲下来之后账
+        上那条就再也没人碰，而它未必永远不退；登出便会一直卡在"还有活进程"上，凭据
+        一个字节也删不掉。
+
+        关闭对每条是有界的（``AcpRuntime.close`` 给传输层 3 秒），所以就算那几条全
+        都杀不掉，这里也只会多花"账上条数 × 3 秒"，不会挂死。关不掉的照旧留在账上。
+        """
+        async with self._trim_lock:
             strays = self._strays()
+            if not strays:
+                return 0
             # 先盖戳再放锁：盖完这一笔，别的 trim 就看不见它们了。
             self._closing.update(strays)
         try:

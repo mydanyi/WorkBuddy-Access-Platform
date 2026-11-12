@@ -292,14 +292,17 @@ class ModelCatalog:
             return await self.refresh()
 
     async def _discover(self):
-        models = await self._from_help()
+        # **先滤再判来源。** 判在滤之前的话，``--help`` 只报出一串超长 ID 时
+        # ``models`` 非空、来源就定成 help，而真正发布出去的是滤完的空清单——配置
+        # 那份回退再也轮不到，清单从此一直空着。过滤之后的"空"才算"这条来源没货"。
+        models = _publishable(await self._from_help())
         if models:
-            return _publishable(models), "help"
+            return models, "help"
         # 读一个小 JSON 也要开线程：本方法在事件循环里被调，卡住的是整个插件的
         # 所有请求，不值得为省一次线程池调度去赌那个文件永远在本地磁盘上。
-        models = await asyncio.to_thread(self._from_config)
+        models = _publishable(await asyncio.to_thread(self._from_config))
         if models:
-            return _publishable(models), "config"
+            return models, "config"
         return [], "none"
 
     async def _from_help(self):

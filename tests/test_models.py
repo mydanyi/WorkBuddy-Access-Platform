@@ -287,6 +287,18 @@ class CatalogProcessTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await catalog.refresh(), [CUSTOM_PREFIX + BETA])
         self.assertEqual(catalog.source, "config")
 
+    async def test_an_over_long_help_entry_does_not_hide_the_config_fallback(self):
+        # ``--help`` 只报出一串入口收不下的 ID 时，过滤之后等于"这条来源没货"。
+        # 要是先判"有没有读到"、后过滤，来源就定成 help、发出去的是空清单，配置那份
+        # 回退再也轮不到——清单从此一直空着，而文件里明明有能用的条目。
+        tmp = _case_dir(self)
+        cli = _write_cli(tmp, ["wb-" + "x" * 200])
+        config = _write_config(tmp, {"models": [{"id": BETA}]})
+        catalog = ModelCatalog(str(cli), config_path=str(config), timeout=15)
+
+        self.assertEqual(await catalog.refresh(), [CUSTOM_PREFIX + BETA])
+        self.assertEqual(catalog.source, "config")
+
     async def test_an_id_the_chat_endpoint_would_reject_is_not_published(self):
         # 清单是聊天入口的**广告**。入口对 ``model`` 卡 128 个字符（见
         # ``test_routing_gateway`` 里那条 4096 字符的用例），广告里出现更长的 ID，
