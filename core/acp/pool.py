@@ -398,13 +398,23 @@ class AcpRuntimePool:
         await self._close_batch(runtimes, "close")
 
     async def shutdown(self) -> None:
-        """永久关闭：之后 :meth:`get` 一律抛 :class:`AcpError`。"""
+        """永久关闭：之后 :meth:`get` 一律抛 :class:`AcpError`。
+
+        账上那几条也要一起关。它们是**淘汰时没关掉**的进程，已经不在 ``_runtimes``
+        里；池一散，除 ``_evicting`` 之外再没人看着它们，留着就是一条活过插件生命
+        周期的 CLI。淘汰那一次失败不代表这一次也失败——重试一次比放弃强。
+
+        与正在进行的淘汰撞上也没事：``AcpRuntime.close`` 持 ``_start_lock``，
+        后到的那次会等前一次关完再看一眼，已经死透就什么都不做。
+        """
         self._closed = True
         async with self._trim_lock:
             runtimes = list(self._runtimes.values())
+            runtimes.extend(self._evicting)
             self._runtimes.clear()
             self._last_used.clear()
             self._busy.clear()
+            self._evicting.clear()
         await self._close_batch(runtimes, "shutdown")
 
 

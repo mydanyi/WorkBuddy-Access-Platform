@@ -620,6 +620,34 @@ class ShutdownTests(_PoolCase):
         self.assertEqual(alpha.shutdowns, 1, "被打断的那条也要关完")
         self.assertEqual(beta.shutdowns, 1, "排在后面的不能因为取消就不关了")
 
+    async def test_shutdown_retries_an_eviction_that_could_not_be_closed(self):
+        # 淘汰关不掉的那条留在 ``_evicting`` 上：它已经不在映射里，池一散就再没人
+        # 看着它。卸载/重载时必须把它也带上，而且**再试一次**——上一次失败不等于
+        # 这一次也失败。
+        pool = self.make_pool(max_processes=1, primary_model=ALPHA)
+        alpha = pool.get(ALPHA)
+        beta = pool.get(BETA)
+        _start(alpha, beta)
+
+        attempts = []
+
+        async def _first_attempt_fails():
+            attempts.append(1)
+            if len(attempts) == 1:
+                raise RuntimeError("FICTIONAL-SHUTDOWN-FAILURE")
+            beta.started = False
+
+        beta.shutdown = _first_attempt_fails
+
+        self.assertEqual(await pool.trim(), 0, "关不掉的那条不算关成功")
+        self.assertTrue(beta.started, "它还活着，只是已经不在映射里了")
+        self.assertEqual(pool.status()["models"], [ALPHA])
+
+        await pool.shutdown()
+        self.assertFalse(beta.started, "卸载时要把它也关掉，不然没人再认领这条进程")
+        self.assertEqual(len(attempts), 2, "淘汰那次失败，关停要再试一次")
+        self.assertEqual(alpha.shutdowns, 1)
+
     async def test_shutdown_survives_a_runtime_that_refuses_to_stop(self):
         pool = self.make_pool()
         alpha = pool.get(ALPHA)
