@@ -363,10 +363,14 @@ class _StubAcpRuntime:
         *,
         block=False,
         link_delay=0.0,
+        after_link=None,
     ):
         self.url = url
         self.block = block
         self.link_delay = link_delay
+        # 链接刚交出去的那一刻要做的事（同步）。用来把"链接已到手"与"回复还没交出去"
+        # 这个窗口钉死——测试里靠它换掉 ``plugin.acp``，不用赌调度顺序。
+        self.after_link = after_link
         self.calls = 0
         self.closed = False
         self._gate = asyncio.Event()
@@ -388,6 +392,8 @@ class _StubAcpRuntime:
             if self.link_delay:
                 await asyncio.sleep(self.link_delay)
             on_auth_url(self.url)
+        if self.after_link is not None:
+            self.after_link()
         if self.block:
             await self._gate.wait()
         else:
@@ -932,6 +938,54 @@ class _PluginIntegrationTestCase(unittest.IsolatedAsyncioTestCase):
         await asyncio.sleep(0.5)
         self.assertEqual(len(plugin.context.sent), 1, "后到的链接要补一条，且只补一条")
         self.assertIn("https", str(plugin.context.sent[0][1]))
+
+        runtime._gate.set()
+        await asyncio.wait_for(plugin._login_task, timeout=5)
+
+    # -- 5b. logout revokes; manual signin allowed when auto is off -------
+    async def test_a_cancelled_command_still_pushes_the_link_that_arrives_later(self):
+        # 命令被取消（插件重载、上层超时）时回复根本交不出去，但登录协程按不变量还
+        # 留着等扫码。这时后到的链接只能走通知——门如果在取消路径上漏成 False，
+        # 用户手里既没有回复也没有链接，只能干等到超时。
+        #
+        # 红线是下面那条通知计数：旧写法下 ``answered["done"]`` 只在正常返回路径上被
+        # 置 True，取消退出时留着 False，链接一条也不发（实测 `0 != 1`）。
+        # ``assertRaises`` 守的是另一件事——取消要原样抛出去，不能被收尸那步咽掉。
+        plugin = await self._make_plugin(**self._make_ready_plugin_config())
+        runtime = _StubAcpRuntime(block=True, link_delay=0.2)
+        plugin.acp = _StubAcpPool(runtime)
+
+        pending = asyncio.create_task(
+            _invoke(plugin.wb, _make_event("wb login"), "login", "")
+        )
+        await asyncio.sleep(0.05)
+        self.assertFalse(pending.done(), "链接还没到，命令应当还停在等待里")
+        pending.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await pending
+
+        await asyncio.sleep(0.3)
+        self.assertEqual(len(plugin.context.sent), 1, "取消之后到的链接必须补一条")
+        self.assertIn("https", str(plugin.context.sent[0][1]))
+
+        runtime._gate.set()
+        await asyncio.wait_for(plugin._login_task, timeout=5)
+
+    async def test_a_changed_pool_still_hands_back_the_link_it_already_has(self):
+        # 链接在等待期间已经到手，等回复要交出去时池子换了一条。旧写法靠回调无条件
+        # 推送，链接还能送达；加了门之后如果这条分支只回一句"状态已变化"，链接就
+        # 无声消失了——回调不会再来第二次。
+        plugin = await self._make_plugin(**self._make_ready_plugin_config())
+        replacement = _StubAcpPool(_StubAcpRuntime())
+        runtime = _StubAcpRuntime(
+            block=True,
+            after_link=lambda: setattr(plugin, "acp", replacement),
+        )
+        plugin.acp = _StubAcpPool(runtime)
+
+        text = _text_of(await _invoke(plugin.wb, _make_event("wb login"), "login", ""))
+        self.assertIn("插件状态已变化", text)
+        self.assertIn("https", text, "链接已经生成出来了，不能因为池子换了就吞掉")
 
         runtime._gate.set()
         await asyncio.wait_for(plugin._login_task, timeout=5)

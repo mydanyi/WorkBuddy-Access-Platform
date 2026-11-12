@@ -800,8 +800,12 @@ class WorkBuddyPlugin(Star):
         self._login_task = None
         if existing is not None and not existing.done():
             existing.cancel()
-            with contextlib.suppress(BaseException):
-                await existing
+            # 收尸不用 ``suppress(BaseException)``：它分不清"我们自己取消的那条"与
+            # "外层取消了这个协程"——两者抛的都是 ``CancelledError``，一 suppress 就
+            # 把重载/卸载时的取消一起咽了，函数接着往下走（登录处会去发起新的登录，
+            # 退出登录处会边被取消边删凭据）。``gather`` 把前者的 ``CancelledError``
+            # 收成返回值，后者照常往外抛。
+            await asyncio.gather(existing, return_exceptions=True)
 
         self._notify_umo = event.unified_msg_origin
         captured = {"url": None}
@@ -829,20 +833,35 @@ class WorkBuddyPlugin(Star):
         # 链接通常几百毫秒内到达；最多等几秒，拿到就回复，拿不到也先把登录任务
         # 留着等扫码，不重复发起第二次 authenticate。
         waiter = asyncio.create_task(ready.wait())
-        with contextlib.suppress(Exception):
-            await asyncio.wait(
-                {waiter, task},
-                timeout=_LOGIN_LINK_SECONDS,
-                return_when=asyncio.FIRST_COMPLETED,
-            )
-        if not waiter.done():
+        try:
+            with contextlib.suppress(Exception):
+                await asyncio.wait(
+                    {waiter, task},
+                    timeout=_LOGIN_LINK_SECONDS,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+            if not waiter.done():
+                waiter.cancel()
+            # 同上：``suppress`` 分不清"我们取消的 waiter"与"外层取消了这个协程"。
+            await asyncio.gather(waiter, return_exceptions=True)
+        except BaseException:
+            # 取消路径上没有"回复"这回事——命令已经结束了。但登录协程还留着等扫码，
+            # 这时不把通道切到通知，后到的链接会以为"回复里带了"，一条也不发，用户
+            # 只能干等到超时。
+            answered["done"] = True
             waiter.cancel()
-        with contextlib.suppress(BaseException):
-            await waiter
+            raise
 
-        # 从这行起，链接再到达就只能走通知。中间没有 await，回调插不进来。
+        # 从这行起，链接再到达就只能走通知。到读 captured 之间没有 await，回调插不进来。
         answered["done"] = True
         if self.acp is not pool:
+            # 池子已经换了，这条登录多半跟着作废；但链接是此刻唯一还能给出去的东西，
+            # 别在这儿把它吞掉——扫得动算捡到，扫不动至少知道自己拿到过什么。
+            if captured["url"]:
+                return (
+                    "插件状态已变化，请重新执行 /wb login。\n"
+                    "本次已生成的链接（可能已失效）：\n" + captured["url"]
+                )
             return "插件状态已变化，请重新执行 /wb login。"
         if captured["url"]:
             return "请使用手机或浏览器打开以下链接完成登录：\n" + captured["url"]
@@ -927,8 +946,12 @@ class WorkBuddyPlugin(Star):
         self._login_task = None
         if existing is not None and not existing.done():
             existing.cancel()
-            with contextlib.suppress(BaseException):
-                await existing
+            # 收尸不用 ``suppress(BaseException)``：它分不清"我们自己取消的那条"与
+            # "外层取消了这个协程"——两者抛的都是 ``CancelledError``，一 suppress 就
+            # 把重载/卸载时的取消一起咽了，函数接着往下走（登录处会去发起新的登录，
+            # 退出登录处会边被取消边删凭据）。``gather`` 把前者的 ``CancelledError``
+            # 收成返回值，后者照常往外抛。
+            await asyncio.gather(existing, return_exceptions=True)
         # 退出登录要删两处：CLI 配置目录，以及真正的凭据目录（在 ~/.local/share
         # 下，只有改了 HOME 才圈得住）。只删配置等于没退。
         purge_failed = False
