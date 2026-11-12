@@ -333,11 +333,7 @@ class AcpRuntimePool:
             for model, runtime in self._runtimes.items()
             if runtime.started or self._busy.get(model)
         ]
-        strays = [
-            runtime
-            for runtime in self._evicting
-            if runtime.started and runtime not in exclude
-        ]
+        strays = [runtime for runtime in self._strays() if runtime not in exclude]
         return models, len(strays)
 
     async def _reclaim_strays(self) -> int:
