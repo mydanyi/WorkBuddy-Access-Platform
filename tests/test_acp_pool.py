@@ -534,6 +534,28 @@ class TrimTests(_PoolCase):
         await asyncio.wait_for(pool.logout(purge_config=True), timeout=1.0)
         self.assertEqual(alpha.logouts, [True])
 
+    async def test_a_ledger_entry_that_died_on_its_own_frees_its_slot(self):
+        # 护栏，不是旧实现的回归用例：`_forget_dead()` 在计数之前先清账，尸体到不了
+        # `_occupied()`，所以这条在当前实现下恒绿。它挡的是"把占位简化成只数集合、
+        # 顺手把清理当成冗余删掉"那种联动改动——那时这条会红。
+        pool = self.make_pool(max_processes=2, primary_model=ALPHA)
+        alpha = pool.get(ALPHA)
+        beta = pool.get(BETA)  # 先领 BETA，让它成为最久未用的那条
+        gamma = pool.get(GAMMA)
+        _start(alpha, beta, gamma)
+
+        async def _stuck_shutdown():
+            pass  # 关不掉：started 保持真
+
+        beta.shutdown = _stuck_shutdown
+
+        self.assertEqual(await pool.trim(), 0, "第一轮淘汰没关掉")
+        self.assertTrue(beta.started)
+
+        beta.started = False  # 进程随后自己退了
+        self.assertEqual(await pool.trim(), 0, "尸体不占位，没什么可收的")
+        self.assertEqual(gamma.shutdowns, 0, "更不该拿待命的 GAMMA 抵数")
+
 
 class CloseAllTests(_PoolCase):
     """``close_all`` 只关不摘：登出后仍要能重新拉起同一条。"""
