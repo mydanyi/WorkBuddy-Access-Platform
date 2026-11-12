@@ -86,6 +86,10 @@ class AcpRuntimePool:
         # 已经不可见，登出前必须单独盯一眼，否则"淘汰正撞上登出"就是漏网之鱼：
         # 凭据删掉了，而那条进程还握着 token。真关掉了才从这里出账。
         self._evicting = set()
+        # 其中**已经有调用方在关**的那几条。两次 trim 交叠并不罕见（进出 lease 都会
+        # 调），而关闭必须在锁外 await：后到的那次会在账上看见前一次正在关的条目，
+        # 于是重复关、重复计数，还把别人的在飞当成占位多淘汰一条。盖上戳就都看不见了。
+        self._closing = set()
         # 每次登出自增一次。租约进门时记一份，``trim()`` 回来再比一次：登出可能在
         # 它等的这段时间里开始、甚至已经跑完（闸门又放开了），只查 ``_logging_out``
         # 看不出来——而那一刻放行，调用方随后就会在"已退出登录"之后拉起一条 CLI。
@@ -325,20 +329,23 @@ class AcpRuntimePool:
         )
 
     def _strays(self):
-        """账上那几条：已经摘出映射、子进程却还活着。
+        """账上那几条：已经摘出映射、子进程还活着、而且没人在关它。
 
-        它们仍然占着一条进程位，只是没人能从池子里领取它们。
+        "没人在关"这一条不能少。关闭在锁外 await，另一个 trim 会在这段里看见它——
+        它既不能算占位（有人在收了），也不能被再关一次（两边都会按"关完 not started"
+        记一笔，同一个进程数出两条）。
         """
-        return [runtime for runtime in self._evicting if runtime.started]
+        return [
+            runtime
+            for runtime in self._evicting
+            if runtime.started and runtime not in self._closing
+        ]
 
-    def _occupied(self, exclude=()):
+    def _occupied(self):
         """占着进程位的两拨，返回 ``(映射里的模型, 账上还活着的条数)``。
 
         只数映射会把上限悄悄放宽成"上限 + 漏网的条数"，而每漏一次就多放宽一条：
         淘汰失败之后，池子以为自己有空位，接着拉起新进程，超出的部分再也没人收。
-
-        ``exclude`` 是**本次调用正在关**的那几条。它们还没死，但已经在收尾队列里，
-        再算进占位就成了自己逼自己：一边关一边把自己算成超额，最后把池子清空。
 
         调用方必须持 ``_trim_lock``。
         """
@@ -347,8 +354,7 @@ class AcpRuntimePool:
             for model, runtime in self._runtimes.items()
             if runtime.started or self._busy.get(model)
         ]
-        strays = [runtime for runtime in self._strays() if runtime not in exclude]
-        return models, len(strays)
+        return models, len(self._strays())
 
     async def _reclaim_strays(self) -> int:
         """超编时把账上那几条再关一次，返回这次真关掉的条数。
@@ -362,13 +368,15 @@ class AcpRuntimePool:
             if len(models) + stray <= self._max:
                 return 0
             strays = self._strays()
-        if not strays:
-            return 0
-        closed = await self._close_batch(strays, "shutdown")
-        self._evicting.difference_update(
-            runtime for runtime in strays if not runtime.started
-        )
-        return closed
+            # 先盖戳再放锁：盖完这一笔，别的 trim 就看不见它们了。
+            self._closing.update(strays)
+        try:
+            return await self._close_batch(strays, "shutdown")
+        finally:
+            self._closing.difference_update(strays)
+            self._evicting.difference_update(
+                runtime for runtime in strays if not runtime.started
+            )
 
     async def trim(self) -> int:
         """把空闲进程收到上限以内，返回真正关掉的条数。
@@ -395,7 +403,7 @@ class AcpRuntimePool:
         victims = []
         async with self._trim_lock:
             while True:
-                occupied, stray = self._occupied(victims)
+                occupied, stray = self._occupied()
                 if len(occupied) + stray <= self._max:
                     break
                 idle = [
@@ -412,12 +420,16 @@ class AcpRuntimePool:
                 evicted = self._runtimes.pop(victim)
                 victims.append(evicted)
                 self._evicting.add(evicted)
+                # 同一刻盖戳：别的 trim 从这一笔起就看不见它了，不会再关一次、也不会
+                # 把它算成占位。见 :meth:`_strays`。
+                self._closing.add(evicted)
                 self._busy.pop(victim, None)
                 self._last_used.pop(victim, None)
 
         try:
             return reclaimed + await self._close_batch(victims, "shutdown")
         finally:
+            self._closing.difference_update(victims)
             # 只把真关掉的出账。还活着的留在账上：它已经不在映射里，除这份账之外
             # 没有任何地方还能看见"这条进程还没死"。
             self._evicting.difference_update(

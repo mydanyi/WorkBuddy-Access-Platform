@@ -447,6 +447,38 @@ class TrimTests(_PoolCase):
             beta.shutdowns, 0, "账上那条收得掉，就不该拿待命的 BETA 抵数"
         )
 
+    async def test_two_overlapping_trims_count_the_same_close_only_once(self):
+        # 关闭只能在锁外 await，所以另一个 trim 会在这段里看见"账上还有一条活着的"。
+        # 不盖戳的话：两边都去关它，两边都按"关完 not started"记一笔，同一条进程数出
+        # 两条；它还会被当成占位，多淘汰一条本可留着的进程。
+        pool = self.make_pool(max_processes=1, primary_model=ALPHA)
+        alpha = pool.get(ALPHA)
+        beta = pool.get(BETA)
+        _start(alpha, beta)
+
+        gate = asyncio.Event()
+        calls = []
+
+        async def _slow_shutdown():
+            calls.append(1)
+            await gate.wait()
+            beta.started = False
+
+        beta.shutdown = _slow_shutdown
+
+        first = asyncio.ensure_future(pool.trim())
+        await asyncio.sleep(0.05)  # 让第一个卡在关闭里
+        release = asyncio.get_running_loop().call_later(0.5, gate.set)
+        try:
+            self.assertEqual(
+                await pool.trim(), 0, "别人正在关的那条不该被再关一次、也不该再数一遍"
+            )
+        finally:
+            release.cancel()
+            gate.set()
+        self.assertEqual(await first, 1, "真把它关掉的那一次才记一笔")
+        self.assertEqual(len(calls), 1, "同一条进程只关一次")
+
     async def test_logout_does_not_wait_for_a_ledger_entry_that_already_died(self):
         # 账上剩一具尸体时，登出会以为还有事在飞，白等满 `_LOGOUT_DRAIN_SECONDS`
         # （5 秒）再往下走。等的是"进程还活着"，不是"集合非空"。
