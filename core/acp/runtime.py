@@ -263,11 +263,27 @@ class AcpRuntime:
         await self.close()
 
     async def _discard(self) -> None:
-        transport, self._transport = self._transport, None
-        self._client = None
-        if transport is not None:
+        """关掉当前连接；**关干净了才摘引用**。
+
+        顺序不能反。先把 ``self._transport`` 置空再去 ``close()``，一旦关闭过程被
+        取消（淘汰空闲进程时正好撞上请求的截止时间就是这条路），调用方手里已经没有
+        这条传输层了，而子进程还活着——没人认领，也没人再试一次。取消时引用留在
+        身上，下一次 ``close()`` / ``ensure_started()`` 会接着把它收掉。
+        """
+        transport = self._transport
+        if transport is None:
+            self._client = None
+            return
+        try:
+            # 取消不吞：清理没做完就该让调用方知道这一轮被打断了。
             with contextlib.suppress(Exception):
                 await transport.close(timeout=3.0)
+        finally:
+            # ``alive`` 为真说明没杀干净（关不掉，或取消落在 terminate 之前）。
+            # 这时保留引用，调用方还能看见"进程还在"，下一轮也还能再试一次。
+            if not transport.alive:
+                self._transport = None
+                self._client = None
 
     # -- 登录 ---------------------------------------------------------------
 

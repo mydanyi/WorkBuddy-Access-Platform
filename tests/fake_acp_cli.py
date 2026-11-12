@@ -29,6 +29,7 @@
 * ``overflow``      收到 ``session/new`` 后吐一行超长帧
 * ``big``           prompt 吐一段 2 MiB 文本（测大帧）
 * ``silent``        只握手，永不回应 prompt（测超时与回收）
+* ``linger_after_eof`` 关掉 stdin 也不退出（测"关闭被取消时还杀不杀进程"）
 """
 
 from __future__ import annotations
@@ -384,6 +385,11 @@ def main():
             handle(message)
         except BrokenPipeError:
             return
+
+    if args.scenario == "linger_after_eof":
+        # stdin 关了也不走：真实 CLI 卡在退出流程里就是这样。用来测 close() 被
+        # 取消时还会不会把 terminate → kill 走完。
+        time.sleep(3600)
 
 
 if __name__ == "__main__":

@@ -192,6 +192,28 @@ class CloseTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(transport.alive)
 
 
+class CloseCancellationTests(unittest.IsolatedAsyncioTestCase):
+    """关闭过程被打断时，子进程不能变成没人认领的孤儿。
+
+    淘汰空闲进程正好撞上请求的截止时间就走这条路：调用方那头已经把所有权摘掉了，
+    这边要是把 terminate/kill 一起跳过，进程就永远留着。
+    """
+
+    async def test_a_cancelled_close_still_reaps_the_child(self):
+        transport = AcpTransport(_argv("linger_after_eof"), request_timeout=5.0)
+        await transport.start()
+        proc = transport._proc
+        closer = asyncio.ensure_future(transport.close(timeout=0.2))
+        await asyncio.sleep(0.05)  # 让它停在"等进程自己退出"上
+        closer.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await closer
+        self.assertIsNotNone(
+            proc.returncode, "取消把 terminate/kill 一起跳过了：进程还活着"
+        )
+        self.assertFalse(transport.alive)
+
+
 class InitializeTests(TransportTestCase):
     scenario = "happy"
 

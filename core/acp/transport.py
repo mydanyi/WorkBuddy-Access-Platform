@@ -162,7 +162,13 @@ class AcpTransport:
         )
 
     async def close(self, *, timeout=5.0) -> None:
-        """关 stdin、等退出，超时 terminate 再超时 kill；待决请求全部失败。"""
+        """关 stdin、等退出，超时 terminate 再超时 kill；待决请求全部失败。
+
+        **取消不能把子进程丢下。** 等待退出这一步一旦被 cancel 打断，terminate/kill
+        整段都会被跳过，而调用方那头往往已经把所有权摘掉了（``_discard()`` 先置空再
+        关闭、``trim()`` 先移出映射再关）：进程就成了没人认领的孤儿，反复几次就超出
+        池子上限。所以收尾放进独立任务，取消时先等它做完，再把取消往外传。
+        """
         self._dead = True
         proc = self._proc
         if proc is None:
@@ -177,6 +183,27 @@ class AcpTransport:
             with contextlib.suppress(Exception):
                 stdin.close()
 
+        reaper = asyncio.ensure_future(self._reap(proc, timeout))
+        try:
+            await asyncio.shield(reaper)
+        except asyncio.CancelledError:
+            # shield 只是把取消挡在 reaper 外面，我们这边照样立刻收到 CancelledError。
+            # 此刻返回等于宣布"关完了"，而进程还活着，所以先等它做完再抛。
+            with contextlib.suppress(BaseException):
+                await asyncio.shield(reaper)
+            raise
+        finally:
+            # 无论如何都要收干净读协程与实例状态：否则 _dead 已是 True，却还留着一个
+            # 挂着读循环的实例。
+            with contextlib.suppress(BaseException):
+                await self._cancel_tasks()
+            # 杀不掉就**留着引用**：调用方要能看出"进程还在"，而 _dead 已是 True，
+            # 没人会再拿它当活管道用。丢掉引用等于把"没杀干净"改写成"杀干净了"，
+            # 于是"活着的 CLI 会把凭据写回去"这个前提就再也没人检查。
+            self._proc = None if proc.returncode is not None else proc
+
+    async def _reap(self, proc, timeout) -> None:
+        """等进程退出；超时 terminate，再超时 kill。"""
         try:
             await asyncio.wait_for(proc.wait(), timeout)
         except (asyncio.TimeoutError, TimeoutError):
@@ -189,15 +216,6 @@ class AcpTransport:
                     proc.kill()
                 with contextlib.suppress(Exception):
                     await asyncio.wait_for(proc.wait(), 3.0)
-        finally:
-            # 等待期间被取消时，读协程与实例状态也必须收干净：否则 _dead 已是
-            # True，却还留着一个活进程和一个挂着读循环的实例。
-            with contextlib.suppress(BaseException):
-                await self._cancel_tasks()
-            # 杀不掉就**留着引用**：调用方要能看出"进程还在"，而 _dead 已是 True，
-            # 没人会再拿它当活管道用。丢掉引用等于把"没杀干净"改写成"杀干净了"，
-            # 于是"活着的 CLI 会把凭据写回去"这个前提就再也没人检查。
-            self._proc = None if proc.returncode is not None else proc
 
     async def _cancel_tasks(self) -> None:
         """取消并**等**读循环真正退出。

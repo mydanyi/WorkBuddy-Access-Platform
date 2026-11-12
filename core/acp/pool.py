@@ -264,12 +264,25 @@ class AcpRuntimePool:
                 victims.append(self._runtimes.pop(victim))
                 self._busy.pop(victim, None)
                 self._last_used.pop(victim, None)
-        closed = 0
-        for runtime in victims:
-            with contextlib.suppress(Exception):
-                await runtime.shutdown()
-                closed += 1
-        return closed
+
+        async def _shutdown_all():
+            count = 0
+            for runtime in victims:
+                with contextlib.suppress(Exception):
+                    await runtime.shutdown()
+                    count += 1
+            return count
+
+        # 这批已经从映射里摘掉了，不会再有人来关它们：中途被取消就撒手，剩下的既
+        # 不在池子里、子进程也还活着，等于凭空漏了几条 CLI。所以整批放进独立任务，
+        # 取消时等它跑完再往外传。
+        cleanup = asyncio.ensure_future(_shutdown_all())
+        try:
+            return await asyncio.shield(cleanup)
+        except asyncio.CancelledError:
+            with contextlib.suppress(BaseException):
+                await asyncio.shield(cleanup)
+            raise
 
     async def close_all(self) -> None:
         """关掉全部进程，但池仍然可用（下次领取会重新拉起）。

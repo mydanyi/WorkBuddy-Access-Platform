@@ -16,6 +16,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 _HERE = Path(__file__).resolve()
 _SOURCE_ROOT = _HERE.parents[2]
@@ -29,8 +30,10 @@ from astrbot_plugin_workbuddy.core.acp import (  # noqa: E402
     AcpProcessError,
     AcpRuntime,
     AcpTimeoutError,
+    AcpTransport,
     default_argv,
 )
+from astrbot_plugin_workbuddy.core.acp import runtime as runtime_module  # noqa: E402
 
 _FAKE = str(_HERE.parent / "fake_acp_cli.py")
 
@@ -91,6 +94,36 @@ class RuntimeTestCase(unittest.IsolatedAsyncioTestCase):
             **kwargs
         )
         return self.runtime
+
+
+class _ImpatientTransport(AcpTransport):
+    """把优雅退出的窗口压到 0.2 秒：走的还是真的 terminate 路径，只是不用等 3 秒。"""
+
+    async def close(self, *, timeout=5.0):
+        await super().close(timeout=0.2)
+
+
+class ShutdownCancellationTests(RuntimeTestCase):
+    """淘汰空闲进程时正好被取消：不能留下一条没人认领的 CLI。"""
+
+    async def test_a_cancelled_shutdown_leaves_no_live_process(self):
+        runtime = self.make_runtime("linger_after_eof")
+        with mock.patch.object(runtime_module, "AcpTransport", _ImpatientTransport):
+            await runtime.ensure_started()
+        transport = runtime.transport
+        proc = transport._proc
+
+        closer = asyncio.ensure_future(runtime.shutdown())
+        await asyncio.sleep(0.05)  # 停在"等进程退出"上
+        # 关闭还没结束，引用就必须还在身上：先摘再关的话，取消之后没有任何人
+        # 拿得到这条进程，它就成了孤儿。
+        self.assertIs(runtime.transport, transport)
+
+        closer.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await closer
+        self.assertIsNotNone(proc.returncode, "取消之后进程还活着")
+        self.assertIsNone(runtime.transport, "关干净了就该摘掉引用")
 
 
 class StartTests(RuntimeTestCase):

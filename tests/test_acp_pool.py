@@ -12,6 +12,7 @@
 模型 ID 全是虚构样本。
 """
 
+import asyncio
 import sys
 import unittest
 from pathlib import Path
@@ -261,6 +262,34 @@ class TrimTests(_PoolCase):
         self.assertEqual(await pool.trim(), 1)
         self.assertEqual(alpha.shutdowns, 0, "主运行时永不淘汰")
         self.assertEqual(beta.shutdowns, 1)
+
+    async def test_a_cancelled_trim_still_shuts_down_the_rest(self):
+        # 这批已经被摘出映射了，池子不会再回头找它们：取消时撒手，剩下那几条既
+        # 不在池子里、进程也还活着，等于凭空漏了 CLI。
+        pool = self.make_pool(max_processes=1)
+        alpha = pool.get(ALPHA)
+        beta = pool.get(BETA)
+        gamma = pool.get(GAMMA)
+        _start(alpha, beta, gamma)
+
+        gate = asyncio.Event()
+        release = alpha.shutdown
+
+        async def _slow_shutdown():
+            await gate.wait()  # 卡在第一条上，好让取消落在收尾途中
+            await release()
+
+        alpha.shutdown = _slow_shutdown
+
+        trimmer = asyncio.ensure_future(pool.trim())
+        await asyncio.sleep(0.05)
+        trimmer.cancel()
+        gate.set()
+        with self.assertRaises(asyncio.CancelledError):
+            await trimmer
+        self.assertEqual(alpha.shutdowns, 1, "被打断的那条也要关完")
+        self.assertEqual(beta.shutdowns, 1, "排在后面的不能因为取消就不关了")
+        self.assertEqual(gamma.shutdowns, 0, "上限之内那条留着")
 
     async def test_a_fully_busy_pool_stays_over_the_cap_rather_than_kill_a_stream(self):
         # 生产里的真实顺序就是"先占住、再拉起"：后端在 lease 里才 ensure_started。
