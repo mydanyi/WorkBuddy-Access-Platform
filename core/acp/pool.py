@@ -294,18 +294,26 @@ class AcpRuntimePool:
                 self._busy.pop(victim, None)
                 self._last_used.pop(victim, None)
 
-        async def _shutdown_all():
+        return await self._close_batch(victims, "shutdown")
+
+    async def _close_batch(self, runtimes, how) -> int:
+        """把一批运行时关完再放行取消，返回关成功的条数。
+
+        **这批已经从映射里摘掉了**，不会再有人回头找它们：中途被取消就撒手，剩下的
+        既不在池子里、子进程也还活着，等于凭空漏了几条 CLI。所以整批放进独立任务，
+        取消时等它跑完再把 ``CancelledError`` 往外传。
+
+        ``how`` 是方法名：淘汰与永久关闭用 ``shutdown``，登录后重启用 ``close``。
+        """
+        async def _run():
             count = 0
-            for runtime in victims:
+            for runtime in runtimes:
                 with contextlib.suppress(Exception):
-                    await runtime.shutdown()
+                    await getattr(runtime, how)()
                     count += 1
             return count
 
-        # 这批已经从映射里摘掉了，不会再有人来关它们：中途被取消就撒手，剩下的既
-        # 不在池子里、子进程也还活着，等于凭空漏了几条 CLI。所以整批放进独立任务，
-        # 取消时等它跑完再往外传。
-        cleanup = asyncio.ensure_future(_shutdown_all())
+        cleanup = asyncio.ensure_future(_run())
         try:
             return await asyncio.shield(cleanup)
         except asyncio.CancelledError:
@@ -327,9 +335,7 @@ class AcpRuntimePool:
         """
         async with self._trim_lock:
             runtimes = list(self._runtimes.values())
-        for runtime in runtimes:
-            with contextlib.suppress(Exception):
-                await runtime.close()
+        await self._close_batch(runtimes, "close")
 
     async def shutdown(self) -> None:
         """永久关闭：之后 :meth:`get` 一律抛 :class:`AcpError`。"""
@@ -339,9 +345,7 @@ class AcpRuntimePool:
             self._runtimes.clear()
             self._last_used.clear()
             self._busy.clear()
-        for runtime in runtimes:
-            with contextlib.suppress(Exception):
-                await runtime.shutdown()
+        await self._close_batch(runtimes, "shutdown")
 
 
 __all__ = ["AcpRuntimePool"]

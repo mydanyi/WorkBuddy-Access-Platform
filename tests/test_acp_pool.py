@@ -484,6 +484,30 @@ class ShutdownTests(_PoolCase):
             async with pool.lease(ALPHA):
                 pass  # pragma: no cover - 走不到这里
 
+    async def test_a_cancelled_shutdown_still_closes_the_rest(self):
+        # 映射已经清空了，没人再回头找它们：取消时撒手，后面那几条就成了孤儿。
+        pool = self.make_pool()
+        alpha = pool.get(ALPHA)
+        beta = pool.get(BETA)
+        _start(alpha, beta)
+        gate = asyncio.Event()
+        release = alpha.shutdown
+
+        async def _slow_shutdown():
+            await gate.wait()  # 卡在第一条上，让取消落在收尾途中
+            await release()
+
+        alpha.shutdown = _slow_shutdown
+
+        stopper = asyncio.ensure_future(pool.shutdown())
+        await asyncio.sleep(0.05)
+        stopper.cancel()
+        gate.set()
+        with self.assertRaises(asyncio.CancelledError):
+            await stopper
+        self.assertEqual(alpha.shutdowns, 1, "被打断的那条也要关完")
+        self.assertEqual(beta.shutdowns, 1, "排在后面的不能因为取消就不关了")
+
     async def test_shutdown_survives_a_runtime_that_refuses_to_stop(self):
         pool = self.make_pool()
         alpha = pool.get(ALPHA)
