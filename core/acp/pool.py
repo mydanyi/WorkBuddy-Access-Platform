@@ -221,6 +221,14 @@ class AcpRuntimePool:
         try:
             await self._drain_leases()
             await self.close_all()
+            if purge_config:
+                # 凭据是**共享**的一份：只要还有一条进程活着，删掉之后它手里的 token
+                # 照样能刷新、能写回磁盘。主运行时有自己的守卫（``AcpRuntime.logout``
+                # 会看 ``transport.alive``），备用进程没有——所以这里统一验一遍。
+                # 关不掉就不删：宁可这次登出失败，也不要留一条"已经退出登录"却仍握着
+                # token 的进程。
+                if any(runtime.started for runtime in self._runtimes.values()):
+                    raise AcpError("acp process is still running")
             await self.primary.logout(purge_config=purge_config)
             if purge_config:
                 # 登录态是**每条**运行时各记一份的，成功聊过一轮的备用模型会是 True。

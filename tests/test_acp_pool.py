@@ -438,6 +438,23 @@ class CloseAllTests(_PoolCase):
         self.assertEqual(alpha.logouts, [True])
         self.assertEqual(beta.logouts, [], "登出只在主运行时上做一次")
 
+    async def test_logout_refuses_to_purge_while_a_secondary_still_runs(self):
+        # 凭据只有一份。主运行时有关不掉的守卫，备用进程没有——只要有一条还活着，
+        # 删掉凭据之后它照样能刷新、能把 token 写回磁盘。
+        pool = self.make_pool(primary_model=ALPHA)
+        alpha = pool.get(ALPHA)
+        beta = pool.get(BETA)
+        _start(alpha, beta)
+
+        async def _stubborn_close():
+            return None  # 关不掉：started 保持真
+
+        beta.close = _stubborn_close
+
+        with self.assertRaises(AcpError):
+            await pool.logout(purge_config=True)
+        self.assertEqual(alpha.logouts, [], "没关干净就不许删凭据")
+
     async def test_logout_waits_for_a_lease_taken_before_the_gate(self):
         # 闸门只拦新请求。已经进来的那条还握着运行时，它的 ensure_started() 会在
         # close_all 之后把 CLI 重新拉起来——握着还没删的 token，然后凭据被删。
