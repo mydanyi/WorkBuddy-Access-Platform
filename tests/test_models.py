@@ -287,6 +287,36 @@ class CatalogProcessTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await catalog.refresh(), [CUSTOM_PREFIX + BETA])
         self.assertEqual(catalog.source, "config")
 
+    async def test_an_id_the_chat_endpoint_would_reject_is_not_published(self):
+        # 清单是聊天入口的**广告**。入口对 ``model`` 卡 128 个字符（见
+        # ``test_routing_gateway`` 里那条 4096 字符的用例），广告里出现更长的 ID，
+        # 客户端照着选，每一次都是 400，而用户看不出为什么。截断更糟：截出来的是
+        # 另一个 CLI 根本不认的模型。
+        tmp = _case_dir(self)
+        cli = _write_cli(tmp, [], marker=False)
+        # 发布出去的是**带前缀**的那一整条，所以边界要按全长算。
+        at_limit = CUSTOM_PREFIX + "wb-" + "y" * (128 - len(CUSTOM_PREFIX) - 3)
+        self.assertEqual(len(at_limit), 128)
+        one_over = at_limit + "z"
+        config = _write_config(
+            tmp,
+            {
+                "models": [
+                    {"id": "wb-" + "x" * 200},
+                    {"id": BETA},
+                    {"id": one_over},
+                    {"id": at_limit},
+                ]
+            },
+        )
+        catalog = ModelCatalog(str(cli), config_path=str(config), timeout=15)
+
+        self.assertEqual(
+            await catalog.refresh(),
+            [CUSTOM_PREFIX + BETA, at_limit],
+            "只发布入口收得下的：正好 128 的留着，129 和 203 的丢掉",
+        )
+
     async def test_neither_source_yields_an_empty_list_and_says_so(self):
         tmp = _case_dir(self)
         cli = _write_cli(tmp, [], marker=False, name="codebuddy-empty")

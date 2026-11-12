@@ -54,6 +54,12 @@ _IMAGE_HINT = "image"
 # 自定义网关模型在 ``--model`` 里的前缀。
 CUSTOM_PREFIX = "custom-local:"
 
+# 模型 ID 的字符上限。聊天入口必须拒绝更长的 ``model``：它会原样进 ``--model``
+# 的 argv 和日志行，不掐住就是一条能顶满请求体上限的字符串。这条线对这份清单同样
+# 成立——清单是那个入口的**广告**，广告里出现一个入口收不下的 ID，客户端照着选，
+# 每一次都是 400，而用户看不出为什么。
+MAX_MODEL_ID_CHARS = 128
+
 # 旧版本在模型 ID 后面拼的显示后缀：``<id> [0.11x]`` / ``<id> [0.11x · 夜间折扣]``
 # / ``<id> [倍率未知]``。倍率下线后这个后缀不再产生，但运维存下来的配置里可能还
 # 有，所以保留这条精确、锚定在末尾的剥除规则；自由格式的方括号一概不动。
@@ -166,9 +172,19 @@ def parse_config_models(document):
     return result
 
 
+def _publishable(models):
+    """去掉聊天入口收不下的 ID，别把用不了的东西写进清单。
+
+    ``--help`` 打出来的 ID 都是短的，超长的只可能来自手写的 ``models.json``。丢掉
+    而不是截断：截出来的 ID 是**另一个**模型，CLI 那边根本不认，那比不发布更糟。
+    也不记日志——脏配置每次刷新都会被读到，记下来就是刷屏，而它要传达的信息（"这条
+    选不了"）已经体现在清单里了。
+    """
+    return [model for model in models if len(model) <= MAX_MODEL_ID_CHARS]
+
+
 class ModelCatalog:
     """内存里的模型清单，来源是本地 CLI 的帮助文本，回退到 ``models.json``。"""
-
     def __init__(
         self,
         cli_path,
@@ -278,12 +294,12 @@ class ModelCatalog:
     async def _discover(self):
         models = await self._from_help()
         if models:
-            return models, "help"
+            return _publishable(models), "help"
         # 读一个小 JSON 也要开线程：本方法在事件循环里被调，卡住的是整个插件的
         # 所有请求，不值得为省一次线程池调度去赌那个文件永远在本地磁盘上。
         models = await asyncio.to_thread(self._from_config)
         if models:
-            return models, "config"
+            return _publishable(models), "config"
         return [], "none"
 
     async def _from_help(self):
@@ -361,6 +377,7 @@ __all__ = [
     "CUSTOM_PREFIX",
     "DEFAULT_CATALOG_AGE",
     "DEFAULT_RETRY_AFTER",
+    "MAX_MODEL_ID_CHARS",
     "ModelCatalog",
     "parse_config_models",
     "parse_help_models",

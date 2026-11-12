@@ -48,7 +48,7 @@ from aiohttp import web
 from .chat import aggregate_chunks
 from .errors import ChatStreamError, UpstreamError
 from .limits import ConcurrencyGate, LimitExceeded
-from .models import strip_model_alias
+from .models import MAX_MODEL_ID_CHARS, strip_model_alias
 from .routing import ORDERED_MODEL_ID
 
 COMPLETIONS_PATH = "/v1/chat/completions"
@@ -65,12 +65,6 @@ _DEFAULT_MAX_REQUEST_BODY_MB = 16
 # The router's own fixed code for "no candidate may be asked this round": that
 # refusal is a *local* 429 rate limit, never a plain upstream failure.
 _ROUTING_COOLING_CODE = "routing_cooling"
-
-# 模型 ID 的长度上限。真实 ID 是 ``wb-…`` 这种短串，128 个字符已经松得离谱。
-# 不设限的话，``model`` 能顶满整个请求体上限（默认 16 MB），而这里**没有任何
-# 长度检查**：它会被原样拼进 400 的错误文本（等于把网关当放大器），也会进
-# ``--model`` 的 argv 和日志行。这道检查排在限流之前，所以必须先掐住长度。
-_MAX_MODEL_ID_CHARS = 128
 
 _SSE_HEADERS = {
     "Content-Type": "text/event-stream",
@@ -269,11 +263,30 @@ class Gateway:
             code="request_too_large",
         )
 
+    def _frame_too_large_error(self):
+        """The 413 for a prompt that fits the body cap but not one ACP frame.
+
+        Same fixed shape and type as :meth:`_too_large_error`, different cause:
+        the body was under ``max_request_body_mb``, the content itself is what
+        overflowed. Pointing at that setting would send the caller to turn a
+        knob that cannot help, so the text only says what to cut.
+        """
+        return self._json_error(
+            413,
+            "请求内容超过单次请求的内容上限；请缩减历史消息或单条消息的内容后重试。",
+            "request_too_large",
+            code="request_too_large",
+        )
+
     def _failed_error(self, exc):
         if isinstance(exc, UpstreamError):
             status = exc.status if isinstance(exc.status, int) and exc.status >= 400 else 502
         else:
             status = getattr(exc, "status", 502) or 502
+        if status == 413:
+            # 这条提示词自己太大（正文 + 历史 + 附件超过一帧的上限），不是上游出事。
+            # 回一句能照着改的话；"upstream request failed" 只会让人去查网络。
+            return self._frame_too_large_error()
         # Only the router's own 429 cooling refusal reads as a rate limit (HTTP
         # 429 and its Retry-After are kept); every other upstream failure keeps
         # the historic ``upstream_error`` type and is never a local limit.
@@ -434,7 +447,9 @@ class Gateway:
                 400, "model must be a non-empty string", "invalid_request_error"
             )
         model = model.strip()
-        if len(model) > _MAX_MODEL_ID_CHARS:
+        if len(model) > MAX_MODEL_ID_CHARS:
+            # 上限与"清单里能出现什么"是同一个常量（:data:`core.models.MAX_MODEL_ID_CHARS`）：
+            # 清单是这道检查的广告，两边一旦分叉，就会出现"列出来的模型选不了"。
             # 固定文案，**不回声**：这个值来自请求体，可以有几 MB，原样拼回去就把
             # 网关变成了放大器。而且这道检查在限流之前，回显等于免费放大。
             return self._json_error(

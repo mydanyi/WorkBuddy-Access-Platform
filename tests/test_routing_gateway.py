@@ -661,6 +661,25 @@ class RequestBodyLimitTests(_GatewayCase):
         for leak in (marker, support.API_KEY, support.SEED_CREDENTIALS["accessToken"]):
             self.assertNotIn(leak, text, "the 413 body must not echo request data")
 
+    async def test_a_prompt_that_overflows_one_frame_is_a_413_with_guidance(self):
+        # 请求体在 ``max_request_body_mb`` 以内，但内容装不进一帧。这不是上游故障，
+        # 回 "upstream request failed" 只会把调用方引去查网络。
+        self.chat.queue_error(MODELS[0], support.upstream_error(413))
+
+        resp = await self.post_chat(self.chat_payload(model=MODELS[0]))
+        try:
+            self.assertEqual(resp.status, 413)
+            text = await resp.text()
+        finally:
+            await resp.release()
+
+        error = (json.loads(text) or {}).get("error") or {}
+        self.assertEqual(error.get("type"), "request_too_large")
+        self.assertEqual(error.get("code"), "request_too_large")
+        message = error.get("message") or ""
+        self.assertNotIn("upstream request failed", message, "这不是上游出事的文案")
+        self.assertIn("缩减", message, "得说清调用方能做什么")
+
     async def test_malformed_json_is_still_400_and_distinct_from_413(self):
         await self.restart_gateway(max_request_body_mb=1)
 

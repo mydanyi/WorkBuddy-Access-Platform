@@ -80,6 +80,8 @@ _CATEGORY_OF_REASON = {
     # The *local* admission budget ran out: a fixed local marker, never a fake
     # upstream rate limit, so a later notification layer can skip it.
     "local_limit": "routing",
+    # 提示词本身超过一帧的上限：调用方该改请求，上游没出事。
+    "request_too_large": "error",
 }
 
 
@@ -113,7 +115,13 @@ def _reason_for(exc) -> str:
         # A 504 is a timeout whichever layer produced it: the ACP backend raises
         # ``UpstreamError(504)`` for a prompt that never finished, and calling
         # that "上游返回错误" would hide the one clue an admin needs.
-        return "timeout" if exc.status == 504 else "upstream"
+        if exc.status == 504:
+            return "timeout"
+        if exc.status == 413:
+            # 一帧装不下这条提示词：该改请求的是调用方。算成 upstream 会让
+            # ``_routing_error_category`` 给管理员推一条"上游服务异常"。
+            return "request_too_large"
+        return "upstream"
     if isinstance(exc, ChatStreamError):
         return "timeout" if str(exc) == _TIMEOUT_MESSAGE else "stream"
     return "error"

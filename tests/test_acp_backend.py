@@ -309,6 +309,26 @@ class FrameTooLargeTests(unittest.IsolatedAsyncioTestCase):
                 pass
         self.assertEqual(ctx.exception.status, 413, "这一帧没发出去，不是上游的错")
 
+    async def test_an_oversized_prompt_is_not_reported_as_an_upstream_incident(self):
+        # 413 落在 ``_CALLER_ERROR_STATUSES`` 里：该改请求的是调用方，给管理员推
+        # 一条"上游服务异常"只会把他往错的方向带。
+        class _Client:
+            def prompt_once(self, text, *, timeout=None):
+                async def _nothing():
+                    raise AcpFrameTooLarge("outgoing acp frame was too large")
+                    yield  # pragma: no cover - 走不到，只是让它成为异步生成器
+
+                return _nothing()
+
+        notices = []
+        backend = AcpChatBackend(
+            _Client(), model="glm-5.2", prompt_timeout=3.0, on_error=notices.append
+        )
+        with self.assertRaises(UpstreamError):
+            async for _chunk in backend.stream(_payload("hi")):
+                pass
+        self.assertEqual(notices, [], "请求自己太大，不算上游事故")
+
 
 class BackendUserEchoTests(BackendTestCase):
     """CLI 回吐用户消息时，不能把它当成助手正文。"""
