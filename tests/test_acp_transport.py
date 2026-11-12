@@ -230,6 +230,9 @@ class CloseCancellationTests(unittest.IsolatedAsyncioTestCase):
 class _DeafStdin:
     """写得进去、drain 报管道已断：CLI 关掉了读端，stdout 却还开着。"""
 
+    def __init__(self, error=BrokenPipeError):
+        self._error = error
+
     def is_closing(self):
         return False
 
@@ -237,7 +240,7 @@ class _DeafStdin:
         pass
 
     async def drain(self):
-        raise BrokenPipeError
+        raise self._error
 
 
 class _DeafProcess:
@@ -246,8 +249,8 @@ class _DeafProcess:
     returncode = None
     pid = 4243
 
-    def __init__(self):
-        self.stdin = _DeafStdin()
+    def __init__(self, error=BrokenPipeError):
+        self.stdin = _DeafStdin(error)
 
 
 class SendFailureTests(unittest.IsolatedAsyncioTestCase):
@@ -261,6 +264,13 @@ class SendFailureTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(AcpProcessError):
             await transport.request("test/echo", {}, timeout=5.0)
         self.assertLess(loop.time() - started, 1.0, "不该傻等到超时")
+
+    async def test_notify_still_shrugs_off_a_broken_pipe(self):
+        # 取消通知、心跳这类东西写不出去就算了：它们没有等待方，抛出去只会让
+        # 收尾路径半路炸掉。``request()`` 才是必须知道"没发出去"的那个。
+        transport = AcpTransport(_argv("happy"), request_timeout=5.0)
+        transport._proc = _DeafProcess(RuntimeError)
+        await transport.notify("session/cancel", {"sessionId": "s1"})
 
     async def test_an_oversized_frame_blames_the_caller_not_the_upstream(self):
         # 网关的请求体上限（默认 16 MB）比单帧上限（8 MiB）宽松，所以"体量大到发不

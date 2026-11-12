@@ -259,12 +259,19 @@ class AcpTransport:
         self._send_sync(payload)
         proc = self._proc
         stdin = None if proc is None else proc.stdin
-        if stdin is not None:
-            try:
-                await stdin.drain()
-            except OSError as exc:
-                if strict:
-                    raise AcpProcessError("acp stdin write failed") from exc
+        if stdin is None:
+            return
+        try:
+            await stdin.drain()
+        except OSError as exc:
+            if strict:
+                raise AcpProcessError("acp stdin write failed") from exc
+        except Exception:
+            # 非 ``OSError`` 只会来自一条已经疯掉的管道（传输被换掉、循环已关）。
+            # ``notify()`` 维持原来"写不出去就算了"的语义；``request()` 不能装作
+            # 已经发出去了，否则又要挂到超时。
+            if strict:
+                raise
 
     def _allocate_id(self) -> int:
         self._next_id += 1
