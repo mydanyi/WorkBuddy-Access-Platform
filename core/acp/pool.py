@@ -468,7 +468,8 @@ class AcpRuntimePool:
         周期的 CLI。淘汰那一次失败不代表这一次也失败——重试一次比放弃强。
 
         **关完才出账，而且只出真关掉的。** 提前清空等于把"没关掉"改写成"没有这条"：
-        这次仍然杀不掉的话，引用就跟着清单一起没了，连再试一次的把手都不剩。
+        这次仍然杀不掉的话，引用就跟着清单一起没了，连再试一次的把手都不剩。映射里
+        来的那几条尤其要注意：清单已经清空，不把它们记到账上就是两头都没有。
 
         与正在进行的淘汰撞上也没事：``AcpRuntime.close`` 持 ``_start_lock``，
         后到的那次会等前一次关完再看一眼，已经死透就什么都不做。
@@ -481,9 +482,13 @@ class AcpRuntimePool:
             self._last_used.clear()
             self._busy.clear()
         await self._close_batch(runtimes, "shutdown")
-        self._evicting.difference_update(
-            runtime for runtime in runtimes if not runtime.started
-        )
+        # 一条一条改账本，不整体覆盖：这期间可能还有淘汰在收尾，它记的那几条不能
+        # 被我这一笔抹掉。
+        for runtime in runtimes:
+            if runtime.started:
+                self._evicting.add(runtime)
+            else:
+                self._evicting.discard(runtime)
 
 
 __all__ = ["AcpRuntimePool"]

@@ -779,6 +779,33 @@ class ShutdownTests(_PoolCase):
         self.assertFalse(beta.started, "第二次还得能顺着账本找到它")
         self.assertEqual(len(attempts), 3)
 
+    async def test_a_second_shutdown_also_finds_a_child_that_came_from_the_mapping(
+        self,
+    ):
+        # 映射清空之后，那几条既不在映射里、也不在账上，就等于两头都没有。从映射来
+        # 的那几条也得记到账上，第二次才找得回来。
+        pool = self.make_pool()
+        alpha = pool.get(ALPHA)
+        beta = pool.get(BETA)
+        _start(alpha, beta)
+
+        attempts = []
+
+        async def _dies_on_the_second_try():
+            attempts.append(1)
+            if len(attempts) > 1:
+                beta.started = False
+
+        beta.shutdown = _dies_on_the_second_try
+
+        await pool.shutdown()
+        self.assertTrue(beta.started, "第一次没关掉")
+        self.assertEqual(len(attempts), 1)
+
+        await pool.shutdown()
+        self.assertFalse(beta.started, "映射清空之后，还得顺着账本找回它")
+        self.assertEqual(len(attempts), 2)
+
     async def test_shutdown_survives_a_runtime_that_refuses_to_stop(self):
         pool = self.make_pool()
         alpha = pool.get(ALPHA)
