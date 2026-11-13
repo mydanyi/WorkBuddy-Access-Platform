@@ -254,8 +254,25 @@ class AcpRuntime:
                 await new_transport.start()
                 await client.initialize()
             except BaseException:
-                with contextlib.suppress(Exception):
-                    await new_transport.close(timeout=2.0)
+                try:
+                    with contextlib.suppress(Exception):
+                        await new_transport.close(timeout=2.0)
+                finally:
+                    if new_transport.alive:
+                        # 跟 ``_discard`` 同一条所有权规则：**子进程还活着就不许撒手**。
+                        # ``close()`` 关不掉时（或取消落在 terminate 之前）它会正常返回、
+                        # 把进程留在那儿，而这里 ``new_transport`` 只是局部变量——一抛
+                        # 出去就没人认领了：``started`` 报 false、``shutdown`` 也找不到
+                        # 它，下一次 ``ensure_started`` 还会再 spawn 一条，两条一起握着
+                        # token。
+                        #
+                        # 放在 ``finally`` 里：关闭本身被取消时也要挂上，否则最需要留住
+                        # 它的那一次恰好什么都没留。
+                        #
+                        # 只留 ``_transport``、不留 ``_client``：``initialize`` 没成功过，
+                        # 那个 client 不能交出去。下一次 ``ensure_started`` 会先
+                        # ``_discard`` 接着收，收不掉就按"上一条还活着"拒绝拉起。
+                        self._transport = new_transport
                 raise
             self._transport = new_transport
             self._client = client

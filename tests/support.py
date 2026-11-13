@@ -343,6 +343,11 @@ class StubCatalog:
         self.reads += 1
         return list(self.models)
 
+    @property
+    def authoritative(self) -> bool:
+        """跟真目录同一条规矩：只有 ``--help`` 读来的那份能当允许列表用。"""
+        return self.source == "help"
+
 
 def upstream_error(status, *, code=None, retry_after=None, limit_scope=None):
     """构造一个形状正确的 ``UpstreamError``（脚本化后端用）。"""

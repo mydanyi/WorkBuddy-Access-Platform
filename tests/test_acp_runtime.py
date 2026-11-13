@@ -51,6 +51,10 @@ class _SurvivingTransport:
 
     def __init__(self):
         self.close_calls = 0
+        self.start_calls = 0
+
+    async def start(self):
+        self.start_calls += 1
 
     async def close(self, *, timeout=5.0):
         self.close_calls += 1
@@ -256,6 +260,36 @@ class StartTests(RuntimeTestCase):
             _SurvivingTransport,
             "拒绝重启之后引用必须还在，下一轮才收得掉",
         )
+
+    async def test_a_failed_initialize_keeps_a_surviving_transport(self):
+        # ``start()`` 成功、``initialize()`` 失败：收尾那一步照例 ``close()``，可它
+        # 关不掉时进程还活着。此时若把 ``new_transport`` 当局部变量丢掉，那条 CLI
+        # 就再也没人认领：``started`` 报 false、``shutdown`` 找不到它，下一轮还会
+        # 再 spawn 一条，两条一起握着 token。
+        runtime = self.make_runtime()
+        surviving = _SurvivingTransport()
+
+        class _ClientThatCannotInitialize:
+            def __init__(self, transport, cwd=None):
+                self.transport = transport
+
+            async def initialize(self):
+                raise AcpProtocolError("FICTIONAL-INIT-FAILURE")
+
+        with mock.patch.object(
+            runtime_module, "AcpTransport", lambda *a, **k: surviving
+        ), mock.patch.object(
+            runtime_module, "AcpClient", _ClientThatCannotInitialize
+        ):
+            with self.assertRaises(AcpProtocolError):
+                await runtime.ensure_started()
+
+        self.assertIs(runtime.transport, surviving, "进程还活着就不能撒手")
+        self.assertTrue(runtime.started, "它还占着一个进程位")
+        # 下一轮先收再拉；收不掉就按"上一条还活着"拒绝，绝不顶掉引用另起一条。
+        with self.assertRaises(AcpError):
+            await runtime.ensure_started()
+        self.assertIs(runtime.transport, surviving)
 
 
 class LoginTests(RuntimeTestCase):

@@ -35,6 +35,12 @@ DEFAULT_CATALOG_AGE = 60.0
 # 轮询的，那就等于把自己变成了进程制造机，而且每次都吃满 ``_HELP_TIMEOUT``。
 DEFAULT_RETRY_AFTER = 5.0
 
+# 连败退避的上限（秒）。只按固定的 ``retry_after`` 限速时，"CLI 永久坏掉"这件事在
+# 时间轴上没有成本：每 5 秒一次、每次吃满 20 秒超时，等于每 25 秒就 spawn 一个注定
+# 失败的进程，永不停止。失败越连续、退避越长，恢复靠显式刷新（``/wb models``，不受
+# 它限制）或下一轮定时重读，而不是靠更快地重试。
+MAX_RETRY_AFTER = 300.0
+
 # 收尸时等进程真正退出的上限（秒）。``kill()`` 是信号，``wait()`` 才是回收。
 _REAP_TIMEOUT = 5.0
 
@@ -206,13 +212,27 @@ class ModelCatalog:
         self._retry_after = min(float(retry_after), max_age)
         self._models = []
         self._source = "none"
+        # 两个来源**分开记账**，发布出去的是它们的并集：
+        #
+        # * ``_help_models`` 只在 ``--help`` 读成时整份替换。那份是全集，末尾本来就
+        #   带着 ``models.json`` 推出来的 ``custom-local:`` 条目。
+        # * ``_config_models`` 每次读到 ``models.json`` 都整份替换。
+        #
+        # 为什么分开：只做"并集"的话，删除不可表达——运维从 ``models.json`` 里删掉
+        # 一个网关，在 help 恢复之前它会一直挂在清单上（也就一直挂在聊天入口的允许
+        # 列表里）。分开记账之后，config 那份每次都是整体换掉，删除照样生效。
+        self._help_models = []
+        self._config_models = []
         # 上次**成功**读取的时刻；``None`` 表示还没读成过。
         self._read_at = None
         # 上次**尝试**读取的时刻，成败都记。只有它能把"一直失败"与"还没试过"
         # 区分开，也才有地方挡住失败重试。
         self._last_attempt = None
-        # 让并发的轮询只 spawn 一次。显式刷新（``refresh``）不持锁：它是"我就要重读"，
-        # 而 ``ensure`` 是"能不读就不读"，两件事的语义不一样。
+        # 连续失败的次数：``--help`` 没读成就加一，读成清零。**配置清单命中不算成功**
+        # ——这一趟 ``--help`` 还是没读到，只是从 ``models.json`` 捞到一部分。
+        self._failures = 0
+        # 一次只读一趟：并发的轮询不必各 spawn 一个 CLI，显式刷新（``/wb models``）
+        # 也不该在别人正读着的时候再拉一个进程出来。
         self._refresh_lock = asyncio.Lock()
 
     @property
@@ -243,8 +263,40 @@ class ModelCatalog:
             return False
         return self.age >= self._max_age
 
+    @property
+    def authoritative(self) -> bool:
+        """这份清单够不够格当聊天入口的**允许列表**。
+
+        只有手里真有一份 ``--help`` 全集时才够格。判据直接看 ``_help_models`` 而不是
+        ``_source`` 字符串：字符串只说"上次成功是从哪读的"，说得出一份从来没拿到过的
+        全集。
+
+        ``models.json`` 那条回退永远只是**子集**（只含运维手写的 ``custom-local:``）。
+        拿子集当允许列表，会让所有内置模型变成 400——正是"子集不许顶替全集"要防的
+        事。拒收替换只挡得住"手里原来有全集"那一路；**首次读取就没读成**时手里本来
+        没有全集，拒收无从谈起，只能靠这个标志告诉调用方"别拿它拦人"。
+        """
+        return bool(self._help_models)
+
+    @property
+    def retry_wait(self) -> float:
+        """距上次失败的尝试要隔多久才允许再试一次（秒），随连败次数翻倍。"""
+        if self._failures <= 1:
+            return self._retry_after
+        return min(
+            self._retry_after * (2.0 ** (self._failures - 1)), MAX_RETRY_AFTER
+        )
+
+    def _merged(self) -> list:
+        """拼出要发布的清单：help 在前、config 在后，重复的只留第一次出现的。"""
+        merged = list(self._help_models)
+        for model in self._config_models:
+            if model not in merged:
+                merged.append(model)
+        return merged
+
     async def refresh(self) -> list:
-        """重读一次。失败时保留上一次成功的结果，绝不清空成"没有模型"。
+        """重读一次（持锁）。失败时保留上一次成功的结果，绝不清空成"没有模型"。
 
         **尝试时刻在读之前就记。** 读到一半被取消（上层超时、客户端断开）时，函数
         其余部分一步都走不到；若把盖章放在读之后，一次取消就会让退避闸门失效，
@@ -254,15 +306,54 @@ class ModelCatalog:
         **失败之后再盖一次。** 读一次可能要吃掉 ``--help`` 那 20 秒超时。只在读之前
         盖章的话，等它失败返回，5 秒的退避期早过了；排在 ``_refresh_lock`` 上的调用方
         会一个接一个地再吃满一次超时。从"这次失败结束"开始算，闸门才真的挡得住。
+
+        **不拿子集顶替全集。** 手里那份是从 ``--help`` 读来的，这一趟只回退到
+        ``models.json``（必然更小、只含 ``custom-local:``），那就不拿它替换 help 那份
+        ——见下面那段注释。判据是"来源变差了"，不是"新清单更短"：两个来源本来就不可比。
+
+        **但也不把这一趟白读。** 拒收的是"替换全集"，不是"内容"：``models.json`` 里
+        新加的网关照样发布出去。CLI 坏掉时"临时挂一个本地网关顶上"正是最可能发生的
+        运维动作，整份丢掉会让它在 help 恢复前一直看不见。
+
+        **持锁**：显式刷新不受退避闸门限制（"我就要重读"），但也不该与一次正在飞的
+        读并发出第二个 CLI 进程。
         """
+        async with self._refresh_lock:
+            return await self._read_once()
+
+    async def _read_once(self) -> list:
+        """:meth:`refresh` 的正文；只由已持锁的调用方进来。"""
         self._last_attempt = self._clock()
-        models, source = await self._discover()
-        if models:
-            self._models = models
-            self._source = source
-            self._read_at = self._clock()
-        else:
+        try:
+            models, source = await self._discover()
+        except asyncio.CancelledError:
+            # 取消也记一次失败：这一趟已经花掉一次 spawn 了。不记的话，反复被早取消的
+            # 调用方（上层超时、客户端断开）会让退避永远停在最短那一档，比修前还密。
+            self._failures += 1
             self._last_attempt = self._clock()
+            raise
+        if models and source == "help":
+            self._help_models = models
+            # help 那份本来就包含 ``models.json`` 推出来的 ``custom-local:`` 条目。
+            # config 那份不清掉，只会让"已经删掉的网关"在下一趟从旧账里冒回来。
+            self._config_models = []
+            self._source = "help"
+            self._read_at = self._clock()
+            self._failures = 0
+        else:
+            # 这一趟 ``--help`` 没读到（超时、CLI 被换掉，或者干脆没有那一行），
+            # 配置清单兜底。**不算成功**：``_failures`` 照加，退避照升级——否则
+            # "CLI 永久坏掉 + ``models.json`` 有货"会变成每 ``max_age`` 秒 spawn 一个
+            # 注定失败的进程，一次都不升级。
+            self._failures += 1
+            self._last_attempt = self._clock()
+            if models:
+                self._config_models = models
+                if not self._help_models:
+                    # 从来没有全集，配置清单就是全部：这是一次真读到，年龄照记。
+                    self._source = "config"
+                    self._read_at = self._clock()
+        self._models = self._merged()
         return self.models
 
     async def ensure(self) -> list:
@@ -274,22 +365,30 @@ class ModelCatalog:
         改过，那份清单就永远停在空列表或旧值上——所以给一个短的保鲜期。
 
         失败也要挡：只按"上次成功"计时的话，CLI 被卸载或卡死时每次轮询都会再 spawn
-        一个进程、再吃满一次超时。"上次尝试"距今不到 ``retry_after`` 就直接放弃，
+        一个进程、再吃满一次超时。"上次尝试"距今不到 :attr:`retry_wait` 就直接放弃，
         把下一次尝试推后。显式刷新（``/wb models``）走 :meth:`refresh`，不受它限制。
 
         整个过程持锁：两个并发的轮询都判断成"过期了"，就会各 spawn 一个 CLI、各吃
         满一次超时。锁只保护"判断 + 读"，不让第二个请求重复第一次的等待以外的东西。
+        :meth:`refresh` 拿的是同一把锁——"我就要重读"不该再拉第二个进程出来。
+
+        **手里有旧清单时不等锁。** 一轮读要吃掉整个 ``_HELP_TIMEOUT``，全程持锁；
+        help 坏掉时 ``stale`` 永真、每个调用方都进不了 fast-path，于是全部在锁上排队，
+        而其中不少是消息路径上"这个模型认不认"的校验——白等半个超时窗。旧清单就在手
+        边，先给它便是。空清单不这么办：那说明还没读成过，让它等那唯一的一次真读。
         """
+        if self._models and self._refresh_lock.locked():
+            return self.models
         async with self._refresh_lock:
             now = self._clock()
             if self._models and self.age < self._max_age:
                 return self.models
             if (
                 self._last_attempt is not None
-                and (now - self._last_attempt) < self._retry_after
+                and (now - self._last_attempt) < self.retry_wait
             ):
                 return self.models
-            return await self.refresh()
+            return await self._read_once()
 
     async def _discover(self):
         # **先滤再判来源。** 判在滤之前的话，``--help`` 只报出一串超长 ID 时
@@ -381,6 +480,7 @@ __all__ = [
     "DEFAULT_CATALOG_AGE",
     "DEFAULT_RETRY_AFTER",
     "MAX_MODEL_ID_CHARS",
+    "MAX_RETRY_AFTER",
     "ModelCatalog",
     "parse_config_models",
     "parse_help_models",

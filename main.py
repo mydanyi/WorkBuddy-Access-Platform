@@ -123,6 +123,11 @@ class WorkBuddyPlugin(Star):
         self._login_task = None
         # 定时重读模型清单的那条任务；同一时刻只允许存在一条。
         self._model_refresh_task = None
+        # 已经作废、但还有子进程没死的池。``AcpRuntimePool.shutdown()`` 关不掉的
+        # 那条会留在池自己的账上；池要是跟着 ``self.acp`` 一起被丢掉，那笔账也就
+        # 没了——下一轮 initialize 建的是新池，这条 CLI 从此没人认得。所以留在这里，
+        # 每次拆卸都再关一遍，直到它真的空掉。
+        self._retired_pools = []
         self._notify_tasks = set()
         self._notify_umo = None
         self._notify_settings = None
@@ -271,7 +276,11 @@ class WorkBuddyPlugin(Star):
 
     async def terminate(self) -> None:
         """Release every owned resource; safe to call more than once."""
-        await self._release_runtime()
+        # 整段收尾都要罩住，不只是关进程那一步：挂账发生在它之前，而取消落在更早的
+        # 等待点（停监听、收登录任务）上时，池连账都没上，罩住后半段也白搭——那正是
+        # "没人认得的 CLI"在同一个函数的更早窗口重开。``shield`` 让外层取消照样立刻
+        # 抛出，收尾在后台跑完（事件循环整个退出就真没辙了，那属于进程级收尾，接受）。
+        await asyncio.shield(self._release_runtime())
 
     # ------------------------------------------------------------------ #
     # runtime construction / teardown
@@ -410,10 +419,11 @@ class WorkBuddyPlugin(Star):
         # ACP 的 CLI 子进程必须在这里收掉：登录任务已经取消，再没人用它。
         acp = self.acp
         self.acp = None
-        if acp is not None:
-            with contextlib.suppress(Exception):
-                # shutdown 而不是 close_all：永久关闭，旧引用不能再把 CLI 拉起来。
-                await acp.shutdown()
+        if acp is not None and acp not in self._retired_pools:
+            # 先挂账再关：``shutdown()`` 里有等待点，被取消时下面的出账一行都执行
+            # 不到，而那一刻恰恰最需要这片地方记着"它还没关干净"。
+            self._retired_pools.append(acp)
+        await self._drain_retired_pools()
 
         # 本地清单只是个内存快照，跟着运行时一起丢，下次重读。
         self.catalog = None
@@ -438,6 +448,26 @@ class WorkBuddyPlugin(Star):
         # Drop every notification reference once the runtime is torn down.
         self.notifier = None
         self._notify_umo = None
+
+    async def _drain_retired_pools(self) -> None:
+        """把账上的池逐个关掉，关干净了才出账。
+
+        用 ``shutdown`` 而不是 ``close_all``：池已经作废，旧引用不能再把 CLI 拉起来。
+        **每个池每次都关**，不看 ``has_live_children`` 再决定——那是"关完之后"的判据，
+        拿它当前置条件会漏掉一个刚挂上来、还什么都没关过的池（它的映射里全是进程，账上
+        却还是空的）。``shutdown()`` 幂等，重复调只多一次关闭超时。
+
+        关不掉的留在账上：它每多活一轮，就多一条"没人认得"的 CLI 的窗口，所以下一次
+        拆卸还要再来一遍；关干净了立刻出账，免得这串东西越攒越长。
+
+        只碰账上那几条，一次空循环就过去了，所以放在拆卸路径上不心疼。
+        """
+        for pool in list(self._retired_pools):
+            with contextlib.suppress(Exception):
+                await pool.shutdown()
+            if not pool.has_live_children:
+                with contextlib.suppress(ValueError):
+                    self._retired_pools.remove(pool)
 
     def _fail(self, reason: str) -> None:
         self.ready = False
@@ -1341,6 +1371,15 @@ class WorkBuddyPlugin(Star):
             lines.append(
                 "注意：这份清单已过了保鲜期，可能与本机 CLI 的现状不符；"
                 "用 /wb models 重读一次。"
+            )
+        if not getattr(catalog, "authoritative", True):
+            # 只读到 ``models.json`` 那份子集时，聊天入口不拿它当允许列表（见
+            # ``core/gateway.py`` 的 ``_known_model``）。这件事必须说出来：否则运维
+            # 看到"来源：models.json + 三个网关"，会以为这台机器只认这三个，而真相是
+            # "CLI 的清单没读到，校验暂时关了"。
+            lines.append(
+                "注意：只读到 models.json 里的自定义网关，CLI 的完整清单没读到；"
+                "此时聊天入口不校验模型名，打错的 id 会由 CLI 自己报错。"
             )
         lines.append("说明：清单来自本机 CLI，与账号登录状态无关。")
         return "\n".join(lines)

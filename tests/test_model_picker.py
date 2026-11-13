@@ -439,6 +439,28 @@ class _ModelPickerTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertIn("3 秒前", fresh)
         self.assertNotIn("保鲜期", fresh)
 
+    async def test_a_config_only_catalog_says_the_model_check_is_off(self):
+        # 只读到 ``models.json`` 那份子集时，聊天入口不拿它当允许列表（否则内置模型
+        # 全部 400）。状态页必须把这件事说出来：运维看到"来源：models.json + 三个
+        # 网关"，很容易以为这台机器就只认这三个。
+        plugin, _config, _ = await self._make_plugin(**self._picker_config())
+        plugin.catalog = fixtures.StubCatalog([ALPHA], source="config", age=3.0)
+        status = support._text_of(
+            await support._invoke(
+                plugin.wb, support._make_event("wb status"), "status", ""
+            )
+        )
+        self.assertIn("不校验模型名", status)
+
+        # 读到完整清单时不加这条：那时候校验是真的在拦。
+        plugin.catalog = fixtures.StubCatalog([ALPHA], source="help", age=3.0)
+        strict = support._text_of(
+            await support._invoke(
+                plugin.wb, support._make_event("wb status"), "status", ""
+            )
+        )
+        self.assertNotIn("不校验模型名", strict)
+
     # =====================================================================
     # 5. A selected [B, A] array of pure ids saves through AstrBotConfig, loads
     #    back in the same order, drives router.status in that order, and the

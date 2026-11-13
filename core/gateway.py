@@ -21,7 +21,8 @@ Behaviour pinned by the contract tests:
   never forwarded to a CLI process;
 * a model id that the local catalog does not contain is a fixed local 400 (never
   a spawned process that would fail later with a 502); when the catalog is empty
-  -- nothing has ever been read -- the check is skipped rather than refusing
+  -- nothing has ever been read -- or is only the ``models.json`` subset (the
+  ``--help`` read never succeeded), the check is skipped rather than refusing
   every request;
 * the request body is capped by ``gateway.max_request_body_mb`` (default 16
   MiB) in real UTF-8 bytes -- Content-Length and chunked bodies alike -- with an
@@ -374,10 +375,26 @@ class Gateway:
         此时拒绝所有请求只会把"还没准备好"变成"永远不能用"。清单非空才做校验——
         此时一个不认识的 id 意味着 CLI 那边一定会失败，早点回 400 比让它变成一条
         注定失败的进程 + 一条"上游异常"提醒好。
+
+        但清单得**够格**当允许列表：``models.json`` 那条回退只含运维手写的
+        ``custom-local:``，是个子集。拿子集拦人，内置模型会全部 400——那正是本次要
+        修的那个 bug，只不过发生在"``--help`` 从一开始就没读成"这条路径上。不够格就
+        降级为 advisory：放行给下游，让 CLI 报真实错误。
         """
         if not models:
             return True
+        if not self._catalog_is_authoritative():
+            return True
         return model in models
+
+    def _catalog_is_authoritative(self) -> bool:
+        """清单能否当允许列表用；见 :attr:`core.models.ModelCatalog.authoritative`。
+
+        拿不准就当"不够格"：漏拦一个模型只是让下游报真实错误，拦错一个却会把本来能
+        用的请求变成 400，而用户从错误文本里看不出是清单的锅。
+        """
+        catalog = self._catalog
+        return bool(getattr(catalog, "authoritative", False))
 
     async def _handle_models(self, request):
         if not self._authorized(request):

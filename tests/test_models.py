@@ -27,6 +27,7 @@ from astrbot_plugin_workbuddy.core.models import (  # noqa: E402
     CUSTOM_PREFIX,
     DEFAULT_CATALOG_AGE,
     DEFAULT_RETRY_AFTER,
+    MAX_RETRY_AFTER,
     ModelCatalog,
     parse_config_models,
     parse_help_models,
@@ -272,11 +273,13 @@ class CatalogProcessTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(catalog.source, "none")
         self.assertIsNone(catalog.age, "从未读成过就没有年龄")
         self.assertFalse(catalog.stale, "空清单不算过期，算没有")
+        self.assertFalse(catalog.authoritative, "没读到过当然不够格当允许列表")
 
         self.assertEqual(await catalog.refresh(), [ALPHA, BETA])
         self.assertEqual(catalog.source, "help")
         self.assertIsNotNone(catalog.age)
         self.assertFalse(catalog.stale)
+        self.assertTrue(catalog.authoritative, "help 读来的才是全集")
 
     async def test_a_cli_without_the_marker_falls_back_to_the_config_file(self):
         tmp = _case_dir(self)
@@ -286,6 +289,8 @@ class CatalogProcessTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(await catalog.refresh(), [CUSTOM_PREFIX + BETA])
         self.assertEqual(catalog.source, "config")
+        # 子集：聊天入口若拿它拦人，内置模型会全部 400。
+        self.assertFalse(catalog.authoritative)
 
     async def test_an_over_long_help_entry_does_not_hide_the_config_fallback(self):
         # ``--help`` 只报出一串入口收不下的 ID 时，过滤之后等于"这条来源没货"。
@@ -422,6 +427,51 @@ class CatalogProcessTests(unittest.IsolatedAsyncioTestCase):
         clock[0] = 300.0
         self.assertTrue(catalog.stale, "过了保鲜期的旧清单必须自报过期")
 
+    async def test_a_partial_config_fallback_does_not_replace_a_full_catalog(self):
+        # 上一版的坑：``--help`` 失败时回退到 ``models.json``，那份**必然更小**、且
+        # 全是 ``custom-local:`` 前缀。拿它顶掉手里的完整清单，等于把这台机器"认哪些
+        # id"悄悄缩成运维手写的那几个：内置模型从候选里消失，聊天入口的允许列表跟着
+        # 缩，一个本来好好的请求就变成 400——而它的进程还好好的。
+        tmp = _case_dir(self)
+        marker = tmp / "probed-once"
+        good = "  --model <model>  Currently supported: ({}, {})\n".format(ALPHA, BETA)
+        cli = _write_cli(
+            tmp,
+            [],
+            name="codebuddy-half-dead",
+            marker=False,
+            extra=(
+                "import os\n"
+                "marker = " + repr(str(marker)) + "\n"
+                "if not os.path.exists(marker):\n"
+                "    open(marker, 'w').write('x')\n"
+                "    sys.stdout.write(" + repr(good) + ")\n"
+            ),
+        )
+        config = _write_config(tmp, {"models": [{"id": GAMMA}]})
+        catalog = ModelCatalog(str(cli), config_path=str(config), timeout=15)
+
+        self.assertEqual(await catalog.refresh(), [ALPHA, BETA])
+        self.assertEqual(catalog.source, "help")
+        self.assertTrue(catalog.authoritative, "help 读来的才算权威清单")
+        read_at = catalog._read_at
+        # 第二次 ``--help`` 不再报清单，只剩配置里那一条——不许顶替，但也不白读：
+        # 并进清单，老的一条都不能少。
+        self.assertEqual(
+            await catalog.refresh(),
+            [ALPHA, BETA, CUSTOM_PREFIX + GAMMA],
+            "子集不许顶掉完整清单",
+        )
+        self.assertEqual(catalog.source, "help", "来源也不能被改写成 config")
+        self.assertTrue(catalog.authoritative, "并集之后照样是权威的")
+        self.assertEqual(catalog._read_at, read_at, "help 那部分没刷新，年龄就该照走")
+
+        # 反过来：手里本来就没有全集时，配置那份回退照收——那正是它存在的意义。
+        fresh = ModelCatalog(str(cli), config_path=str(config), timeout=15)
+        self.assertEqual(await fresh.refresh(), [CUSTOM_PREFIX + GAMMA])
+        self.assertEqual(fresh.source, "config")
+        self.assertFalse(fresh.authoritative, "只有配置清单，当不了允许列表")
+
     async def test_refresh_really_re_reads_after_the_cli_changes(self):
         tmp = _case_dir(self)
         cli = _write_cli(tmp, [ALPHA, BETA], name="codebuddy-upgrade")
@@ -475,6 +525,190 @@ class CatalogProcessTests(unittest.IsolatedAsyncioTestCase):
         await catalog.ensure()
         self.assertEqual(_runs(tmp), 2, "过了重试间隔就该再试一次")
 
+    async def test_repeated_failures_back_off_further_each_time(self):
+        # 固定 5 秒退避在"CLI 永久坏掉"面前等于没有：每 5 秒一次、每次吃满 20 秒
+        # 超时，也就是每 25 秒 spawn 一个注定失败的进程，永不停止。连败要越退越远。
+        tmp = _case_dir(self)
+        clock = [0.0]
+        cli = _write_cli(
+            tmp, [], marker=False, name="codebuddy-dead", extra=_counting(tmp)
+        )
+        catalog = ModelCatalog(
+            str(cli), timeout=15, clock=lambda: clock[0], max_age=60, retry_after=5
+        )
+
+        self.assertEqual(await catalog.ensure(), [])
+        self.assertEqual(_runs(tmp), 1)
+        clock[0] = 6.0  # 第一次退避 5 秒，过了
+        await catalog.ensure()
+        self.assertEqual(_runs(tmp), 2)
+        self.assertEqual(catalog._failures, 2, "两次失败都记上")
+
+        clock[0] = 15.0  # 距上次失败 9 秒：第二次退避已经是 10 秒，还不够
+        await catalog.ensure()
+        self.assertEqual(_runs(tmp), 2, "连败之后退避要翻倍")
+
+        clock[0] = 17.0
+        await catalog.ensure()
+        self.assertEqual(_runs(tmp), 3, "过了 10 秒就该再试")
+
+        # 封顶：再怎么连败也不会退到"永远不重试"。
+        catalog._failures = 40
+        self.assertEqual(catalog.retry_wait, MAX_RETRY_AFTER, "退避有上限")
+
+        # 一旦读成，连败清零、退避回到最短。
+        _write_cli(tmp, [ALPHA], name="codebuddy-dead")
+        clock[0] = 17.0 + MAX_RETRY_AFTER
+        self.assertEqual(await catalog.ensure(), [ALPHA])
+        self.assertEqual(catalog._failures, 0, "读成了就把连败清零")
+        self.assertEqual(catalog.retry_wait, 5.0)
+
+    async def test_a_poll_does_not_queue_behind_an_in_flight_read(self):
+        # 一轮读吃满 20 秒超时并全程持锁。help 坏掉时 ``stale`` 永真，每个调用方都进
+        # 不了 fast-path，于是一起在锁上排队——而其中不少是消息路径上"这个模型认不
+        # 认"的校验。手里有旧清单就先给它，别让它白等半个超时窗。
+        tmp = _case_dir(self)
+        clock = [120.0]
+        cli = _write_cli(tmp, [ALPHA], name="codebuddy-slow")
+        catalog = ModelCatalog(
+            str(cli), timeout=15, clock=lambda: clock[0], max_age=60, retry_after=0
+        )
+        catalog._models = [ALPHA]
+        catalog._source = "help"
+        catalog._read_at = 0.0          # 已经过期
+
+        started = asyncio.Event()
+        gate = asyncio.Event()
+
+        async def _blocked_read():
+            started.set()
+            await gate.wait()
+            return [], "none"
+
+        catalog._discover = _blocked_read
+        first = asyncio.create_task(catalog.ensure())
+        await asyncio.wait_for(started.wait(), 5.0)
+        try:
+            # 读还卡着。这一次必须立刻拿到旧清单，而不是排在锁上。
+            self.assertEqual(
+                await asyncio.wait_for(catalog.ensure(), 2.0),
+                [ALPHA],
+                "手里有旧清单就别排队",
+            )
+        finally:
+            gate.set()
+            await asyncio.wait_for(first, 5.0)
+
+        # 空清单不这么办：那说明还没读成过，该等那唯一的一次真读。
+        cold = ModelCatalog("codebuddy", timeout=15)
+        started.clear()
+        gate.clear()
+
+        async def _blocked_again():
+            started.set()
+            await gate.wait()
+            return [BETA], "help"
+
+        cold._discover = _blocked_again
+        holder = asyncio.create_task(cold.ensure())
+        await asyncio.wait_for(started.wait(), 5.0)
+        self.assertTrue(cold._refresh_lock.locked(), "这条用例的前提是锁真的被占着")
+        gate.set()
+        self.assertEqual(await asyncio.wait_for(holder, 5.0), [BETA])
+        self.assertEqual(await asyncio.wait_for(cold.ensure(), 5.0), [BETA])
+
+    async def test_a_config_fallback_does_not_reset_the_backoff(self):
+        # "``--help`` 永久坏掉 + ``models.json`` 有货"：每趟都靠配置清单兜底。要是那
+        # 算成功、连败清零，退避就一次都不会升级——节奏从"每 25 秒"变成"每 60 秒"，
+        # 照样是一个注定失败的进程接着一个。
+        tmp = _case_dir(self)
+        clock = [0.0]
+        cli = _write_cli(
+            tmp, [], marker=False, name="codebuddy-dead", extra=_counting(tmp)
+        )
+        config = _write_config(tmp, {"models": [{"id": GAMMA}]})
+        catalog = ModelCatalog(
+            str(cli),
+            config_path=str(config),
+            timeout=15,
+            clock=lambda: clock[0],
+            max_age=60,
+            retry_after=5,
+        )
+
+        self.assertEqual(await catalog.ensure(), [CUSTOM_PREFIX + GAMMA])
+        self.assertEqual(_runs(tmp), 1)
+        self.assertEqual(catalog._failures, 1, "配置兜底不算 help 读成")
+
+        clock[0] = 61.0  # 过了保鲜期，再读一趟
+        await catalog.ensure()
+        self.assertEqual(_runs(tmp), 2)
+        self.assertEqual(catalog._failures, 2)
+        self.assertEqual(catalog.retry_wait, 10.0, "连败要升级")
+
+        clock[0] = 66.0  # 距上次失败 5 秒：升级后是 10 秒，还不够
+        await catalog.ensure()
+        self.assertEqual(_runs(tmp), 2, "配置兜底不许把退避打回最短")
+
+    async def test_a_gateway_removed_from_the_config_disappears(self):
+        # 并集只能加不能减。运维从 ``models.json`` 里删掉一个网关，在 help 恢复之前
+        # 它会一直挂在清单上（也就一直挂在聊天入口的允许列表里）。两个来源分开记账
+        # 之后，config 那份整体换新，删除照样生效。
+        tmp = _case_dir(self)
+        marker = tmp / "probed-once"
+        good = "  --model <model>  Currently supported: ({})\n".format(ALPHA)
+        cli = _write_cli(
+            tmp,
+            [],
+            name="codebuddy-half-dead",
+            marker=False,
+            extra=(
+                "import os\n"
+                "marker = " + repr(str(marker)) + "\n"
+                "if not os.path.exists(marker):\n"
+                "    open(marker, 'w').write('x')\n"
+                "    sys.stdout.write(" + repr(good) + ")\n"
+            ),
+        )
+        config = _write_config(tmp, {"models": [{"id": GAMMA}]})
+        catalog = ModelCatalog(str(cli), config_path=str(config), timeout=15)
+
+        self.assertEqual(await catalog.refresh(), [ALPHA])
+        self.assertEqual(await catalog.refresh(), [ALPHA, CUSTOM_PREFIX + GAMMA])
+
+        _write_config(tmp, {"models": [{"id": BETA}]})
+        self.assertEqual(
+            await catalog.refresh(),
+            [ALPHA, CUSTOM_PREFIX + BETA],
+            "删掉的那条必须真的消失",
+        )
+
+    async def test_an_explicit_refresh_waits_for_the_read_in_flight(self):
+        # ``/wb models`` 直调 ``refresh``。锁只由 ``ensure`` 拿的话，help 卡死那 20 秒
+        # 里管理员再敲一次就并发出第二个 CLI 进程——持锁要防的正是这个。
+        catalog = ModelCatalog("codebuddy", timeout=15)
+        started = asyncio.Event()
+        gate = asyncio.Event()
+        calls = []
+
+        async def _blocked_read():
+            calls.append(1)
+            started.set()
+            await gate.wait()
+            return [ALPHA], "help"
+
+        catalog._discover = _blocked_read
+        first = asyncio.create_task(catalog.refresh())
+        await asyncio.wait_for(started.wait(), 5.0)
+        second = asyncio.create_task(catalog.refresh())
+        for _ in range(20):
+            await asyncio.sleep(0.01)
+        self.assertEqual(len(calls), 1, "别人正读着的时候不许再拉一个进程")
+
+        gate.set()
+        self.assertEqual(await asyncio.wait_for(first, 5.0), [ALPHA])
+        self.assertEqual(await asyncio.wait_for(second, 5.0), [ALPHA])
+
     async def test_a_cancelled_read_still_counts_as_an_attempt(self):
         # 读到一半被取消时，"尝试时刻"必须在读之前就盖章。否则一次取消就让退避
         # 闸门失效，之后每次轮询都重新 spawn、重新吃满一次超时。
@@ -509,6 +743,22 @@ class CatalogProcessTests(unittest.IsolatedAsyncioTestCase):
         clock[0] = 1.0
         self.assertEqual(await catalog.ensure(), [])
         self.assertEqual(_runs(tmp), 1, "取消也算一次尝试，退避闸门必须生效")
+        self.assertEqual(catalog.retry_wait, 5.0, "一次失败还是基础宽度")
+
+        # 再被早取消一次：退避必须跟着升级，否则反复早取消的调用方能让它停在最短
+        # 那一档——比修前还密。
+        clock[0] = 6.0
+        second = asyncio.create_task(catalog.ensure())
+        for _ in range(200):
+            if _runs(tmp) == 2:
+                break
+            await asyncio.sleep(0.01)
+        self.assertEqual(_runs(tmp), 2, "假 CLI 没起来，这条用例没验到东西")
+        second.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await second
+        self.assertEqual(catalog._failures, 2, "取消也要计数")
+        self.assertEqual(catalog.retry_wait, 10.0, "连着被取消，退避要升级")
 
     async def test_concurrent_polls_spawn_only_one_cli(self):
         # 两个并发的 /v1/models 都判断成"过期了"，会各拉一个 CLI、各吃满一次超时。

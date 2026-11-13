@@ -454,6 +454,11 @@ class _StubAcpPool:
     def get(self, model=None):
         return self.primary
 
+    @property
+    def has_live_children(self) -> bool:
+        """替身默认"关干净了"：``main`` 据此决定要不要把这个池留在账上。"""
+        return False
+
     async def close_all(self) -> None:
         self.close_alls += 1
 
@@ -468,9 +473,61 @@ class _StubAcpPool:
         await self.primary.shutdown()
 
 
+class _PoolWithASurvivor:
+    """``shutdown()`` 第一次关不掉的池：第二次才干净。
+
+    真池的这条分支要一条"杀不死的子进程"才跑得到（见 ``test_acp_pool.py`` 里的
+    ``_SurvivingTransport``）。这里要验的是**插件侧**的所有权：关不干净的池还留不
+    留在手上、下次会不会再试。
+    """
+
+    def __init__(self):
+        self.shutdowns = 0
+        self.survivor = True
+
+    @property
+    def has_live_children(self) -> bool:
+        return self.survivor
+
+    async def shutdown(self) -> None:
+        self.shutdowns += 1
+        if self.shutdowns >= 2:
+            self.survivor = False
+
+
+class _PoolThatClosesSlowly:
+    """``shutdown()`` 卡在等待点上的池：用来验"取消之后由谁收尾"。"""
+
+    def __init__(self):
+        self.shutdowns = 0
+        self.entered = asyncio.Event()
+        self.gate = asyncio.Event()
+        self.survivor = True
+
+    @property
+    def has_live_children(self) -> bool:
+        return self.survivor
+
+    async def shutdown(self) -> None:
+        self.shutdowns += 1
+        self.entered.set()
+        await self.gate.wait()
+        self.survivor = False
+
+
+class _GatewayThatStopsSlowly:
+    """``stop()`` 卡在等待点上的网关：用来把取消点挪到"挂账之前"。"""
+
+    def __init__(self):
+        self.entered = asyncio.Event()
+        self.gate = asyncio.Event()
+
+    async def stop(self) -> None:
+        self.entered.set()
+        await self.gate.wait()
+
+
 _FAKE_CLI = Path(__file__).resolve().parent / "fake_acp_cli.py"
-
-
 async def _acp_client(scenario: str):
     """一个真连假 CLI、且已完成握手的 ACP 客户端。
 
@@ -796,6 +853,87 @@ class _PluginIntegrationTestCase(unittest.IsolatedAsyncioTestCase):
         plugin2 = await self._make_plugin(**self._make_ready_plugin_config())
         self.assertTrue(plugin2.ready)
         await plugin2.terminate()
+
+    # -- 3c. a pool that cannot finish shutdown is kept until it is empty --
+    async def test_a_pool_that_cannot_finish_shutdown_is_kept_and_retried(self):
+        # ``AcpRuntimePool.shutdown()`` 关不掉的那条子进程留在池自己的账上。池要是
+        # 跟着 ``self.acp`` 一起被丢掉，那笔账也就没了：下一轮 initialize 建的是新池，
+        # 这条 CLI 从此没人认得，活过插件生命周期。
+        plugin = await self._make_plugin(initialize=False)
+        pool = _PoolWithASurvivor()
+        plugin.acp = pool
+
+        await plugin.terminate()
+        self.assertIsNone(plugin.acp, "插件自己的引用照样要摘掉")
+        self.assertEqual(plugin._retired_pools, [pool], "还有活口的池不许丢")
+        self.assertEqual(pool.shutdowns, 1)
+
+        # 下一次拆卸（重载就是这条路）接着收；收干净了才真的放手。
+        await plugin._release_runtime()
+        self.assertEqual(pool.shutdowns, 2, "还活着就再试一次")
+        self.assertEqual(plugin._retired_pools, [])
+
+    async def test_a_pool_that_was_never_shut_down_still_gets_shut_down(self):
+        # 账上空的池**不等于**"没有活口"：它还没关过，映射里全是进程。拿
+        # ``has_live_children`` 当"要不要关"的前置条件就会跳过关闭、再把它当成
+        # 关干净了丢掉——一次都没关，池里的 CLI 全部脱管。
+        plugin = await self._make_plugin(initialize=False)
+        pool = _StubAcpPool()
+        plugin.acp = pool
+
+        await plugin.terminate()
+        self.assertEqual(pool.shutdowns, 1, "一次都没关就把池丢了")
+        self.assertEqual(plugin._retired_pools, [])
+
+    async def test_a_cancelled_final_teardown_still_finishes_closing(self):
+        # 账上的池靠"下一次拆卸再试"兜底，可最后一次拆卸之后没有下一次：插件被永久
+        # 禁用、上层超时取消 terminate，账上的池就再没人去关了——正是这一整片要关掉
+        # 的"没人认得的 CLI"窗口，在终局路径上重新打开。shield 把收尾放进自己的任务：
+        # 取消照样抛出，关闭在后台跑完。
+        plugin = await self._make_plugin(initialize=False)
+        pool = _PoolThatClosesSlowly()
+        plugin.acp = pool
+
+        task = asyncio.create_task(plugin.terminate())
+        await asyncio.wait_for(pool.entered.wait(), 5.0)
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+        self.assertEqual(plugin._retired_pools, [pool], "还没关干净，账不能销")
+
+        pool.gate.set()
+        for _ in range(200):  # 等后台那段收尾跑完
+            if not plugin._retired_pools:
+                break
+            await asyncio.sleep(0.01)
+        self.assertEqual(plugin._retired_pools, [], "取消之后也得关干净")
+        self.assertFalse(pool.has_live_children)
+
+    async def test_a_cancel_before_the_pool_is_charged_still_closes_it(self):
+        # 取消落在挂账**之前**的等待点上（这里停在停监听）：只罩住最后那段 drain 是
+        # 不够的——那一刻池还没上账，drain 从未启动，而没有下一次拆卸了。整段收尾都
+        # 罩住之后，后台仍会走到挂账与关闭。
+        plugin = await self._make_plugin(initialize=False)
+        gateway = _GatewayThatStopsSlowly()
+        plugin.gateway = gateway
+        pool = _StubAcpPool()
+        plugin.acp = pool
+
+        task = asyncio.create_task(plugin.terminate())
+        await asyncio.wait_for(gateway.entered.wait(), 5.0)
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+        self.assertEqual(plugin._retired_pools, [], "取消时还没挂账")
+        self.assertEqual(pool.shutdowns, 0, "也还没开始关")
+
+        gateway.gate.set()
+        for _ in range(200):  # 等后台那段收尾跑完
+            if pool.shutdowns:
+                break
+            await asyncio.sleep(0.01)
+        self.assertEqual(pool.shutdowns, 1, "后台收尾必须走到关闭")
+        self.assertEqual(plugin._retired_pools, [])
 
     # -- 3b. empty api_key never opens the listener -----------------------
     async def test_valid_settings_bind_health_and_empty_api_key_disables_listener(self):

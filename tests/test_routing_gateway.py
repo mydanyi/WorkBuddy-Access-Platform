@@ -32,6 +32,7 @@ from astrbot_plugin_workbuddy.core.gateway import (  # noqa: E402
     MODELS_PATH,
     Gateway,
 )
+from astrbot_plugin_workbuddy.core.models import CUSTOM_PREFIX  # noqa: E402
 from astrbot_plugin_workbuddy.core.routing import (  # noqa: E402
     ORDERED_MODEL_ID,
     ModelRouter,
@@ -441,6 +442,23 @@ class RoutingThroughGatewayTests(_GatewayCase):
         finally:
             await resp.release()
         self.assertEqual(self.chat.sent_models, ["wb-anything"])
+
+    async def test_a_config_only_catalog_is_advisory_instead_of_a_refusal(self):
+        # ``--help`` 从第一次就没读成（冷启动超时、CLI 被换掉）：清单里只有
+        # ``models.json`` 那几条 ``custom-local:``。它照样被当成允许列表的话，内置
+        # 模型会全部 400——跟"子集顶替全集"那个 bug 同一个症状，只是发生在首次读取
+        # 这条路上。子集不够格拦人：放行，让 CLI 报真实错误。
+        await self.restart_gateway(
+            catalog=support.StubCatalog([CUSTOM_PREFIX + "wb-local"], source="config")
+        )
+        self.chat.queue_text("wb-builtin", "ok")
+        resp = await self.post_chat(self.chat_payload(model="wb-builtin"))
+        try:
+            self.assertEqual(resp.status, 200)
+            await resp.read()
+        finally:
+            await resp.release()
+        self.assertEqual(self.chat.sent_models, ["wb-builtin"], "降级清单不许拦人")
 
     async def test_a_missing_catalog_skips_the_check_entirely(self):
         await self.restart_gateway(catalog=None)

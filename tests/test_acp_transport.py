@@ -284,6 +284,65 @@ class SendFailureTests(unittest.IsolatedAsyncioTestCase):
             )
 
 
+class _SilentStdin:
+    """``drain()`` 永远不回来：CLI 不读 stdin，管道缓冲区已经满了。"""
+
+    def is_closing(self):
+        return False
+
+    def write(self, data):
+        pass
+
+    async def drain(self):
+        await asyncio.Event().wait()  # 只有取消叫得醒它
+
+
+class _SilentProcess:
+    """只提供 ``request()`` 会碰到的那几个属性的子进程替身。"""
+
+    returncode = None
+    pid = 4245
+
+    def __init__(self):
+        self.stdin = _SilentStdin()
+
+
+class BlockedSendTests(unittest.IsolatedAsyncioTestCase):
+    """发不出去、而对面已经判死：这一轮必须立刻返回，不许陪着 drain 一起耗。"""
+
+    async def test_a_dead_reader_interrupts_a_blocked_send(self):
+        # CLI 不读 stdin（``drain()`` 挂着），stdout 又坏了。只按"先发完再等"串行走，
+        # 这个失败要等 drain 自己愿意回来才看得见——prompt 那一档是 600 秒，并发名额
+        # 就这么白占十分钟，而进程其实已经废了。
+        transport = AcpTransport(_argv("happy"), request_timeout=600.0)
+        transport._proc = _SilentProcess()
+        loop = asyncio.get_running_loop()
+        started = loop.time()
+
+        async def _reader_dies():
+            # 有界轮询：``_pending`` 万一一直没注册上（``request()`` 在它之前就退出
+            # 了），这里也得自己收工。收不了就让用例按"没在 1 秒内返回"去红，绝不
+            # 把一个核烧到天荒地老。
+            for _ in range(200):
+                if transport._pending:
+                    transport._fail_pending(AcpProcessError("FICTIONAL-READER-DIED"))
+                    return
+                await asyncio.sleep(0.01)
+
+        killer = asyncio.ensure_future(_reader_dies())
+        try:
+            with self.assertRaises(AcpProcessError):
+                # 外面再套一个 2 秒上限：没修之前这里会一直挂着，用例不该跟着挂死。
+                await asyncio.wait_for(
+                    transport.request("session/prompt", {}, timeout=600.0), 2.0
+                )
+        finally:
+            # ``return_exceptions`` 只兜"抛异常的死法"，不兜"根本不终止"。
+            killer.cancel()
+            await asyncio.gather(killer, return_exceptions=True)
+        self.assertLess(loop.time() - started, 1.0, "读循环已经判死了，不该等到超时")
+
+
 class InitializeTests(TransportTestCase):
     scenario = "happy"
 
@@ -436,12 +495,20 @@ class PromptTests(TransportTestCase):
         await _drain(client)
         stats = await self.transport.request("test/stats")
         self.assertEqual(stats["session_new"], 2)
+        # 光数 session_new 不够：建了两个会话、却把两轮的 prompt 都发进第一个，
+        # 一样能过。请求隔离坏掉时，上一轮的上下文会漏进下一轮。
+        self.assertEqual(
+            len(set(stats["prompt_sessions"])), 2, "两轮必须落在两个不同的会话上"
+        )
 
     async def test_concurrent_turns_do_not_share_a_session(self):
         client = AcpClient(self.transport, cwd="/tmp")
         await asyncio.gather(_drain(client), _drain(client))
         stats = await self.transport.request("test/stats")
         self.assertEqual(stats["session_new"], 2)
+        self.assertEqual(
+            len(set(stats["prompt_sessions"])), 2, "并发两轮更不许挤进同一个会话"
+        )
 
     async def test_mid_stream_error_propagates(self):
         await self.transport.close(timeout=3.0)

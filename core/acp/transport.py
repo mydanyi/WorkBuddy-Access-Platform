@@ -304,8 +304,37 @@ class AcpTransport:
             payload["params"] = params
 
         async def round_trip():
-            await self._send(payload, strict=True)
-            return await future
+            # 发与等**并行**。CLI 不读 stdin 时 ``_send`` 会挂在 ``drain()`` 上，而
+            # 读循环那边可能早就把这一帧判死了（stdout 关了、帧被破坏）。只按"先发完
+            # 再等"串行走，那个失败要等 drain 自己愿意回来才看得见——prompt 那一档是
+            # 600 秒，并发名额就这么白占十分钟，而进程其实已经废了。
+            sending = asyncio.ensure_future(self._send(payload, strict=True))
+            try:
+                done, _ = await asyncio.wait(
+                    {sending, future}, return_when=asyncio.FIRST_COMPLETED
+                )
+                if future in done:
+                    if future.cancelled() or future.exception() is not None:
+                        # 传输层先判死：这一帧还在写就没人收了，收干净再抛。
+                        sending.cancel()
+                    # 反过来，响应正常到手时不许掐：对端已经把整帧读完了（不然回不了
+                    # 包），那一帧确实写出去了，只是 ``drain()`` 还在等缓冲区排空。
+                    # 让它自然收尾，别把一个成功的发送记成"被取消"。
+                    with contextlib.suppress(BaseException):
+                        await sending
+                    return future.result()
+                await sending
+                return await future
+            finally:
+                # 无条件收尾，**不看有没有结束**：``sending`` 已经带着异常完成时，
+                # 恰恰是它最需要被认领的时候（读写两端几乎同时死，先被 ``wait``
+                # 唤醒的往往是 future 那一侧）。只按"没完成才 await"守门，那条
+                # 异常就永远没人取——GC 时一句 "Task exception was never retrieved"，
+                # 而写端的真实死因（往往比读端那句"传输已关"更准）也跟着丢了。
+                if not sending.done():
+                    sending.cancel()
+                with contextlib.suppress(BaseException):
+                    await sending
 
         try:
             if timeout is None:

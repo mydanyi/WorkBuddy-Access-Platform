@@ -120,6 +120,19 @@ class ConstructionTests(unittest.TestCase):
         pool = AcpRuntimePool(lambda model: _FakeRuntime(model), primary_model=123)
         self.assertIsNone(pool.status()["primary_model"])
 
+    def test_a_blank_primary_model_normalizes_to_the_default_key(self):
+        # ``""`` 与空白串跟 ``get("")`` / ``lease("")`` 说的是同一件事：CLI 自己的
+        # 默认模型，键是 ``None``。原样存下来的话主运行时记在 ``None`` 上、而淘汰时
+        # 比的是 ``""``——两个键永不相等，主运行时就变成可淘汰的了（见下面
+        # ``test_a_blank_primary_is_never_evicted``）。
+        for blank in ("", "   ", "\t\n"):
+            with self.subTest(value=blank):
+                pool = AcpRuntimePool(
+                    lambda model: _FakeRuntime(model), primary_model=blank
+                )
+                self.assertIsNone(pool.status()["primary_model"])
+                self.assertIs(pool.primary, pool.get(None), "主运行时就是默认那一条")
+
 
 class GetAndStatusTests(_PoolCase):
     """同一模型永远同一条进程；状态页是只读快照。"""
@@ -265,6 +278,20 @@ class TrimTests(_PoolCase):
         self.assertEqual(await pool.trim(), 1)
         self.assertEqual(alpha.shutdowns, 0, "主运行时永不淘汰")
         self.assertEqual(beta.shutdowns, 1)
+
+    async def test_a_blank_primary_is_never_evicted(self):
+        # 空白的主模型名跟 ``get("")`` 一样落到 ``None`` 这个键上。主键若原样存成
+        # ``"  "``，淘汰时比的 ``model != 主键`` 就永远成立，主运行时会以"最久未用"
+        # 的身份被关掉——登录凭据正握着它，随后拿到的是一条死运行时。
+        pool = self.make_pool(max_processes=1, primary_model="  ")
+        primary = pool.get(None)
+        beta = pool.get(BETA)
+        _start(primary, beta)
+
+        self.assertEqual(await pool.trim(), 1)
+        self.assertEqual(primary.shutdowns, 0, "主运行时永不淘汰，空白名字也一样")
+        self.assertEqual(beta.shutdowns, 1)
+        self.assertIs(pool.primary, primary)
 
     async def test_a_cancelled_trim_still_shuts_down_the_rest(self):
         # 这批已经被摘出映射了，池子不会再回头找它们：取消时撒手，剩下那几条既
@@ -647,6 +674,43 @@ class CloseAllTests(_PoolCase):
         async with pool.lease(BETA) as runtime:
             self.assertEqual(runtime.model, BETA)
 
+    async def test_an_overlapping_logout_keeps_the_gate_closed(self):
+        # 连着两次登出：后一次先收工时**不许**放开闸门——前一次还在往下走，马上
+        # 要删凭据。那一刻放进来的租约能拉起一条握着 token 的进程，而删除就排在
+        # 它后面：用户看到"已退出登录"，账号却还在。
+        pool = self.make_pool(primary_model=ALPHA)
+        alpha = pool.get(ALPHA)
+        _start(alpha)
+
+        calls = []
+        first_in = asyncio.Event()
+        release_first = asyncio.Event()
+
+        async def logout(*, purge_config=False):
+            calls.append(purge_config)
+            if len(calls) == 1:
+                first_in.set()
+                await release_first.wait()
+
+        alpha.logout = logout
+        first = asyncio.ensure_future(pool.logout(purge_config=True))
+        try:
+            await asyncio.wait_for(first_in.wait(), 5.0)
+            second = asyncio.ensure_future(pool.logout(purge_config=True))
+            await asyncio.wait_for(second, 5.0)
+            self.assertEqual(calls, [True, True], "两次都真的走到了删凭据那一步")
+            # 第二次已经收工，第一次还卡在 logout 里：闸门必须还是关着的。
+            with self.assertRaises(AcpError):
+                async with pool.lease(BETA):
+                    pass  # pragma: no cover - 走不到这里
+        finally:
+            release_first.set()
+            await asyncio.gather(first, return_exceptions=True)
+
+        # 最后一个登出也结束了，闸门才放开。
+        async with pool.lease(BETA) as runtime:
+            self.assertEqual(runtime.model, BETA)
+
     async def test_the_pool_is_usable_again_after_a_failed_logout(self):
         pool = self.make_pool(primary_model=ALPHA)
         alpha = pool.get(ALPHA)
@@ -911,6 +975,39 @@ class CloseAllTests(_PoolCase):
         await holder
         self.assertEqual(len(outcome), 1)
         self.assertIn("logging out", outcome[0], "闸门关了之后不许再放行")
+
+    async def test_a_lease_waiting_inside_trim_is_refused_after_shutdown(self):
+        # 同一个窗口，换成永久关闭：``shutdown()`` 既不抬高登出深度、也不动 epoch，
+        # 只查那两样就会放行一条刚被关掉的运行时。调用方拿到它，紧接着的
+        # ``ensure_started()`` 只会撞上"运行时已关闭"——而它本来就没资格进场。
+        pool = self.make_pool(max_processes=1, primary_model=ALPHA)
+        alpha = pool.get(ALPHA)
+        _start(alpha)
+
+        gate = asyncio.Event()
+        real_trim = pool.trim
+
+        async def _slow_trim():
+            await gate.wait()
+            return await real_trim()
+
+        pool.trim = _slow_trim
+        outcome = []
+
+        async def _hold():
+            try:
+                async with pool.lease(BETA):
+                    outcome.append("ok")
+            except AcpError as exc:
+                outcome.append(str(exc))
+
+        holder = asyncio.ensure_future(_hold())
+        await asyncio.sleep(0.05)  # 让它停在 trim 里
+        await pool.shutdown()
+        gate.set()
+        await asyncio.wait_for(holder, 5.0)
+        self.assertEqual(len(outcome), 1)
+        self.assertIn("closed", outcome[0], "池已经作废，不许再把运行时交出去")
 
 
 class ShutdownTests(_PoolCase):
