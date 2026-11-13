@@ -41,9 +41,11 @@ from .transport import SESSION_CLOSED
 # 一轮 prompt 的终态标记：作为生成器的最后一项产出。
 KIND_DONE = "done"
 
-# 上报给 CLI 的客户端版本。必须与 metadata.yaml 的 version 一致；版本号统一
-# 收敛是既有技术债，这里先不引入第五处来源，只在 P3 一并处理时改这一行。
-CLIENT_VERSION = "0.1.3"
+# 上报给 CLI 的客户端版本。**必须与 ``metadata.yaml`` 和 ``main.py`` 的
+# ``@register(...)`` 一致**：这一串会进 ``initialize`` 的 ``clientInfo.version``，
+# 是 CLI 那边唯一能知道"谁在跟我说话"的东西，报个陈旧版本等于让它按旧行为对待。
+# 三处各写一遍是既有技术债，改版本时一起改。
+CLIENT_VERSION = "0.3.0"
 
 
 class AcpClient:

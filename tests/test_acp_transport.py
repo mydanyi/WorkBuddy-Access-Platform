@@ -35,6 +35,7 @@ from astrbot_plugin_workbuddy.core.acp import (  # noqa: E402
     SESSION_CLOSED,
 )
 from astrbot_plugin_workbuddy.core.acp import protocol  # noqa: E402
+from astrbot_plugin_workbuddy.core.acp.client import CLIENT_VERSION  # noqa: E402
 from astrbot_plugin_workbuddy.core.acp.transport import MAX_FRAME_BYTES  # noqa: E402
 
 _FAKE = str(_HERE.parent / "fake_acp_cli.py")
@@ -379,6 +380,18 @@ class BlockedSendTests(unittest.IsolatedAsyncioTestCase):
 
 class InitializeTests(TransportTestCase):
     scenario = "happy"
+
+    def test_the_reported_client_version_matches_the_plugin_metadata(self):
+        # 这一串会进 ``initialize`` 的 ``clientInfo.version``，是 CLI 那边唯一能知道
+        # "谁在跟我说话"的东西。报个陈旧版本，它就会按旧行为对待我们，而没人看得出来。
+        # 三处各写一遍（metadata.yaml / @register / 这里）是既有技术债，这条用例负责
+        # 让"忘记一起改"变红。
+        import re
+
+        metadata = (_HERE.parents[1] / "metadata.yaml").read_text(encoding="utf-8")
+        declared = re.search(r"^version:\s*v?([\d.]+)", metadata, re.MULTILINE)
+        self.assertIsNotNone(declared, "metadata.yaml 里没找到 version")
+        self.assertEqual(CLIENT_VERSION, declared.group(1))
 
     async def test_initialize_reports_capabilities_and_auth_methods(self):
         client = AcpClient(self.transport, cwd="/tmp")
