@@ -121,6 +121,8 @@ class WorkBuddyPlugin(Star):
         self.catalog = None
 
         self._login_task = None
+        # 定时重读模型清单的那条任务；同一时刻只允许存在一条。
+        self._model_refresh_task = None
         self._notify_tasks = set()
         self._notify_umo = None
         self._notify_settings = None
@@ -263,6 +265,10 @@ class WorkBuddyPlugin(Star):
             except Exception:
                 pass
 
+        # 定时重读模型清单。它只碰本机 CLI，与账号、网关都无关，所以不看签到那份
+        # 前提；起不来也只是静默跳过，绝不影响已经可用的运行时。
+        self._start_model_refresh()
+
     async def terminate(self) -> None:
         """Release every owned resource; safe to call more than once."""
         await self._release_runtime()
@@ -362,8 +368,18 @@ class WorkBuddyPlugin(Star):
         self._login_task = None
         if login_task is not None and not login_task.done():
             login_task.cancel()
-            with contextlib.suppress(BaseException):
-                await login_task
+            # 同 ``_logout``：不用 ``suppress(BaseException)``，它分不清"我们自己
+            # 取消的那条"与"外层把 release 本身取消了"。
+            await asyncio.gather(login_task, return_exceptions=True)
+
+        # 定时重读必须停在 ``self.catalog`` 被丢掉之前：它每轮最后一步是发布候选，
+        # 而 ``catalog`` 已置空时发布等于把候选刷成只剩已保存的那几项。cancel 只是
+        # 投递，``await`` 才是真的停住，所以两步都要做。
+        refresh_task = self._model_refresh_task
+        self._model_refresh_task = None
+        if refresh_task is not None and not refresh_task.done():
+            refresh_task.cancel()
+            await asyncio.gather(refresh_task, return_exceptions=True)
 
         # 先停网关再收 CLI。反过来（先 shutdown 进程池、后停监听）中间隔着调度器
         # 和提醒队列两个 await，那段时间端口还开着，任何进来的聊天都会走完整路由
@@ -444,7 +460,13 @@ class WorkBuddyPlugin(Star):
         self._publish_model_options()
 
     async def _refresh_catalog(self) -> list:
-        """Re-read the local model list; a failure keeps the last good one."""
+        """Re-read the local model list; a failure keeps the last good one.
+
+        **只在同一个 ``ModelCatalog`` 实例上重读，绝不替换 ``self.catalog``。** 定时
+        循环每轮记下这个对象、读完比对还是不是它，用来判断"这一轮读的世界还算不算
+        数"；重读若把实例换掉，那一轮会被判成"世界变了"而跳过，而且每轮都这样，
+        定时从此只读不发。``ModelCatalog.refresh()`` 原地更新，这里也只做转发。
+        """
         catalog = self.catalog
         if catalog is None:
             return []
@@ -454,6 +476,77 @@ class WorkBuddyPlugin(Star):
             raise
         except Exception:  # noqa: BLE001 - a picker read never fails the runtime
             return catalog.models
+
+    def _start_model_refresh(self) -> None:
+        """Start the single periodic re-read; never reads here.
+
+        这里只起任务、不读清单：启动首读已经由 ``_prime_model_options()`` 做过一
+        次，紧接着再 spawn 一个 ``--help`` 只会把启动拖慢一倍。所以第一轮要等满一
+        个间隔——顺带也让"刚启动就被重载"不会变成连续两次进程启动。
+        """
+        settings = self._settings
+        refresh = (
+            settings.get("model_refresh") if isinstance(settings, dict) else None
+        )
+        if not isinstance(refresh, dict) or refresh.get("enabled") is not True:
+            return
+        existing = self._model_refresh_task
+        if existing is not None and not existing.done():
+            # 幂等：这个方法只管"确保有一条在跑"，不管重启。换配置走一次
+            # ``initialize()``——它开头就会 ``_release_runtime()``，旧任务在那里
+            # 被收掉。生命周期交叠时也可能撞见一条上家的任务：留着它，让循环自己
+            # 按当轮的清单重新取，而不是这里再起一条。
+            return
+        seconds = _refresh_interval_seconds(refresh.get("interval_minutes"))
+        if seconds is None:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        task = loop.create_task(
+            self._model_refresh_loop(seconds), name="wb-model-refresh"
+        )
+        task.add_done_callback(self._consume_task)
+        self._model_refresh_task = task
+
+    async def _model_refresh_loop(self, interval_seconds: int) -> None:
+        """Re-read the catalog once per interval, sequentially, until cancelled.
+
+        每轮都走 :meth:`_refresh_catalog`：读失败时它保留上一次成功的清单、并把
+        下一次尝试推后，所以这里不需要自己的重试与退避。发布是幂等的，重复发同
+        一份候选不会产生副作用。
+
+        **每轮开头先确认这一轮还该不该由我来跑。** 生命周期是"先拆后建"，两次调用
+        交叠时，拆的那一次可能已经读过 ``_model_refresh_task`` 之后才被建的任务追上
+        来：任务还在跑，但已经没人持有它。让它继续跑只有一个结果——按一份过期的
+        （甚至空的）清单把配置页候选重发一遍，每个间隔一遍，而且永不退场。所以要
+        查两条：**我还是不是插件握着的那一条**（换了新任务说明这次交接不是我的），
+        以及**还有没有清单可发**。
+
+        **发之前还要再判一次，判据是"我读的那份还在不在"。** 读清单那一步会 spawn
+        一个 ``--help``，是真的让出点；运行时正好能在这段时间里被拆掉，`self.catalog`
+        就在这个 await 里变成 ``None``。只在轮首判一次的话，回来照样按空清单发布，
+        而且发布之后没有任何东西会把它纠正回来。检查与发布之间不许有 await，这个
+        窗口才关得死。
+
+        **换了一份（不是拆掉）只跳过这一轮，不退出。** 交叠的 ``initialize()`` 会
+        重建清单，而它收尾的 ``_start_model_refresh()`` 看到这条任务还活着就不再起新
+        的——这时候退出去，定时就永远停在那儿，配置页还显示"已启用"。跳过这一轮，
+        下一轮轮首重新取当前那份，自己就接上了。
+        """
+        while True:
+            await asyncio.sleep(interval_seconds)
+            if asyncio.current_task() is not self._model_refresh_task:
+                return
+            catalog = self.catalog
+            if catalog is None:
+                return
+            await self._refresh_catalog()
+            if self.catalog is not catalog:
+                # 拆了就是拆了（None，下一轮轮首收尾）；换了一份就重来一轮。
+                continue
+            self._publish_model_options()
 
     def _publish_model_options(self) -> None:
         """Rebuild the delivered ``routing.models`` options/labels in place.
@@ -1027,6 +1120,8 @@ class WorkBuddyPlugin(Star):
         else:
             lines.append("网关：未监听")
 
+        lines.extend(self._format_model_refresh_status())
+
         if self.scheduler is not None:
             st = self.scheduler.status()
             signin_cfg = self._settings["signin"] if self._settings else {}
@@ -1186,6 +1281,33 @@ class WorkBuddyPlugin(Star):
             return "当前不可签到（{}）。".format(result.get("reason", "已阻止"))
         return "签到未完成，请稍后重试。"
 
+    def _format_model_refresh_status(self) -> list:
+        """Two purely local overview lines: switch and interval, no read.
+
+        只读已校验的设置，所以这个视图既不会额外 spawn 一次 ``--help``，也不会
+        编一个"上次刷新时间"出来——清单的年龄由 ``/wb models`` 那个视图负责。
+        """
+        refresh = None
+        if self._settings is not None:
+            value = self._settings.get("model_refresh")
+            refresh = value if isinstance(value, dict) else None
+        enabled = isinstance(refresh, dict) and refresh.get("enabled") is True
+        interval = refresh.get("interval_minutes") if isinstance(refresh, dict) else None
+        if isinstance(interval, bool) or not isinstance(interval, int):
+            interval = None
+        lines = [
+            "模型自动刷新：{}（间隔 {} 分钟，仅重读本机 CLI 清单）".format(
+                "已启用" if enabled else "未启用",
+                interval if interval is not None else "未知",
+            )
+        ]
+        if enabled:
+            lines.append(
+                "刷新范围：仅定时更新模型顺序列表的候选；"
+                "启动首读、登录后读取与 /wb models 不受此开关影响"
+            )
+        return lines
+
     async def _models_text(self, *, refresh: bool) -> str:
         """List the ids this machine's CLI accepts; no network, no login needed."""
         if refresh:
@@ -1289,6 +1411,17 @@ class WorkBuddyPlugin(Star):
         """Consume a background task's result so no exception is left unretrieved."""
         with contextlib.suppress(BaseException):
             task.exception()
+
+
+def _refresh_interval_seconds(minutes):
+    """把配置里的分钟换成秒；不是正整数就返回 ``None``（= 别起任务）。
+
+    单独拿出来是因为这是整个定时链上唯一一处单位换算：写成 ``* 3600`` 或者干脆
+    把分钟当秒睡，跑起来一切正常，只是频率差 60 倍，等到发现时早就上线了。
+    """
+    if isinstance(minutes, bool) or not isinstance(minutes, int) or minutes < 1:
+        return None
+    return minutes * 60
 
 
 def _model_label(model) -> str:

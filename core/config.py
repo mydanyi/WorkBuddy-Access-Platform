@@ -232,6 +232,19 @@ def _routing(section) -> dict:
     }
 
 
+def _model_refresh(section) -> dict:
+    """定时重读本机模型清单的轮询设置。
+
+    只影响"多久重读一次候选"。读的是本机 ``codebuddy --help``，不联网、不读账号，
+    所以这里没有倍率、配额之类的上游概念，也就不需要额外的字段去描述它们。
+    """
+    present, value = _field(section, "enabled")
+    enabled = _bool(value, "model_refresh.enabled", True)
+    present, value = _field(section, "interval_minutes")
+    interval = _int(value, "model_refresh.interval_minutes", 60, 1)
+    return {"enabled": enabled, "interval_minutes": interval}
+
+
 def _acp(section) -> dict:
     """The CLI launch contract.
 
@@ -287,6 +300,7 @@ def load_settings(raw) -> dict:
     http = _section(raw, "http")
     notifications = _section(raw, "notifications")
     routing = _section(raw, "routing")
+    model_refresh = _section(raw, "model_refresh")
 
     return {
         "gateway": {
@@ -339,4 +353,5 @@ def load_settings(raw) -> dict:
         },
         "notifications": _notifications(notifications),
         "routing": _routing(routing),
+        "model_refresh": _model_refresh(model_refresh),
     }

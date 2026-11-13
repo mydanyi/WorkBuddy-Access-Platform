@@ -152,6 +152,10 @@ DOCUMENTED_CONFIG = {
         "cooldown_seconds": 60,
         "first_frame_timeout": 90,
     },
+    "model_refresh": {
+        "enabled": True,
+        "interval_minutes": 60,
+    },
     "acp": {
         "cli_path": "codebuddy",
         "tools": "",
@@ -578,6 +582,9 @@ class _PluginIntegrationTestCase(unittest.IsolatedAsyncioTestCase):
             # account never fires a signin round behind a test's back (e.g. the
             # "rejected commands touch zero upstream" assertion).
             "signin": {"enabled": False},
+            # 定时重读模型清单也一样：这里没有一条用例想验那个计时器，留它跑着只会
+            # 在退场时多一条待收的任务。计时器本身由 tests/test_model_picker.py 验。
+            "model_refresh": {"enabled": False},
             # 测试一律不许拉起真 CLI：本机/构建机上可能真的装了 codebuddy，
             # 一次 token 刷新就会开一个真进程，慢且会写到测试不该碰的地方。
             # 明确指向不存在的可执行文件，让 ``ensure_started`` 立刻失败。
