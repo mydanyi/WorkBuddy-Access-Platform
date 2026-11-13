@@ -361,9 +361,16 @@ class AcpRuntimePool:
         进程会自己退：淘汰那次 `shutdown()` 超时返回，过一会儿它还是走了。尸体留在
         账上没有用处——它不占位（占位只看 ``started``），却会让 ``_drain_evictions``
         以为还有事在飞，白等满一个窗口。
+
+        **正在关的那几条不算尸体。** ``started`` 说的是"子进程还没退"，而关闭在锁外
+        await：这中间 ``started`` 可能已经变假，关闭本身却还没收工——真到那一步就撒手，
+        等于替一次**还没结束**的关闭下了"它死了"的结论。等那一轮 ``trim()`` 的
+        ``finally`` 收完，它自己会出账（判据同样是 ``started``）。
         """
         self._evicting.difference_update(
-            runtime for runtime in list(self._evicting) if not runtime.started
+            runtime
+            for runtime in list(self._evicting)
+            if not runtime.started and runtime not in self._closing
         )
 
     def _strays(self):

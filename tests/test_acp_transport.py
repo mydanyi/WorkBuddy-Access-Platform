@@ -342,6 +342,40 @@ class BlockedSendTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.gather(killer, return_exceptions=True)
         self.assertLess(loop.time() - started, 1.0, "读循环已经判死了，不该等到超时")
 
+    async def test_a_cancelled_caller_is_not_turned_into_a_success(self):
+        # 响应先到、发送还挂在 ``drain()`` 上（对端已经把整帧读完，只是缓冲区没排空）。
+        # 这时候调用方被取消，取消必须真的抛出去：吞掉它等于把一次取消变成一次"成功
+        # 返回"，请求方还以为下游收到了。写端真出错照样吞——响应都到手了，这次往返
+        # 本身是成功的。
+        transport = AcpTransport(_argv("happy"), request_timeout=600.0)
+        transport._proc = _SilentProcess()
+
+        task = asyncio.ensure_future(
+            transport.request("session/prompt", {}, timeout=600.0)
+        )
+        try:
+            for _ in range(200):  # 等它把 future 注册上
+                if transport._pending:
+                    break
+                await asyncio.sleep(0.01)
+            self.assertTrue(transport._pending, "请求没注册上，这条用例没验到东西")
+            for request_id, future in list(transport._pending.items()):
+                future.set_result(
+                    {"jsonrpc": "2.0", "id": request_id, "result": {}}
+                )
+            for _ in range(50):  # 让它真的走到"响应到手、接着等发送"那一步
+                if task.done():
+                    break
+                await asyncio.sleep(0.01)
+            self.assertFalse(task.done(), "它该还卡在发送上，否则没验到那个窗口")
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await asyncio.wait_for(task, 2.0)
+        finally:
+            if not task.done():
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+
 
 class InitializeTests(TransportTestCase):
     scenario = "happy"

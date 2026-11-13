@@ -1087,8 +1087,18 @@ class WorkBuddyPlugin(Star):
         # 退出登录要删两处：CLI 配置目录，以及真正的凭据目录（在 ~/.local/share
         # 下，只有改了 HOME 才圈得住）。只删配置等于没退。
         purge_failed = False
+        # 作废池里的子进程同样攥着 token，而 ``pool.logout()`` 只看活着的那个池。
+        # 先再关一遍（关不掉的那条会留在账上），再判能不能删：删了它会把凭据原样
+        # 写回去，而命令已经回复"已退出登录"——池子那边写死的规矩，这里也一样。
+        await self._drain_retired_pools()
+        if any(item.has_live_children for item in self._retired_pools):
+            _log.warning(
+                "logout refused: %d retired acp pool(s) still have live children",
+                len(self._retired_pools),
+            )
+            purge_failed = True
         pool = self.acp
-        if pool is not None:
+        if pool is not None and not purge_failed:
             try:
                 # 池自己先关掉**全部**进程再删：留着的那条握着 token，会把凭据
                 # 原样写回去，而命令已经回复"已退出登录"。

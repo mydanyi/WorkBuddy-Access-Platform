@@ -245,6 +245,25 @@ def _write_config(directory, document, *, name="models.json"):
     return path
 
 
+def _write_once_cli(directory, models, *, name):
+    """第一次跑才打印清单、之后不打印的假 CLI：模拟"``--help`` 时好时坏"。"""
+    marker = Path(directory) / (name + ".probed")
+    line = "  --model <model>  Currently supported: ({})\n".format(", ".join(models))
+    return _write_cli(
+        directory,
+        [],
+        name=name,
+        marker=False,
+        extra=(
+            "import os\n"
+            "marker = " + repr(str(marker)) + "\n"
+            "if not os.path.exists(marker):\n"
+            "    open(marker, 'w').write('x')\n"
+            "    sys.stdout.write(" + repr(line) + ")\n"
+        ),
+    )
+
+
 def _counting(directory, *, name="runs"):
     """返回一段脚本尾巴：每跑一次就往 ``name`` 里追加一个字符。
 
@@ -555,6 +574,10 @@ class CatalogProcessTests(unittest.IsolatedAsyncioTestCase):
         # 封顶：再怎么连败也不会退到"永远不重试"。
         catalog._failures = 40
         self.assertEqual(catalog.retry_wait, MAX_RETRY_AFTER, "退避有上限")
+        # 连败上千次时指数会越界（``2.0 ** 1000000`` 直接 OverflowError）。封顶之后
+        # 再乘没有意义，也不该在算退避的时候抛异常。
+        catalog._failures = 10 ** 6
+        self.assertEqual(catalog.retry_wait, MAX_RETRY_AFTER, "连败再多也不许溢出")
 
         # 一旦读成，连败清零、退避回到最短。
         _write_cli(tmp, [ALPHA], name="codebuddy-dead")
@@ -681,6 +704,42 @@ class CatalogProcessTests(unittest.IsolatedAsyncioTestCase):
             await catalog.refresh(),
             [ALPHA, CUSTOM_PREFIX + BETA],
             "删掉的那条必须真的消失",
+        )
+
+    async def test_an_empty_config_replaces_the_previous_custom_gateways(self):
+        # 读到了、文件里一条都没有：那是"运维把网关都删了"，不是"没读到"。分不清这
+        # 两件事，删掉的网关会一直挂在清单上（也就一直挂在聊天入口的允许列表里）。
+        tmp = _case_dir(self)
+        cli = _write_once_cli(tmp, [ALPHA], name="codebuddy-emptied")
+        config = _write_config(tmp, {"models": [{"id": GAMMA}]})
+        catalog = ModelCatalog(str(cli), config_path=str(config), timeout=15)
+
+        self.assertEqual(await catalog.refresh(), [ALPHA])
+        self.assertEqual(await catalog.refresh(), [ALPHA, CUSTOM_PREFIX + GAMMA])
+
+        _write_config(tmp, {"models": []})
+        self.assertEqual(
+            await catalog.refresh(), [ALPHA], "配置被清空就要照它清账"
+        )
+
+    async def test_a_custom_gateway_in_the_help_snapshot_follows_the_config(self):
+        # ``--help`` 末尾那串 ``custom-local:`` 是**上一次**读 ``models.json`` 时的
+        # 样子。照着它过日子，运维删掉的网关就删不掉——而"help 读不成"正是最需要删
+        # 得掉的时候。
+        tmp = _case_dir(self)
+        cli = _write_once_cli(
+            tmp, [ALPHA, CUSTOM_PREFIX + GAMMA], name="codebuddy-snapshot"
+        )
+        config = _write_config(tmp, {"models": [{"id": GAMMA}]})
+        catalog = ModelCatalog(str(cli), config_path=str(config), timeout=15)
+
+        self.assertEqual(await catalog.refresh(), [ALPHA, CUSTOM_PREFIX + GAMMA])
+
+        _write_config(tmp, {"models": []})
+        self.assertEqual(
+            await catalog.refresh(),
+            [ALPHA],
+            "help 快照里的旧网关不许顶着配置活下去",
         )
 
     async def test_an_explicit_refresh_waits_for_the_read_in_flight(self):

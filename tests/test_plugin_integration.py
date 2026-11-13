@@ -909,6 +909,18 @@ class _PluginIntegrationTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(plugin._retired_pools, [], "取消之后也得关干净")
         self.assertFalse(pool.has_live_children)
 
+    async def test_logout_refuses_to_purge_while_a_retired_pool_lives(self):
+        # 作废池里的子进程同样攥着 token，而 ``pool.logout()`` 只看活着的那个池。
+        # 照删就会让一条没人认得的 CLI 把凭据原样写回去，而命令已经说"已退出登录"。
+        plugin = await self._make_plugin(initialize=False)
+        pool = _StubAcpPool()
+        plugin.acp = pool
+        plugin._retired_pools.append(_PoolWithASurvivor())
+
+        text = await plugin._logout()
+        self.assertIn("未能清除", text, "关不掉就不许说已经退出")
+        self.assertEqual(pool.logouts, 0, "账上还有活口时，连活动池都不许删")
+
     async def test_a_cancel_before_the_pool_is_charged_still_closes_it(self):
         # 取消落在挂账**之前**的等待点上（这里停在停监听）：只罩住最后那段 drain 是
         # 不够的——那一刻池还没上账，drain 从未启动，而没有下一次拆卸了。整段收尾都

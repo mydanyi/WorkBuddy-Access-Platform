@@ -604,6 +604,35 @@ class TrimTests(_PoolCase):
         await asyncio.wait_for(pool.logout(purge_config=True), timeout=1.0)
         self.assertEqual(alpha.logouts, [True])
 
+    async def test_a_ledger_entry_that_is_still_closing_is_not_forgotten(self):
+        # 关闭在锁外 await。这中间 ``started`` 可能已经变假（进程句柄那头说它退了），
+        # 关闭本身却还没收工。这时候把它当尸体划掉，万一子进程活下来，"还有活口"就
+        # 再也看不到了——登出会拿着这个 false 去删凭据。
+        pool = self.make_pool(max_processes=1, primary_model=ALPHA)
+        alpha = pool.get(ALPHA)
+        beta = pool.get(BETA)
+        _start(alpha, beta)
+
+        entered = asyncio.Event()
+        gate = asyncio.Event()
+
+        async def _slow_shutdown():
+            entered.set()
+            await gate.wait()  # 关到一半停住
+
+        beta.shutdown = _slow_shutdown
+        trimming = asyncio.create_task(pool.trim())
+        await asyncio.wait_for(entered.wait(), 5.0)
+
+        beta.started = False
+        self.assertIn(beta, pool._evicting)
+        pool._forget_dead()
+        self.assertIn(beta, pool._evicting, "关闭还没收工的那条不许当尸体划掉")
+
+        gate.set()
+        await asyncio.wait_for(trimming, 5.0)
+        self.assertNotIn(beta, pool._evicting, "那一轮关完了才出账")
+
     async def test_a_ledger_entry_that_died_on_its_own_frees_its_slot(self):
         # 护栏，不是旧实现的回归用例：`_forget_dead()` 在计数之前先清账，尸体到不了
         # `_occupied()`，所以单处改动下它恒绿。两段断言各盯一件事：第一轮那句盯"占位

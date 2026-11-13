@@ -280,16 +280,29 @@ class ModelCatalog:
 
     @property
     def retry_wait(self) -> float:
-        """距上次失败的尝试要隔多久才允许再试一次（秒），随连败次数翻倍。"""
-        if self._failures <= 1:
-            return self._retry_after
-        return min(
-            self._retry_after * (2.0 ** (self._failures - 1)), MAX_RETRY_AFTER
-        )
+        """距上次失败的尝试要隔多久才允许再试一次（秒），随连败次数翻倍。
+
+        逐次翻倍、到了上限就停：不写 ``retry_after * 2 ** (n - 1)``，那个式子在连败
+        上千次之后会抛 ``OverflowError``（浮点指数越界）。上限之外再乘也没有意义。
+        """
+        wait = self._retry_after
+        for _ in range(self._failures - 1):
+            if wait >= MAX_RETRY_AFTER:
+                break
+            wait *= 2.0
+        return min(wait, MAX_RETRY_AFTER)
 
     def _merged(self) -> list:
-        """拼出要发布的清单：help 在前、config 在后，重复的只留第一次出现的。"""
-        merged = list(self._help_models)
+        """拼出要发布的清单：``--help`` 的内置条目在前，自定义网关在后。
+
+        自定义那条**跟配置走，不跟 help 走**：help 快照里末尾那串 ``custom-local:``
+        是上一次读它时 ``models.json`` 的样子，运维删掉一个网关，它会在 help 下一次
+        读成之前一直挂着——而 "help 一直读不成" 恰恰是这段代码最可能被用到的场景。
+        所以 help 那一半只留内置的，自定义的永远取 ``_config_models``（每次整份替换）。
+        """
+        merged = [
+            model for model in self._help_models if not model.startswith(CUSTOM_PREFIX)
+        ]
         for model in self._config_models:
             if model not in merged:
                 merged.append(model)
@@ -334,9 +347,13 @@ class ModelCatalog:
             raise
         if models and source == "help":
             self._help_models = models
-            # help 那份本来就包含 ``models.json`` 推出来的 ``custom-local:`` 条目。
-            # config 那份不清掉，只会让"已经删掉的网关"在下一趟从旧账里冒回来。
-            self._config_models = []
+            # help 那份末尾本来就带着 ``models.json`` 推出来的 ``custom-local:`` 条目。
+            # 把它们挪进 config 那本账（见 :meth:`_merged`），这样"自定义网关"永远只有
+            # 一个来源：help 里那一份只是**上一次**读配置时的样子，照着它过日子，运维
+            # 删掉的网关就删不掉了。
+            self._config_models = [
+                model for model in models if model.startswith(CUSTOM_PREFIX)
+            ]
             self._source = "help"
             self._read_at = self._clock()
             self._failures = 0
@@ -347,10 +364,12 @@ class ModelCatalog:
             # 注定失败的进程，一次都不升级。
             self._failures += 1
             self._last_attempt = self._clock()
-            if models:
+            if source == "config":
+                # 读到就是读到，**空的也算**：文件被清空等于"没有自定义网关了"，
+                # 留着上一份等于把已经删掉的网关又挂回去。读失败（文件没了、JSON 坏
+                # 了）走的是 ``source == "none"``，那才该保留旧值。
                 self._config_models = models
                 if not self._help_models:
-                    # 从来没有全集，配置清单就是全部：这是一次真读到，年龄照记。
                     self._source = "config"
                     self._read_at = self._clock()
         self._models = self._merged()
@@ -399,9 +418,12 @@ class ModelCatalog:
             return models, "help"
         # 读一个小 JSON 也要开线程：本方法在事件循环里被调，卡住的是整个插件的
         # 所有请求，不值得为省一次线程池调度去赌那个文件永远在本地磁盘上。
-        models = _publishable(await asyncio.to_thread(self._from_config))
-        if models:
-            return models, "config"
+        config = await asyncio.to_thread(self._from_config)
+        if config is not None:
+            # **读到就算数，空的也算。** 空表说的是"文件里就是没有条目"——可能是运维
+            # 刚清空，也可能是这一版 CLI 的自定义网关都配在别处。把它跟"读不到"
+            # （文件没了、JSON 坏了）分开：前者该照它清账，后者才该保留上一份。
+            return _publishable(config), "config"
         return [], "none"
 
     async def _from_help(self):
@@ -435,13 +457,19 @@ class ModelCatalog:
         return parse_help_models(stdout.decode("utf-8", "replace"))
 
     def _from_config(self):
+        """读 ``models.json``：读到就返回列表（**可能是空表**），没读到返回 ``None``。
+
+        两者必须分开。空表是"这份文件里没有条目"，调用方要照它把旧的自定义网关清掉；
+        ``None`` 是"没读到"（没配路径、文件不在、JSON 坏了），那种情况下保留上一份
+        比清空安全——一次手滑的编辑不该让整台机器上的网关消失。
+        """
         if not self._config_path or not os.path.isfile(self._config_path):
-            return []
+            return None
         try:
             with open(self._config_path, "r", encoding="utf-8") as handle:
                 document = json.load(handle)
         except (OSError, ValueError):
-            return []
+            return None
         return parse_config_models(document)
 
 

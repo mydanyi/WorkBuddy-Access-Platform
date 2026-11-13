@@ -316,11 +316,23 @@ class AcpTransport:
                 if future in done:
                     if future.cancelled() or future.exception() is not None:
                         # 传输层先判死：这一帧还在写就没人收了，收干净再抛。
+                        # 这里的收尾可以把 ``CancelledError`` 一起咽掉——它是**我们
+                        # 自己** ``cancel()`` 出来的，真正要往外抛的是 ``future`` 的
+                        # 那份失败（下一行照原样抛）。
                         sending.cancel()
+                        with contextlib.suppress(BaseException):
+                            await sending
+                        return future.result()
                     # 反过来，响应正常到手时不许掐：对端已经把整帧读完了（不然回不了
                     # 包），那一帧确实写出去了，只是 ``drain()`` 还在等缓冲区排空。
                     # 让它自然收尾，别把一个成功的发送记成"被取消"。
-                    with contextlib.suppress(BaseException):
+                    #
+                    # 只 suppress ``Exception``，**不 suppress 取消**：这里 await 的
+                    # 是一条健康的发送，它不会自己抛 ``CancelledError``；这时候冒出来
+                    # 的那个只可能是"调用方被取消了"。吞掉它等于把一次取消变成一次成功
+                    # 返回，请求方还以为下游收到了。写端真出错（管道断了）照样吞掉：
+                    # 响应已经到手，这次往返是成功的。
+                    with contextlib.suppress(Exception):
                         await sending
                     return future.result()
                 await sending
