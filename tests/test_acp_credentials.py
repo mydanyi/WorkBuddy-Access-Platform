@@ -186,6 +186,24 @@ class ReadTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(self.source.logged_out)
         self.assertEqual(self.source.credentials["accessToken"], "tok-1")
 
+    def test_a_logout_marker_drops_the_cached_account(self):
+        # 缓存里留着上一个账号，看见登出标记就得丢掉。不丢的话：标记被重新登录顶掉
+        # 之后，凭据文件要是正好读不出来（半写、EACCES），``_read`` 会把那份缓存当成
+        # "上一次读到的好凭据"交回去，``UpstreamClient`` 拿它发请求——一个已经登出的
+        # 账号继续在用。
+        _write(self.runtime.credential_path, _record("tok-old"))
+        self.assertEqual(self.source.credentials["accessToken"], "tok-old")
+
+        marker = Path(self.runtime.logged_out_path)
+        marker.write_text("", encoding="utf-8")
+        self.assertEqual(self.source.credentials, {}, "登出之后不许再报凭据")
+
+        # 重新登录把标记顶成过期，而这次文件是坏的。
+        os.utime(marker, ns=(1, 1))
+        with open(self.runtime.credential_path, "w", encoding="utf-8") as handle:
+            handle.write("{ half written")
+        self.assertEqual(self.source.credentials, {}, "宁可说没凭据，也不许把旧账号交出去")
+
     def test_cache_is_reused_until_the_file_changes(self):
         _write(self.runtime.credential_path, _record("tok-1"))
         first = self.source.credentials

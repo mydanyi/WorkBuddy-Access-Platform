@@ -19,6 +19,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import os
 import re
@@ -496,6 +497,10 @@ async def _reap(process) -> bool:
         process.kill()
     except (ProcessLookupError, OSError):
         pass
+    # 管道先关掉。``communicate()`` 被取消之后，stdout 的读传输可能停在"暂停"上：
+    # 没人再读，EOF 到不了，而 ``Process.wait()`` 等的是子进程传输——管道不关它
+    # 就永远不醒。收尸这一步不读内容，关掉最省事。
+    _close_pipes(process)
     # 先把"等它退出"这条任务抓在手里。直接 ``await asyncio.shield(process.wait())``
     # 是挡不住取消的：``CancelledError`` 会在**这一层**立刻抛出，shield 里的等待还
     # 在跑，我们却已经返回了——调用方照着 ``cancelled`` 马上 ``raise``、目录的锁也
@@ -517,7 +522,25 @@ async def _reap(process) -> bool:
             continue
         except (asyncio.TimeoutError, OSError, ProcessLookupError):
             break
+    if not waiter.done():
+        # 到点了还没退。这条等待不能留在这儿：它攥着进程对象，事件循环关掉时会冒出
+        # "Task was destroyed but it is pending"。收尸的承诺是"等它退出"，做不到
+        # 就当场撤掉这条等待，别留个半开着的东西在后面。
+        waiter.cancel()
+        try:
+            await asyncio.gather(waiter, return_exceptions=True)
+        except asyncio.CancelledError:
+            cancelled = True
     return cancelled
+
+
+def _close_pipes(process) -> None:
+    """把子进程的管道关掉；替身进程没有 ``_transport`` 时什么也不做。"""
+    transport = getattr(process, "_transport", None)
+    if transport is None:
+        return
+    with contextlib.suppress(Exception):
+        transport.close()
 
 
 __all__ = [

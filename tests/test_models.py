@@ -15,6 +15,7 @@ import shutil
 import sys
 import unittest
 from pathlib import Path
+from unittest import mock
 
 _HERE = Path(__file__).resolve()
 _PLUGIN_ROOT = _HERE.parents[1]
@@ -34,6 +35,7 @@ from astrbot_plugin_workbuddy.core.models import (  # noqa: E402
     strip_model_alias,
     _reap,
 )
+from astrbot_plugin_workbuddy.core import models as models_module  # noqa: E402
 
 try:  # 包内发现
     from tests import support as fixtures
@@ -316,6 +318,33 @@ class _SlowExit:
         return 0
 
 
+class _PausedProbe:
+    """``--help`` 的替身：``wait()`` 永远不返回，管道收没收掉它自己记着。
+
+    真进程在 ``communicate()`` 被取消、stdout 又恰好停在"暂停"上时就是这个样子：
+    EOF 到不了，``wait()`` 一直挂着。这里用一条永远不醒的事件把同一段路摆出来。
+    """
+
+    def __init__(self):
+        self.killed = False
+        self.closed = False
+        self.wait_cancelled = False
+        self._transport = self
+
+    def kill(self):
+        self.killed = True
+
+    def close(self):
+        self.closed = True
+
+    async def wait(self):
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            self.wait_cancelled = True
+            raise
+
+
 @unittest.skipIf(
     sys.platform == "win32",
     "ModelCatalog spawns the CLI with create_subprocess_exec; Windows has no "
@@ -478,6 +507,20 @@ class CatalogProcessTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(task.done(), "取消之后也得接着等它退出")
         process.gate.set()
         self.assertTrue(await asyncio.wait_for(task, 5.0), "得把'被取消过'报上来")
+
+    async def test_a_probe_that_never_exits_closes_its_pipes_and_leaves_no_waiter(self):
+        # ``communicate()`` 被取消之后，stdout 的读传输可能停在"暂停"上：没人再读，
+        # EOF 到不了，而 ``Process.wait()`` 等的是子进程传输——管道不关它就永远不醒。
+        # 到点还没退也不能把那条等待留在这儿（它攥着进程对象，循环关闭时会冒出
+        # "Task was destroyed but it is pending"）。
+        process = _PausedProbe()
+        baseline = len(asyncio.all_tasks())
+        with mock.patch.object(models_module, "_REAP_TIMEOUT", 0.05):
+            self.assertFalse(await asyncio.wait_for(_reap(process), 5.0))
+        self.assertTrue(process.killed, "该掐的还是要掐")
+        self.assertTrue(process.closed, "收尸前先把管道关掉，否则 wait() 永远不醒")
+        self.assertTrue(process.wait_cancelled, "到点了也不许把等待留在那儿")
+        self.assertEqual(len(asyncio.all_tasks()), baseline, "不许留下没收拾的等待")
 
     async def test_a_failed_read_keeps_the_last_good_list(self):
         tmp = _case_dir(self)

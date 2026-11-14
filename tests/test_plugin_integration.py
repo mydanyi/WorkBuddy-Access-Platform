@@ -1163,6 +1163,32 @@ class _PluginIntegrationTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(pool.shutdowns, 1, "后台收尾必须走到关闭")
         self.assertEqual(plugin._retired_pools, [])
 
+    async def test_a_teardown_during_the_catalog_read_keeps_the_plugin_not_ready(self):
+        # 清单探针要 spawn 一次本地 CLI，慢的时候好几秒。这段时间 ``terminate()`` 完全
+        # 可能整轮跑完：网关、调度器、池、清单全清掉。那边醒来若照样往下走，就是
+        # ``ready = True`` 加一句 ``self.scheduler.start()``——插件自称可用、手里是空的。
+        plugin = await self._make_plugin(**self._make_ready_plugin_config())
+        self.assertTrue(plugin.ready)
+
+        entered = asyncio.Event()
+        release = asyncio.Event()
+
+        async def _slow_prime():
+            entered.set()
+            await release.wait()
+
+        with mock.patch.object(plugin, "_prime_model_options", _slow_prime):
+            attempt = asyncio.create_task(plugin.initialize())
+            await asyncio.wait_for(entered.wait(), 5.0)
+            await plugin.terminate()
+            self.assertFalse(plugin.ready, "拆卸跑完就不许还是 ready")
+            release.set()
+            await asyncio.wait_for(attempt, 5.0)
+
+        self.assertFalse(plugin.ready, "被拆卸作废的那一轮不许把 ready 再置 True")
+        self.assertIsNone(plugin.gateway, "更不许留下一个没人管的网关")
+        self.assertIsNone(plugin.acp, "也不许留一条没人认领的运行时")
+
     # -- 3b. empty api_key never opens the listener -----------------------
     async def test_valid_settings_bind_health_and_empty_api_key_disables_listener(self):
         os.environ["WORKBUDDY_MASTER_KEY"] = MASTER_KEY

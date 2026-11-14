@@ -139,6 +139,11 @@ class WorkBuddyPlugin(Star):
         # 醒来之后再擦一遍——锁一点忙都帮不上。所以任务本身也留一份，
         # ``initialize()`` 先等它真的结束（见 ``_wait_for_pending_teardown``）。
         self._teardown_task = None
+        # 每一轮拆卸都让此前开跑的初始化**作废**。``initialize()`` 中间要等清单探针
+        # （读本地 CLI，可能要几秒），这段时间 ``terminate()`` 完全可能整轮跑完：网关、
+        # 调度器、池都清掉；那边醒来照样把 ``ready`` 置 True，插件自称可用，手里却是
+        # 空的。收尾时对一下身份，对不上就把这一轮丢掉。
+        self._lifecycle_epoch = 0
         # 定时重读模型清单的那条任务；同一时刻只允许存在一条。
         self._model_refresh_task = None
         # 已经作废、但还有子进程没死的池。``AcpRuntimePool.shutdown()`` 关不掉的
@@ -167,6 +172,9 @@ class WorkBuddyPlugin(Star):
         """Build the runtime; a repeated call releases the previous one first."""
         await self._wait_for_pending_teardown()
         await self._release_runtime()
+        # 这一轮的身份。下面每一个 await 之后，别人都可能把整轮收掉；收掉一次身份
+        # 就变一次，收尾时对不上就说明"我建的这套已经不算数了"。
+        epoch = self._lifecycle_epoch
 
         try:
             settings = load_settings(self._raw_config)
@@ -273,6 +281,14 @@ class WorkBuddyPlugin(Star):
         # below: a missing CLI only leaves the picker on the saved choices, and
         # can never disable the gateway, the scheduler or the login flow.
         await self._prime_model_options()
+
+        if epoch != self._lifecycle_epoch:
+            # 等清单的这几秒里，``terminate()`` 把整轮收完了：网关、调度器、池、清单
+            # 全没了。再往下就是 ``ready = True``（插件自称可用、手里是空的）外加一句
+            # ``self.scheduler.start()``。把这一轮迟到建出来的东西收掉，当作没发生过。
+            _log.info("workbuddy: initialization dropped, a teardown overtook it")
+            await self._release_runtime()
+            return
 
         self.ready = True
         self.error_reason = ""
@@ -431,6 +447,9 @@ class WorkBuddyPlugin(Star):
             await self._release_runtime_once()
 
     async def _release_runtime_once(self) -> None:
+        # 先把这一轮的身份推进一格：从这里开始，任何还在半路上的 ``initialize()``
+        # 都算过期——它建的东西正被下面逐项拆掉。
+        self._lifecycle_epoch += 1
         self.ready = False
         # Block new notifications before any producer is stopped.
         self._notify_stopped = True

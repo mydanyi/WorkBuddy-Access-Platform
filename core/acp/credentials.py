@@ -158,6 +158,11 @@ class CliCredentials:
     def credentials(self) -> dict:
         """当前登录态；未登录（或没有凭据文件）时返回 ``{}``。"""
         if self.logged_out:
+            # 明确登出过，缓存里那份就是**上一个账号**。留着它，等标记被重新登录
+            # 顶掉、而凭据文件正好读不出来（半写、EACCES）时，``_read`` 会把它当成
+            # "上一次读到的好凭据"交出去——``UpstreamClient`` 拿它发请求，等于拿一个
+            # 已经登出的账号继续用。看见标记就丢掉，跟 ``logout()`` 收拾的是同一份。
+            self._forget()
             return {}
         return self._read()
 
@@ -179,6 +184,7 @@ class CliCredentials:
         async with self._refresh_lock:
             if self.logged_out:
                 # 明确登出过就没有"刷新"这回事，别让调用方等满一个窗口。
+                self._forget()
                 raise UpstreamError(401, None)
             current = self.credentials
             token_now = current.get("accessToken")
@@ -232,10 +238,14 @@ class CliCredentials:
         真正的删除归 ``AcpRuntime.logout(purge_config=True)``——它要先确认进程
         真的死了才动手。这里再删一次没有任何好处，只会让"谁负责删"变成两个答案。
         """
-        self._cached = {}
-        self._stamp = None
+        self._forget()
 
     # -- 内部 ---------------------------------------------------------------
+
+    def _forget(self) -> None:
+        """丢掉内存里那份凭据。登出、以及"看见登出标记"时都要走这里。"""
+        self._cached = {}
+        self._stamp = None
 
     def _read(self, *, force=False) -> dict:
         """读一次；``force`` 跳过节流缓存。
@@ -277,6 +287,7 @@ class CliCredentials:
         缓存就永远看不见新 token，把"CLI 已经刷好"误判成 401。
         """
         if self.logged_out:
+            self._forget()
             return {}
         return self._read(force=True)
 
