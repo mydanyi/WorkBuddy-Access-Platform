@@ -1087,6 +1087,44 @@ class _PluginIntegrationTestCase(unittest.IsolatedAsyncioTestCase):
         stubborn.release.set()
         await asyncio.sleep(0)
 
+    async def test_a_second_logout_is_refused_instead_of_sharing_the_gate(self):
+        # 两条登出并行跑：先收工的那条 ``finally`` 会把闸门打开，而另一条还在删
+        # 凭据——这中间放进来的登录没人取消，凭据照样被写回去。
+        plugin = await self._make_plugin(**self._make_ready_plugin_config())
+        pool = _PoolThatLogsOutSlowly()
+        plugin.acp = pool
+
+        first = asyncio.create_task(plugin._logout())
+        await asyncio.wait_for(pool.entered.wait(), 5.0)
+        # 有界地等第二条：没被挡住的话它也会去调 ``pool.logout()``，而那道闸门要等
+        # 这条用例最后才放——不设上限就是用例自己挂死，而不是判红。
+        second = asyncio.ensure_future(plugin._logout())
+        done, pending = await asyncio.wait({second}, timeout=1.0)
+        self.assertTrue(done, "第二条登出不该也去清场：它会一直卡在池的闸门上")
+        self.assertEqual(second.result(), "正在退出登录，请稍后再试。")
+        self.assertTrue(plugin._logout_pending, "闸门得由第一条握着，不能被第二条关掉")
+        for task in pending:
+            task.cancel()
+
+        pool.gate.set()
+        self.assertIn("已退出登录", await asyncio.wait_for(first, 10.0))
+        self.assertFalse(plugin._logout_pending, "清完场要开闸")
+
+    async def test_a_login_is_refused_once_the_runtime_is_torn_down(self):
+        # 拆卸在锁里摘走登录任务之后还要关网关、关池。这期间等在锁上的登录拿到的
+        # 还是进门时抓的那条运行时；它要是登录成功，``_on_login_success`` 会去重建
+        # 拆卸刚清掉的网关和调度器，而人以为插件正在卸载。
+        plugin = await self._make_plugin(**self._make_ready_plugin_config())
+        pool = _StubAcpPool()
+        plugin.acp = pool
+        plugin.ready = False
+
+        self.assertEqual(
+            await plugin._begin_login(_StubEvent()),
+            "插件状态已变化，请重新执行 /wb login。",
+        )
+        self.assertIsNone(plugin._login_task, "拆卸中不许留下一条新的登录")
+
     async def test_logout_refuses_to_purge_while_a_retired_pool_lives(self):
         # 作废池里的子进程同样攥着 token，而 ``pool.logout()`` 只看活着的那个池。
         # 照删就会让一条没人认得的 CLI 把凭据原样写回去，而命令已经说"已退出登录"。

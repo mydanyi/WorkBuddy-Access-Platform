@@ -260,11 +260,12 @@ class AcpClient:
                 try:
                     if not task.done():
                         task.cancel()
-                    await task
-                except asyncio.CancelledError:
-                    # 只吞"被我们取消的那个 task"的取消；外层取消要继续往上走。
-                    if not task.cancelled():
-                        raise
+                    # 用 ``gather`` 收尸，不用 ``await task``：直接 await 时，外层取消
+                    # 会顺着这次 await 传到那条任务上，等它真的收完，``task.cancelled()``
+                    # 也是 True——"调用方被取消了"和"我们取消了它"当场分不出来，那样
+                    # 一个 except 就会把调用方的取消一起咽掉。gather 把任务自己的结局
+                    # 收成返回值，调用方的取消照常往外抛。
+                    await asyncio.gather(task, return_exceptions=True)
                 finally:
                     # 只要这一轮没有正常收尾，上游就还在跑：超时、RPC 错误、消费者
                     # 提前退出都算。不发 cancel，CLI 会把这一轮生成到底——额度白烧。

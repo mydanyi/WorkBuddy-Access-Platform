@@ -1020,6 +1020,12 @@ class WorkBuddyPlugin(Star):
         # 换任务这一段要在锁里：否则正在跑的登出会把"槽里是 None"当成"没有登录在
         # 跑"，取消落空之后再让它把这条新任务塞进去。
         async with self._login_task_lock:
+            if not self.ready or self.acp is not pool:
+                # 拆卸已经开跑了。``_release_runtime`` 在锁里摘走登录任务之后，还要
+                # 去关网关、关池——这期间等在锁上的登录拿到的还是进门时抓的那条
+                # 运行时。它要是登录成功，``_on_login_success`` 会去重建拆卸刚清掉
+                # 的网关和调度器，人却以为插件正在卸载。
+                return "插件状态已变化，请重新执行 /wb login。"
             if self._logout_pending:
                 # 登出还在清场。这条窗口里起来的登录没人会取消它：等它扫完码把凭据
                 # 写回去，那边刚好清完场，回复还是"已退出登录"。在锁里看，跟登出
@@ -1146,18 +1152,19 @@ class WorkBuddyPlugin(Star):
         return True
 
     async def _logout(self) -> str:
-        # 整个开场都在 ``try`` 里，包括置位与取消登录那一步：取消正好落在
+        # 开场分两段，为的是**早退不碰闸门**：并行的第二条登出必须被挡回去，而不是
+        # 也去清场——它先收工的话，``finally`` 会把第一条还握着的闸门打开，这中间
+        # 放进来的登录没人取消，凭据照样被写回去。
+        async with self._login_task_lock:
+            if self._logout_pending:
+                return "正在退出登录，请稍后再试。"
+            self._logout_pending = True
+        # 从这里往下都在 ``try`` 里，包括取消登录那一步：取消正好落在
         # ``_cancel_login_task()`` 的收尸上时，清场根本没开始，标志却已经立起来了。
         # 漏在 ``True`` 上就等于此后每一条 ``/wb login`` 都被挡在"正在退出登录"，
         # 只能重载插件——而这正是本条要防的那种"关不掉的门"。
         try:
-            # 跟 ``_begin_login`` 用同一把锁，只圈"摘走并取消"这一小段。后面删凭据、
-            # 关进程要几秒，攥着锁会把一条并发的登录整个堵住。
             async with self._login_task_lock:
-                # 关门跟摘任务是同一个动作的两半。只取消、不关门的话，这之后起来的
-                # 登录谁也不管——等它扫完码把凭据写回去，这边刚好清完场，回复还是
-                # "已退出登录"。标志在锁里置位，``_begin_login`` 也在锁里看它。
-                self._logout_pending = True
                 await self._cancel_login_task()
             return await self._finish_logout()
         finally:
