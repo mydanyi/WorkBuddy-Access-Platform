@@ -183,13 +183,33 @@ class Gateway:
         if not self._api_key:
             self.bound_port = None
             return
+        if self._stopping:
+            # 已经有人喊过停了。这时候再绑，那条监听就再也没人关得掉：拆卸那边
+            # 早把引用丢干净了（收尾已经把 ``self.gateway`` 置空）。
+            self.bound_port = None
+            return
         # ``handler_cancellation`` is an ``AppRunner`` argument, not an
         # ``Application`` one: it lets a client disconnect cancel the handler.
-        self._runner = web.AppRunner(self._app, handler_cancellation=True)
-        await self._runner.setup()
-        self._site = web.TCPSite(self._runner, self._host, self._port)
-        await self._site.start()
-        address = self._runner.addresses[0]
+        runner = web.AppRunner(self._app, handler_cancellation=True)
+        self._runner = runner
+        await runner.setup()
+        site = web.TCPSite(runner, self._host, self._port)
+        self._site = site
+        await site.start()
+        if self._stopping:
+            # 停在这几跳的中间：``stop()`` 那时看到的 ``site`` 还没起来，aiohttp 的
+            # ``cleanup()`` 对"还没 start 的 site"只是把它从注册表里摘掉，不会关随后
+            # 才建好的那条监听。这里自己收——端口要是留着，下一次重载会绑不上。
+            with contextlib.suppress(Exception):
+                await site.stop()
+            with contextlib.suppress(Exception):
+                await runner.cleanup()
+            if self._runner is runner:
+                self._runner = None
+                self._site = None
+            self.bound_port = None
+            return
+        address = runner.addresses[0]
         self.bound_port = int(address[1])
 
     async def stop(self) -> None:

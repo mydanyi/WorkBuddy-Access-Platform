@@ -1256,6 +1256,21 @@ class _PluginIntegrationTestCase(unittest.IsolatedAsyncioTestCase):
             async with session.get(f"http://127.0.0.1:{port}/health") as resp:
                 self.assertEqual(resp.status, 200, "重载后的监听不许被那次登出停掉")
 
+    async def test_a_stopped_gateway_never_binds_a_listener(self):
+        # ``start()`` 里 ``site.start()`` 是个等待点，拆卸正好落在它前面时，收尾那边
+        # 早把 ``self.gateway`` 丢干净了；那条 start 再往下走就是绑一条没人认领的监听，
+        # 端口一直占着，下一次重载绑不上。停过的网关不许再绑。
+        plugin = await self._make_plugin(**self._make_ready_plugin_config())
+        gateway = plugin.gateway
+        self.assertTrue(gateway.bound_port)
+
+        await plugin.terminate()
+        self.assertIsNone(gateway.bound_port)
+
+        # 收尾之后那条迟到的 start 才轮到执行。
+        await gateway.start()
+        self.assertIsNone(gateway.bound_port, "停过的网关不许再绑监听：绑了也没人关")
+
     # -- 3b. empty api_key never opens the listener -----------------------
     async def test_valid_settings_bind_health_and_empty_api_key_disables_listener(self):
         os.environ["WORKBUDDY_MASTER_KEY"] = MASTER_KEY
