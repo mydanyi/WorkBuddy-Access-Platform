@@ -941,6 +941,50 @@ class _PluginIntegrationTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(plugin.router, "旧收尾把新建的路由擦掉了")
         self.assertIsNotNone(plugin.notifier, "旧收尾把新建的提醒器擦掉了")
 
+    async def test_initialize_waits_for_a_teardown_that_never_reached_the_lock(self):
+        # 上一条盯的是"收尾卡在关池子上"，那时它已经排进 ``_teardown_lock`` 了。
+        # 还有一段更早的窗口：``shield`` 只是把收尾包成一条任务，从它有动静到真正
+        # 走到锁之前，``terminate()`` 可以先被取消——锁上根本没人排队。这段时间进
+        # ``initialize()`` 会拿到那把空锁、把运行时建好，而那条任务随后才走到锁，
+        # 醒过来再擦一遍。锁排得清"谁先进去"，排不了"谁还没来"。
+        plugin = await self._make_plugin(**self._make_ready_plugin_config())
+        plugin.acp = _StubAcpPool()
+
+        gate = asyncio.Event()
+        # 收尾那条任务一动手就先举手，然后被挡在锁**外**——这个窗口就是本用例要的。
+        # 用举手信号而不是睡眠：只有确认它真的就位了，``initialize()`` 才进来。
+        parked = asyncio.Event()
+        release = plugin._release_runtime
+
+        async def _parked():
+            if not parked.is_set():
+                parked.set()
+                await gate.wait()
+            await release()
+
+        plugin._release_runtime = _parked
+
+        runner = asyncio.create_task(plugin.terminate())
+        await asyncio.wait_for(parked.wait(), timeout=5.0)
+        runner.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await runner
+
+        rebuilt = asyncio.create_task(plugin.initialize())
+        # 窗口给宽一点：没修的话这一轮足够它把运行时建完；修了的话它会一直等到闸门
+        # 打开，这里到点抛超时。两种情况下面都由 ``gate.set()`` 收口，判据只有一条
+        # ——新建成的东西还在不在。
+        try:
+            await asyncio.wait_for(asyncio.shield(rebuilt), timeout=0.5)
+        except asyncio.TimeoutError:
+            pass
+        gate.set()
+        await asyncio.wait_for(rebuilt, timeout=10.0)
+        # 迟到的收尾要是又擦了一遍，就是这一步把它露出来。
+        await asyncio.sleep(0.05)
+        self.assertIsNotNone(plugin.router, "没排进锁的那轮收尾把新建的路由擦掉了")
+        self.assertIsNotNone(plugin.notifier, "没排进锁的那轮收尾把新建的提醒器擦掉了")
+
     async def test_logout_refuses_to_purge_while_a_retired_pool_lives(self):
         # 作废池里的子进程同样攥着 token，而 ``pool.logout()`` 只看活着的那个池。
         # 照删就会让一条没人认得的 CLI 把凭据原样写回去，而命令已经说"已退出登录"。

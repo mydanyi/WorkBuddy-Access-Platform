@@ -133,6 +133,12 @@ class WorkBuddyPlugin(Star):
         # ``initialize()`` 一进门也要收尾。两边同时做，旧的那一轮会在新的运行时
         # 建好之后再把它清一遍（见 ``_release_runtime``）。
         self._teardown_lock = asyncio.Lock()
+        # 那把锁只排得清"谁先进去"，排不了"谁还没来排队"：``shield`` 只是把收尾
+        # 包成一条任务，从它被创建到第一次被调度之间，``terminate()`` 完全可能先
+        # 被取消。这段窗口里 ``initialize()`` 能直接拿到锁，把运行时建好，那条任务
+        # 醒来之后再擦一遍——锁一点忙都帮不上。所以任务本身也留一份，
+        # ``initialize()`` 先等它真的结束（见 ``_wait_for_pending_teardown``）。
+        self._teardown_task = None
         # 定时重读模型清单的那条任务；同一时刻只允许存在一条。
         self._model_refresh_task = None
         # 已经作废、但还有子进程没死的池。``AcpRuntimePool.shutdown()`` 关不掉的
@@ -154,6 +160,7 @@ class WorkBuddyPlugin(Star):
 
     async def initialize(self) -> None:
         """Build the runtime; a repeated call releases the previous one first."""
+        await self._wait_for_pending_teardown()
         await self._release_runtime()
 
         try:
@@ -292,7 +299,14 @@ class WorkBuddyPlugin(Star):
         # 等待点（停监听、收登录任务）上时，池连账都没上，罩住后半段也白搭——那正是
         # "没人认得的 CLI"在同一个函数的更早窗口重开。``shield`` 让外层取消照样立刻
         # 抛出，收尾在后台跑完（事件循环整个退出就真没辙了，那属于进程级收尾，接受）。
-        await asyncio.shield(self._release_runtime())
+        #
+        # 任务先落地再 shield：只有从 ``_teardown_task`` 上看得见，下一次
+        # ``initialize()`` 才等得到它。已经在后台跑的那条直接复用，不另起一条。
+        task = self._teardown_task
+        if task is None or task.done():
+            task = asyncio.ensure_future(self._release_runtime())
+            self._teardown_task = task
+        await asyncio.shield(task)
 
     # ------------------------------------------------------------------ #
     # runtime construction / teardown
@@ -379,6 +393,20 @@ class WorkBuddyPlugin(Star):
                 self._queue_notice(
                     self._error_notify_on(), lambda: self.notifier.error("runtime")
                 )
+
+    async def _wait_for_pending_teardown(self) -> None:
+        """等上一轮被取消后留在后台的收尾真的结束。
+
+        ``_teardown_lock`` 挡不住"还没来排队"的那一轮：``shield`` 只是把收尾包成
+        一条任务，从 ``ensure_future`` 到它第一次被调度之间，``terminate()`` 可以
+        先被取消。这段时间进 ``initialize()`` 会拿到一把没人排队的锁、把运行时建
+        好，而那条任务醒来之后再清一遍——监听还在、``ready`` 还是 True，路由和通知
+        却没了。任务本身留了一份在这里，就先等它，再谈锁。
+        """
+        task = self._teardown_task
+        if task is None or task.done():
+            return
+        await asyncio.gather(task, return_exceptions=True)
 
     async def _release_runtime(self) -> None:
         """收尾；并发调用排队，后来的那一轮等前一轮真的收完再动手。
