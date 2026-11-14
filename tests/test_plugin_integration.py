@@ -533,6 +533,26 @@ class _GatewayThatStopsSlowly:
         await self.gate.wait()
 
 
+class _PoolThatLogsOutSlowly(_StubAcpPool):
+    """``logout()`` 卡在等待点上的池：用来把窗口停在"登出已成定局、还没清完场"。"""
+
+    def __init__(self):
+        super().__init__()
+        self.entered = asyncio.Event()
+        self.gate = asyncio.Event()
+
+    async def logout(self, *, purge_config=False) -> None:
+        self.entered.set()
+        await self.gate.wait()
+        await super().logout(purge_config=purge_config)
+
+
+class _StubEvent:
+    """只带 ``_begin_login`` 真会读到的那一个字段。"""
+
+    unified_msg_origin = "test:GroupMessage:1"
+
+
 _FAKE_CLI = Path(__file__).resolve().parent / "fake_acp_cli.py"
 async def _acp_client(scenario: str):
     """一个真连假 CLI、且已完成握手的 ACP 客户端。
@@ -1013,6 +1033,27 @@ class _PluginIntegrationTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(
             pool.survivor, "收尾被 initialize 的取消带走了：那条 CLI 还留着"
         )
+
+    async def test_a_login_started_during_logout_is_refused(self):
+        # ``_logout`` 摘走并取消的只是"它进锁那一刻槽里的那条"。此后新起来的登录它
+        # 管不着：等人家扫完码把凭据写回去，这边刚好清完场，回复还是"已退出登录"。
+        plugin = await self._make_plugin(**self._make_ready_plugin_config())
+        pool = _PoolThatLogsOutSlowly()
+        plugin.acp = pool
+
+        out = asyncio.create_task(plugin._logout())
+        await asyncio.wait_for(pool.entered.wait(), 5.0)
+
+        attempt = asyncio.create_task(plugin._begin_login(_StubEvent()))
+        await asyncio.sleep(0.05)
+        self.assertIsNone(plugin._login_task, "登出还没清完场，这条登录不许留下任务")
+
+        pool.gate.set()
+        self.assertIn("已退出登录", await asyncio.wait_for(out, 10.0))
+        self.assertEqual(
+            await asyncio.wait_for(attempt, 10.0), "正在退出登录，请稍后再试。"
+        )
+        self.assertFalse(plugin._logout_pending, "清完场要开闸，不然从此不许登录")
 
     async def test_logout_refuses_to_purge_while_a_retired_pool_lives(self):
         # 作废池里的子进程同样攥着 token，而 ``pool.logout()`` 只看活着的那个池。

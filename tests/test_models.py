@@ -163,10 +163,27 @@ class ParseConfigTests(unittest.TestCase):
         document = {"models": [{"id": "Custom-Local:" + ALPHA}]}
         self.assertEqual(parse_config_models(document), [CUSTOM_PREFIX + ALPHA])
 
-    def test_a_shape_that_is_not_a_model_list_yields_nothing(self):
-        for document in (None, 1, "models", {"models": {}}, {"models": "abc"}, [], {}):
+    def test_a_valid_empty_list_is_an_empty_snapshot(self):
+        # "文件里一条都没有"要跟"文件长得不对"分开：前者调用方该照它清账，后者只能
+        # 当没读到、保留上一份。
+        for document in ([], {"models": []}):
             with self.subTest(document=document):
                 self.assertEqual(parse_config_models(document), [])
+
+    def test_a_shape_that_is_not_a_model_list_is_not_read_at_all(self):
+        # 以前这里返回 ``[]``，于是 ``{"models": {}}`` 这种手滑写法被当成"运维刚清空"，
+        # 候选里的自定义模型一次性消失。
+        for document in (
+            None,
+            1,
+            "models",
+            {"models": {}},
+            {"models": "abc"},
+            {"models": None},
+            {},
+        ):
+            with self.subTest(document=document):
+                self.assertIsNone(parse_config_models(document))
 
 
 # --------------------------------------------------------------------------- #
@@ -525,6 +542,26 @@ class CatalogProcessTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await fresh.refresh(), [CUSTOM_PREFIX + GAMMA])
         self.assertEqual(fresh.source, "config")
         self.assertFalse(fresh.authoritative, "只有配置清单，当不了允许列表")
+
+    async def test_an_invalid_config_shape_does_not_wipe_the_snapshot(self):
+        # 手里那份本来就来自配置时（``--help`` 什么都没报），``{"models": {}}`` 这种
+        # "形状不对"以前被当成"这份文件里一条都没有"，返回一张空快照把候选清干净——
+        # 运维手滑写错一层括号，手写的自定义网关就一夜之间没了。
+        tmp = _case_dir(self)
+        cli = _write_cli(tmp, [], name="codebuddy-no-help")
+        config = _write_config(tmp, {"models": [{"id": GAMMA}]})
+        catalog = ModelCatalog(str(cli), config_path=str(config), timeout=15)
+
+        self.assertEqual(await catalog.refresh(), [CUSTOM_PREFIX + GAMMA])
+        self.assertEqual(catalog.source, "config")
+
+        # 配置文件被写歪了：``models`` 成了对象。
+        _write_config(tmp, {"models": {}})
+        self.assertEqual(
+            await catalog.refresh(),
+            [CUSTOM_PREFIX + GAMMA],
+            "形状不对只算没读到，不许拿它把手里那份清掉",
+        )
 
     async def test_refresh_really_re_reads_after_the_cli_changes(self):
         tmp = _case_dir(self)

@@ -152,6 +152,11 @@ class WorkBuddyPlugin(Star):
         # No proactive notice may be queued until the runtime is fully built.
         self._notify_stopped = True
         self._logout_in_progress = False
+        # 登出已经开场、还在清场。跟 ``_logout_in_progress`` 不是一回事：那个是告警
+        # 闸门（"这次失败是我自己弄的，别报"），这个是**登录的准入闸门**。
+        # ``_logout`` 摘走并取消的只是"它进锁那一刻槽里的那条"；此后新起的登录它
+        # 管不着——等人家扫完码把凭据写回去，这边刚好清完场，还回一句"已退出登录"。
+        self._logout_pending = False
         self._gateway_bind_failed = False
 
     # ------------------------------------------------------------------ #
@@ -1015,6 +1020,11 @@ class WorkBuddyPlugin(Star):
         # 换任务这一段要在锁里：否则正在跑的登出会把"槽里是 None"当成"没有登录在
         # 跑"，取消落空之后再让它把这条新任务塞进去。
         async with self._login_task_lock:
+            if self._logout_pending:
+                # 登出还在清场。这条窗口里起来的登录没人会取消它：等它扫完码把凭据
+                # 写回去，那边刚好清完场，回复还是"已退出登录"。在锁里看，跟登出
+                # 置位是同一把锁，不会看漏。
+                return "正在退出登录，请稍后再试。"
             await self._cancel_login_task()
             self._notify_umo = event.unified_msg_origin
             task = asyncio.create_task(
@@ -1139,7 +1149,19 @@ class WorkBuddyPlugin(Star):
         # 跟 ``_begin_login`` 用同一把锁，只圈"摘走并取消"这一小段。后面删凭据、
         # 关进程要几秒，攥着锁会把一条并发的登录整个堵住。
         async with self._login_task_lock:
+            # 关门跟摘任务是同一个动作的两半。只取消、不关门的话，这之后起来的登录
+            # 谁也不管——等它扫完码把凭据写回去，这边刚好清完场，回复还是"已退出
+            # 登录"。标志在锁里置位，``_begin_login`` 也在锁里看它，两边同一把锁。
+            self._logout_pending = True
             await self._cancel_login_task()
+        try:
+            return await self._finish_logout()
+        finally:
+            # 失败也要开闸：卡在 True 上等于从此不许登录，只能重载插件。
+            self._logout_pending = False
+
+    async def _finish_logout(self) -> str:
+        """登出已经定了，剩下的是清场；``_logout_pending`` 由调用方开合。"""
         # 标记"这次登出是有意的"：凭据是被主动清掉的，中途出岔子也不该弹一条假的
         # 告警。**置在这里而不是函数开头**——上面那步被取消时进程没关、凭据也没删，
         # 什么都不该留下；而这个标志是告警的闸门，漏在 True 上就等于从此不再报任何

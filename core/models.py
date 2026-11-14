@@ -127,6 +127,11 @@ def parse_config_models(document):
     接受两种形状：``{"models": [...]}``（现行）与裸列表；每项可以是对象（读 ``id``）
     或纯字符串。任何一项不合法就跳过，绝不整份放弃。
 
+    **形状不对返回 ``None``，不返回空表。** 空表是"这份文件里一条都没有"，调用方要
+    照它把候选清空；``{"models": {}}``、``null``、裸字符串这些是"这份文件长得不对"，
+    跟"读不到"一样，只能保留上一份。两者混成一个 ``[]`` 的话，运维手滑把 ``models``
+    写成对象、恰好又赶上 ``--help`` 读不出货，候选里的自定义模型会一次性消失。
+
     带 ``custom-local:`` 前缀的条目会先剥一层再看：剩下的是空串、或者还叠着一层
     前缀，整条丢掉（那种 id CLI 不认，留着只会让人选到必然失败的模型）；前缀写成
     别的的大小写则归一成小写，因为 CLI 只认小写那一种写法。
@@ -136,9 +141,9 @@ def parse_config_models(document):
     elif isinstance(document, list):
         items = document
     else:
-        return []
+        return None
     if not isinstance(items, list):
-        return []
+        return None
 
     result = []
     seen = set()
@@ -460,8 +465,9 @@ class ModelCatalog:
         """读 ``models.json``：读到就返回列表（**可能是空表**），没读到返回 ``None``。
 
         两者必须分开。空表是"这份文件里没有条目"，调用方要照它把旧的自定义网关清掉；
-        ``None`` 是"没读到"（没配路径、文件不在、JSON 坏了），那种情况下保留上一份
-        比清空安全——一次手滑的编辑不该让整台机器上的网关消失。
+        ``None`` 是"没读到"（没配路径、文件不在、JSON 坏了、**或者形状不对**），
+        那种情况下保留上一份比清空安全——一次手滑的编辑不该让整台机器上的网关消失。
+        形状判断在 :func:`parse_config_models` 里：它给 ``None``，这里就照没读到处理。
         """
         if not self._config_path or not os.path.isfile(self._config_path):
             return None
