@@ -39,8 +39,12 @@ class TempRootTests(unittest.TestCase):
         blocker.write_text("", encoding="utf-8")
         self.addCleanup(blocker.unlink, missing_ok=True)
         fake = blocker / "sub" / "pkg" / "tests" / "support.py"
-        with mock.patch.object(support, "_HERE", fake):
-            base = support._resolve_base_tmp()
+        # 环境变量排在 ``_HERE`` 前面：本机恰好设了 ``WORKBUDDY_TEST_TMP`` 时，这条
+        # 用例会直接命中那个目录、根本没走到回退分支，改坏了也照样绿。整份快照后摘掉。
+        with mock.patch.dict(os.environ):
+            os.environ.pop("WORKBUDDY_TEST_TMP", None)
+            with mock.patch.object(support, "_HERE", fake):
+                base = support._resolve_base_tmp()
         self.assertNotEqual(base, fake.parents[3] / "tmp")
         self.assertTrue(base.is_dir(), "退回去的那个目录也得真的建出来")
         self.assertTrue(os.access(base, os.W_OK))
