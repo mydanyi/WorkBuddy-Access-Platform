@@ -57,15 +57,27 @@ MAX_RETRY_AFTER = 900.0
 
 
 def _entries(body) -> list:
-    """从可能的三层信封里掏出模型数组；形状不对就是空。"""
-    data = body.get("data") if isinstance(body, dict) else body
-    if isinstance(data, dict):
-        for key in ("models", "data", "list"):
-            value = data.get(key)
-            if isinstance(value, list):
-                return value
+    """掏出模型数组。
+
+    **信封已经被客户端拆过一层**：``UpstreamClient._parse`` 返回的就是 ``data``
+    那一层，所以线上拿到的是 ``{"models": [...]}`` 而不是 ``{"code": 0, "data": ...}``。
+    这里两种都吃（裸数组、``{"models": [...]}``、再嵌一层的 ``{"data": {...}}``），
+    少猜一层总比线上悄悄空表强。
+    """
+    if isinstance(body, list):
+        return body
+    if not isinstance(body, dict):
         return []
-    return data if isinstance(data, list) else []
+    for key in ("models", "data", "list", "items"):
+        value = body.get(key)
+        if isinstance(value, list):
+            return value
+        if isinstance(value, dict):
+            for inner in ("models", "list", "items"):
+                nested = value.get(inner)
+                if isinstance(nested, list):
+                    return nested
+    return []
 
 
 def build_price_map(enterprise_entries, v3_entries) -> dict:

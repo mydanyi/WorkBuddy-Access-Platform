@@ -52,15 +52,18 @@ class _FakeClient:
         return [call["path"] for call in self.calls]
 
 
+# ``UpstreamClient._parse`` 已经把信封拆掉了：真实形状就是 ``data`` 那一层，
+# 不是 ``{"code": 0, "data": {...}}``。替身必须照这个形状写——照完整信封写的话，
+# 线上空表、用例全绿，上一版就是这么翻车的。
 def _enterprise(*items):
-    return {"code": 0, "data": {"models": list(items)}}
+    return {"models": list(items)}
 
 
 def _v3(*items, promotions=None):
     data = {"models": list(items)}
     if promotions is not None:
         data["modelPromotions"] = promotions
-    return {"code": 0, "data": data}
+    return data
 
 
 class BuildPriceMapTests(unittest.TestCase):
@@ -86,6 +89,19 @@ class BuildPriceMapTests(unittest.TestCase):
     def test_junk_entries_are_ignored(self):
         price = build_price_map([None, "x", {"id": ""}, {"id": 3}], None)
         self.assertEqual(price, {})
+
+
+class EntriesTests(unittest.TestCase):
+    def test_it_reads_the_shape_the_client_actually_returns(self):
+        from astrbot_plugin_workbuddy.core.pricing import _entries
+
+        # 线上真实形状：``_parse`` 只回 ``data`` 那一层。
+        self.assertEqual(_entries({"models": [{"id": "m"}]}), [{"id": "m"}])
+        # 裸数组与再嵌一层也照样认，少猜一层总比线上空表强。
+        self.assertEqual(_entries([{"id": "m"}]), [{"id": "m"}])
+        self.assertEqual(_entries({"data": {"models": [{"id": "m"}]}}), [{"id": "m"}])
+        self.assertEqual(_entries({"code": 0}), [])
+        self.assertEqual(_entries(None), [])
 
 
 class ModelPricingTests(unittest.IsolatedAsyncioTestCase):
