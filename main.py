@@ -144,6 +144,9 @@ class WorkBuddyPlugin(Star):
         # 调度器、池都清掉；那边醒来照样把 ``ready`` 置 True，插件自称可用，手里却是
         # 空的。收尾时对一下身份，对不上就把这一轮丢掉。
         self._lifecycle_epoch = 0
+        # 初始化排队用。只串行 ``initialize()``，不串 ``terminate()``——卸载路径上
+        # 绝不能让一次本地 CLI 探针把它挡住。
+        self._init_lock = asyncio.Lock()
         # 定时重读模型清单的那条任务；同一时刻只允许存在一条。
         self._model_refresh_task = None
         # 已经作废、但还有子进程没死的池。``AcpRuntimePool.shutdown()`` 关不掉的
@@ -169,7 +172,18 @@ class WorkBuddyPlugin(Star):
     # ------------------------------------------------------------------ #
 
     async def initialize(self) -> None:
-        """Build the runtime; a repeated call releases the previous one first."""
+        """Build the runtime; a repeated call releases the previous one first.
+
+        两轮初始化**排队**，不并着走。它们改的是同一批字段（``acp`` / ``gateway`` /
+        ``scheduler`` / ``catalog``），并着走的话后一轮开场就 ``_release_runtime()``，
+        把前一轮刚建好的那套收掉，而前一轮还卡在等清单上；等它醒来，``ready`` 与手里
+        的运行时对不上。排队还让下面那个"过期"判断变得可信——代号变了只可能是拆卸干
+        的，不会是另一轮初始化，所以过期那一轮自己收自己的收尾不会误伤谁。
+        """
+        async with self._init_lock:
+            await self._initialize_once()
+
+    async def _initialize_once(self) -> None:
         await self._wait_for_pending_teardown()
         await self._release_runtime()
         # 这一轮的身份。下面每一个 await 之后，别人都可能把整轮收掉；收掉一次身份
@@ -286,6 +300,8 @@ class WorkBuddyPlugin(Star):
             # 等清单的这几秒里，``terminate()`` 把整轮收完了：网关、调度器、池、清单
             # 全没了。再往下就是 ``ready = True``（插件自称可用、手里是空的）外加一句
             # ``self.scheduler.start()``。把这一轮迟到建出来的东西收掉，当作没发生过。
+            # 这一步收的是共享字段，所以上面必须排队：并着走的另一轮初始化此刻可能正
+            # 握着这些字段，收下去就是把别人的运行时拆了。
             _log.info("workbuddy: initialization dropped, a teardown overtook it")
             await self._release_runtime()
             return

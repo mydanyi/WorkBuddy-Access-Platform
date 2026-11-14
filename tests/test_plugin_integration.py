@@ -1189,6 +1189,39 @@ class _PluginIntegrationTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(plugin.gateway, "更不许留下一个没人管的网关")
         self.assertIsNone(plugin.acp, "也不许留一条没人认领的运行时")
 
+    async def test_a_second_initialize_waits_instead_of_building_on_top(self):
+        # 两轮初始化并着走会改同一批字段：后一轮开场就 ``_release_runtime()``，把前一轮
+        # 刚建好的那套收掉；前一轮还卡在等清单上，醒来看到代号变了，顺手又收一遍——
+        # 而那时 ``self.gateway`` 已经是后一轮的了。收尾收的是共享字段，所以只能排队。
+        plugin = await self._make_plugin(**self._make_ready_plugin_config())
+
+        entered = asyncio.Event()
+        release = asyncio.Event()
+        calls = []
+
+        async def _prime():
+            calls.append(1)
+            if len(calls) == 1:
+                entered.set()
+                await release.wait()
+
+        with mock.patch.object(plugin, "_prime_model_options", _prime):
+            first = asyncio.create_task(plugin.initialize())
+            await asyncio.wait_for(entered.wait(), 5.0)
+
+            second = asyncio.create_task(plugin.initialize())
+            done, _ = await asyncio.wait({second}, timeout=0.5)
+            self.assertEqual(done, set(), "第二轮必须排队，不能跟第一轮一起改同一批字段")
+            self.assertEqual(len(calls), 1, "排队期间它连清单都不许去读")
+
+            await plugin.terminate()
+            release.set()
+            await asyncio.wait_for(first, 5.0)
+            await asyncio.wait_for(second, 5.0)
+
+        self.assertTrue(plugin.ready, "轮到它时自己把这套建起来了")
+        self.assertIsNotNone(plugin.gateway, "它的网关不许被前一轮的收尾顺手拆掉")
+
     # -- 3b. empty api_key never opens the listener -----------------------
     async def test_valid_settings_bind_health_and_empty_api_key_disables_listener(self):
         os.environ["WORKBUDDY_MASTER_KEY"] = MASTER_KEY
