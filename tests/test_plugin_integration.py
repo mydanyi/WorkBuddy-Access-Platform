@@ -985,6 +985,35 @@ class _PluginIntegrationTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(plugin.router, "没排进锁的那轮收尾把新建的路由擦掉了")
         self.assertIsNotNone(plugin.notifier, "没排进锁的那轮收尾把新建的提醒器擦掉了")
 
+    async def test_cancelling_initialize_does_not_kill_the_retained_teardown(self):
+        # ``initialize()`` 等旧收尾时自己也会被取消。``gather`` 是"我们等别人"，
+        # 外层取消会顺着它传到那条收尾任务上（``return_exceptions`` 只收结果、
+        # 不挡取消）。而收尾可能正卡在 ``gateway.stop()`` 的 handler 等待里，被砍在
+        # 那儿就跳过清理；偏偏 ``self.gateway`` 已经置空，后面没人再关得掉那个监听。
+        plugin = await self._make_plugin(**self._make_ready_plugin_config())
+        pool = _PoolThatClosesSlowly()
+        plugin.acp = pool
+
+        term = asyncio.create_task(plugin.terminate())
+        await asyncio.wait_for(pool.entered.wait(), 5.0)
+        term.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await term
+
+        init = asyncio.create_task(plugin.initialize())
+        await asyncio.sleep(0.05)
+        self.assertFalse(init.done(), "收尾还堵在闸门上，这一轮初始化不该已经结束")
+        init.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await init
+
+        # 判据：取消 initialize 不许把收尾一起带走。放闸之后它必须自己走完。
+        pool.gate.set()
+        await asyncio.sleep(0.05)
+        self.assertFalse(
+            pool.survivor, "收尾被 initialize 的取消带走了：那条 CLI 还留着"
+        )
+
     async def test_logout_refuses_to_purge_while_a_retired_pool_lives(self):
         # 作废池里的子进程同样攥着 token，而 ``pool.logout()`` 只看活着的那个池。
         # 照删就会让一条没人认得的 CLI 把凭据原样写回去，而命令已经说"已退出登录"。

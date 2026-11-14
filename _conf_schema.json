@@ -134,7 +134,7 @@
         "type": "string",
         "default": "",
         "description": "默认模型",
-        "hint": "请求里没带模型时的兜底模型；留空表示用 CLI 自己的默认模型。正常接入 AstrBot 时每个请求都会带模型，这里通常不用填。可用模型见 /wb models。"
+        "hint": "进程启动时传给 CLI 的 --model；留空表示用 CLI 自己的默认模型。注意网关要求每个请求都带 model，缺了直接返回 400，不会落到这一项上。正常接入 AstrBot 时每个请求都会带模型，这里通常不用填。可用模型见 /wb models。"
       },
       "max_processes": {
         "type": "int",

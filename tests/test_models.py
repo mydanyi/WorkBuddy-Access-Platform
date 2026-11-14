@@ -32,6 +32,7 @@ from astrbot_plugin_workbuddy.core.models import (  # noqa: E402
     parse_config_models,
     parse_help_models,
     strip_model_alias,
+    _reap,
 )
 
 try:  # 包内发现
@@ -277,6 +278,27 @@ def _runs(directory, *, name="runs") -> int:
     return len(path.read_text()) if path.exists() else 0
 
 
+class _SlowExit:
+    """``wait()`` 卡在闸门上的进程替身。
+
+    真进程的 ``wait()`` 什么时候回收说不准，用它才能把"取消正好落在等退出这一步"
+    摆成一个可以稳定复现的时序。
+    """
+
+    def __init__(self):
+        self.killed = False
+        self.waiting = asyncio.Event()
+        self.gate = asyncio.Event()
+
+    def kill(self):
+        self.killed = True
+
+    async def wait(self):
+        self.waiting.set()
+        await self.gate.wait()
+        return 0
+
+
 @unittest.skipIf(
     sys.platform == "win32",
     "ModelCatalog spawns the CLI with create_subprocess_exec; Windows has no "
@@ -426,6 +448,19 @@ class CatalogProcessTests(unittest.IsolatedAsyncioTestCase):
         # 清单没变，来源没变：取消不是"读到了空清单"。
         self.assertEqual(catalog.models, [])
         self.assertEqual(catalog.source, "none")
+
+    async def test_cancelling_the_reap_itself_still_waits_for_the_exit(self):
+        # 收尸这一步自己也会被取消：``shield`` 只护住里层的 ``wait()``，取消照样在
+        # ``_reap`` 这一层抛出。它要是当场返回，调用方立刻 re-raise、目录的锁也放掉，
+        # 而那个进程还没真退——函数名和契约里的"等它真的退出"一起落空。
+        process = _SlowExit()
+        task = asyncio.ensure_future(_reap(process))
+        await asyncio.wait_for(process.waiting.wait(), 5.0)
+        task.cancel()
+        await asyncio.sleep(0.05)
+        self.assertFalse(task.done(), "取消之后也得接着等它退出")
+        process.gate.set()
+        self.assertTrue(await asyncio.wait_for(task, 5.0), "得把'被取消过'报上来")
 
     async def test_a_failed_read_keeps_the_last_good_list(self):
         tmp = _case_dir(self)

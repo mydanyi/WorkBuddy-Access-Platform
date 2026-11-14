@@ -9,6 +9,7 @@
 
 from __future__ import annotations
 
+import math
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 
@@ -62,15 +63,24 @@ def parse_retry_after(resp):
 
     两种合法形状都要认：延迟秒数（``"120"``）与 HTTP-date。缺头、空串、负数以外的
     垃圾一律 ``None``，绝不编一个等待时间出来——上层拿 ``None`` 就是不提示。
+
+    ``inf`` / ``nan`` 也算垃圾。``float("Infinity")`` 是不报错的，放过去的话上层
+    会拿它当冷却时长：``cooldown_until`` 变成无穷大，``_block_reason`` 从此永远返回
+    "冷却中"，``resume()`` 只清暂停标记、清不掉它，这个值还会以 ``Infinity`` 的
+    形式落进状态文件。``nan`` 更糟——它跟任何数比较都是 False，冷却等于零。
     """
     value = resp.headers.get("Retry-After")
     if not value:
         return None
     value = value.strip()
     try:
-        return max(0.0, float(value))
+        seconds = float(value)
     except (TypeError, ValueError):
         pass
+    else:
+        if not math.isfinite(seconds):
+            return None
+        return max(0.0, seconds)
     try:
         parsed = parsedate_to_datetime(value)
     except (TypeError, ValueError):

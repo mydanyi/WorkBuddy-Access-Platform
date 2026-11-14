@@ -35,16 +35,20 @@ class TempRootTests(unittest.TestCase):
     def test_an_unusable_default_falls_back_to_a_writable_dir(self):
         # 故意让 ``parents[3]`` 指向一个**文件**：在它下面建目录必然失败（root 也一样），
         # 正好模拟裸 clone 时 ``/home/tmp`` 那种"建不出来"的情形。
-        blocker = Path(tempfile.gettempdir()) / "wb-support-blocker"
-        blocker.write_text("", encoding="utf-8")
-        self.addCleanup(blocker.unlink, missing_ok=True)
-        fake = blocker / "sub" / "pkg" / "tests" / "support.py"
-        # 环境变量排在 ``_HERE`` 前面：本机恰好设了 ``WORKBUDDY_TEST_TMP`` 时，这条
-        # 用例会直接命中那个目录、根本没走到回退分支，改坏了也照样绿。整份快照后摘掉。
-        with mock.patch.dict(os.environ):
-            os.environ.pop("WORKBUDDY_TEST_TMP", None)
-            with mock.patch.object(support, "_HERE", fake):
-                base = support._resolve_base_tmp()
+        #
+        # 装它的目录由本次用例自己开：写死 ``/tmp/wb-support-blocker`` 的话，两个测试
+        # 进程会抢同一个文件——先收工的那个把它删掉，另一个的 ``_resolve_base_tmp()``
+        # 就真的把目录建了出来，``assertNotEqual`` 随之失败，清理时还去 unlink 一个目录。
+        with tempfile.TemporaryDirectory() as holding:
+            blocker = Path(holding) / "blocker"
+            blocker.write_text("", encoding="utf-8")
+            fake = blocker / "sub" / "pkg" / "tests" / "support.py"
+            # 环境变量排在 ``_HERE`` 前面：本机恰好设了 ``WORKBUDDY_TEST_TMP`` 时，这条
+            # 用例会直接命中那个目录、根本没走到回退分支，改坏了也照样绿。整份快照后摘掉。
+            with mock.patch.dict(os.environ):
+                os.environ.pop("WORKBUDDY_TEST_TMP", None)
+                with mock.patch.object(support, "_HERE", fake):
+                    base = support._resolve_base_tmp()
         self.assertNotEqual(base, fake.parents[3] / "tmp")
         self.assertTrue(base.is_dir(), "退回去的那个目录也得真的建出来")
         self.assertTrue(os.access(base, os.W_OK))

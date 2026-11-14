@@ -256,7 +256,7 @@ CLI 不在 PATH 里（比如装在 nvm 的版本目录下）时，把 `acp.cli_p
 | `routing.cooldown_seconds` / `first_frame_timeout` | `60` / `90` | 秒 |
 | `acp.cli_path` | `codebuddy` | 走 PATH；否则填绝对路径 |
 | `acp.tools` | `""` | 留空 = 禁用全部内置工具 |
-| `acp.model` | `""` | 请求没带模型时的兜底，留空用 CLI 默认 |
+| `acp.model` | `""` | 进程的 `--model`；留空用 CLI 默认。请求**必须**带 `model`，缺了网关直接 400，不会落到这一项 |
 | `acp.max_processes` | `2` | 同时常驻的 CLI 进程数，1..16 |
 | `acp.login_timeout` | `120` | 等扫码的秒数 |
 | `signin.enabled` / `timezone` | `true` / `Asia/Shanghai` | |

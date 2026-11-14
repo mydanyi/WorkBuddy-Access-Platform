@@ -340,6 +340,13 @@ class RetryAfterTests(unittest.TestCase):
         self.assertIsNone(parse_retry_after(self._Resp(None)))
         self.assertIsNone(parse_retry_after(self._Resp("not-a-date")))
         self.assertGreater(parse_retry_after(self._Resp("Wed, 21 Oct 2099 07:28:00 GMT")), 0)
+        # ``inf`` / ``nan`` 也归"认不出来"。``float("Infinity")`` 不报错，放过去的话
+        # 冷却时长就成了无穷大：``_block_reason`` 从此永远返回"冷却中"，``resume()``
+        # 只清暂停标记、清不掉它，这个值还会以 ``Infinity`` 的形式落进状态文件。
+        # ``nan`` 反过来——跟任何数比较都是 False，冷却等于零。
+        self.assertIsNone(parse_retry_after(self._Resp("Infinity")))
+        self.assertIsNone(parse_retry_after(self._Resp("-Infinity")))
+        self.assertIsNone(parse_retry_after(self._Resp("nan")))
 
 
 if __name__ == "__main__":

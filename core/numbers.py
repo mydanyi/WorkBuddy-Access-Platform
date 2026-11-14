@@ -14,8 +14,13 @@ __all__ = ["is_finite_number"]
 
 def is_finite_number(value) -> bool:
     """True for a real, finite ``int``/``float`` (never ``bool``)."""
-    return (
-        isinstance(value, (int, float))
-        and not isinstance(value, bool)
-        and math.isfinite(value)
-    )
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    try:
+        return math.isfinite(value)
+    except OverflowError:
+        # ``10**400`` 这种整数：类型对、也不是 ``bool``，但 ``math.isfinite`` 要先把它
+        # 转成 double，转不动就抛。它本来就不是能拿来算的数值，按"不是"处理——
+        # 抛出去的话，调用方那句 ``if not is_finite_number(...)`` 的兜底反而看不见，
+        # 报错的是奖励文案或冷却计算这些更远的地方。
+        return False

@@ -406,7 +406,12 @@ class WorkBuddyPlugin(Star):
         task = self._teardown_task
         if task is None or task.done():
             return
-        await asyncio.gather(task, return_exceptions=True)
+        # 连这一等也要 shield。``gather`` 是**我们**等别人的一条等待，外层一旦取消
+        # 这一轮初始化，取消会顺着 gather 传到那条收尾任务上——``return_exceptions``
+        # 只收结果、不挡取消。而收尾可能在 ``gateway.stop()`` 里等 handler，被砍在
+        # 那儿就跳过 runner 清理；偏偏 ``self.gateway`` 已经置空了，后面没人再关得掉
+        # 那个监听，下一次初始化绑定同一个端口就失败。任务留着，再来一次还是等它。
+        await asyncio.shield(asyncio.gather(task, return_exceptions=True))
 
     async def _release_runtime(self) -> None:
         """收尾；并发调用排队，后来的那一轮等前一轮真的收完再动手。

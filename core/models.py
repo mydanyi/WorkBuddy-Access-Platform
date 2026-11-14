@@ -490,16 +490,27 @@ async def _reap(process) -> bool:
         process.kill()
     except (ProcessLookupError, OSError):
         pass
-    try:
-        # shield：外层被取消时别把"等它退出"这一步一起取消掉，否则又是一条
-        # killed 但没 wait 的进程。
-        await asyncio.wait_for(
-            asyncio.shield(process.wait()), timeout=_REAP_TIMEOUT
-        )
-    except asyncio.CancelledError:
-        cancelled = True
-    except (asyncio.TimeoutError, OSError, ProcessLookupError):
-        pass
+    # 先把"等它退出"这条任务抓在手里。直接 ``await asyncio.shield(process.wait())``
+    # 是挡不住取消的：``CancelledError`` 会在**这一层**立刻抛出，shield 里的等待还
+    # 在跑，我们却已经返回了——调用方照着 ``cancelled`` 马上 ``raise``、目录的锁也
+    # 放掉，而进程还没真退，函数名与契约里的"等它真的退出"当场落空。留着这条任务，
+    # 取消之后接着等（总共仍以 ``_REAP_TIMEOUT`` 为限），最后用返回值交差。
+    waiter = asyncio.ensure_future(process.wait())
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + _REAP_TIMEOUT
+    while True:
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            break
+        try:
+            await asyncio.wait_for(asyncio.shield(waiter), timeout=remaining)
+            break
+        except asyncio.CancelledError:
+            # 收尸不能半路被打断：记下这一次取消，接着等。
+            cancelled = True
+            continue
+        except (asyncio.TimeoutError, OSError, ProcessLookupError):
+            break
     return cancelled
 
 
