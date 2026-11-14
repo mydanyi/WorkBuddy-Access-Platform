@@ -1,10 +1,11 @@
-"""Local OpenAI-compatible HTTP gateway in front of :class:`ChatService`.
+"""Local OpenAI-compatible HTTP gateway in front of the chat backend.
 
 Public endpoints (all local, no upstream account data ever leaks):
 
 * ``POST /v1/chat/completions`` -- bearer-authenticated; streams SSE or returns an
   aggregated JSON completion, exactly as the client asked;
-* ``GET /v1/models`` -- bearer-authenticated; the live upstream CLI-chat catalog;
+* ``GET /v1/models`` -- bearer-authenticated; the model list this install can
+  actually serve, read from the local CLI (never from an upstream account API);
 * ``GET /health`` / ``GET /healthz`` -- unauthenticated; a bare status, no
   account data.
 
@@ -13,12 +14,16 @@ Behaviour pinned by the contract tests:
 * with an empty ``api_key`` the chat listener is never opened;
 * admission is counted precisely against ``concurrency + queue_size``, a full
   queue or an expired queue wait answers 429 with ``Retry-After``, and the RPM
-  budget is judged before enqueueing but spent per *real* upstream chat POST
-  (shared with growth chat);
+  budget is judged before enqueueing but spent per *real* ACP prompt;
 * the virtual ordered model (``core.routing.ORDERED_MODEL_ID``) is only
   advertised/served while the route is enabled; its candidates are walked by
   the real :class:`core.routing.ModelRouter`, and the virtual Chinese id is
-  never forwarded upstream;
+  never forwarded to a CLI process;
+* a model id that the local catalog does not contain is a fixed local 400 (never
+  a spawned process that would fail later with a 502); when the catalog is empty
+  -- nothing has ever been read -- or is only the ``models.json`` subset (the
+  ``--help`` read never succeeded), the check is skipped rather than refusing
+  every request;
 * the request body is capped by ``gateway.max_request_body_mb`` (default 16
   MiB) in real UTF-8 bytes -- Content-Length and chunked bodies alike -- with an
   OpenAI-compatible JSON ``413 request_too_large`` that echoes no request data;
@@ -37,21 +42,22 @@ import asyncio
 import contextlib
 import hmac
 import json
+import logging
 import math
 
-import aiohttp
 from aiohttp import web
-
 from .chat import aggregate_chunks
-from .credits import display_model_id, upstream_model_id
 from .errors import ChatStreamError, UpstreamError
 from .limits import ConcurrencyGate, LimitExceeded
+from .models import MAX_MODEL_ID_CHARS, strip_model_alias
 from .routing import ORDERED_MODEL_ID
 
 COMPLETIONS_PATH = "/v1/chat/completions"
 MODELS_PATH = "/v1/models"
 HEALTH_PATH = "/health"
 HEALTHZ_PATH = "/healthz"
+
+_log = logging.getLogger(__name__)
 
 _MIB = 1024 * 1024
 # Approved default body cap; ``0`` never means "unlimited".
@@ -96,7 +102,6 @@ class Gateway:
     def __init__(
         self,
         chat,
-        client,
         *,
         api_key,
         host="127.0.0.1",
@@ -107,6 +112,7 @@ class Gateway:
         queue_timeout=30.0,
         limits=None,
         router=None,
+        catalog=None,
         max_request_body_mb=_DEFAULT_MAX_REQUEST_BODY_MB,
     ):
         # The body cap is a positive integer number of MiB: ``bool``, ``0``, a
@@ -119,16 +125,18 @@ class Gateway:
         ):
             raise ValueError("max_request_body_mb must be a positive integer")
         self._chat = chat
-        self._client = client
+        # 模型清单的来源。给 ``None`` 表示"这个网关不掌握清单"：``/v1/models``
+        # 就只报虚拟入口，聊天也不做未知模型校验。生产里一定是
+        # :class:`core.models.ModelCatalog`。
+        self._catalog = catalog
         self._router = router
         self._api_key = api_key or ""
         self._host = host
         self._port = port
         self._max_request_body_mb = max_request_body_mb
         self._max_request_body_bytes = max_request_body_mb * _MIB
-        # The gate lives on the ChatService so a direct call and the gateway
-        # share one budget; the gateway applies its configured budget to that
-        # same gate (default: 1 concurrent, 6 RPM, queue 2, timeout 30s).
+        # 并发门挂在**聊天后端**上，而不是网关自己：直连后端和走网关用的是同一个
+        # 预算。网关把自己配置的那份写上去（默认 1 并发、6 RPM、队列 2、等 30 秒）。
         if limits is not None:
             chat.limits = limits
         else:
@@ -175,13 +183,33 @@ class Gateway:
         if not self._api_key:
             self.bound_port = None
             return
+        if self._stopping:
+            # 已经有人喊过停了。这时候再绑，那条监听就再也没人关得掉：拆卸那边
+            # 早把引用丢干净了（收尾已经把 ``self.gateway`` 置空）。
+            self.bound_port = None
+            return
         # ``handler_cancellation`` is an ``AppRunner`` argument, not an
         # ``Application`` one: it lets a client disconnect cancel the handler.
-        self._runner = web.AppRunner(self._app, handler_cancellation=True)
-        await self._runner.setup()
-        self._site = web.TCPSite(self._runner, self._host, self._port)
-        await self._site.start()
-        address = self._runner.addresses[0]
+        runner = web.AppRunner(self._app, handler_cancellation=True)
+        self._runner = runner
+        await runner.setup()
+        site = web.TCPSite(runner, self._host, self._port)
+        self._site = site
+        await site.start()
+        if self._stopping:
+            # 停在这几跳的中间：``stop()`` 那时看到的 ``site`` 还没起来，aiohttp 的
+            # ``cleanup()`` 对"还没 start 的 site"只是把它从注册表里摘掉，不会关随后
+            # 才建好的那条监听。这里自己收——端口要是留着，下一次重载会绑不上。
+            with contextlib.suppress(Exception):
+                await site.stop()
+            with contextlib.suppress(Exception):
+                await runner.cleanup()
+            if self._runner is runner:
+                self._runner = None
+                self._site = None
+            self.bound_port = None
+            return
+        address = runner.addresses[0]
         self.bound_port = int(address[1])
 
     async def stop(self) -> None:
@@ -256,11 +284,30 @@ class Gateway:
             code="request_too_large",
         )
 
+    def _frame_too_large_error(self):
+        """The 413 for a prompt that fits the body cap but not one ACP frame.
+
+        Same fixed shape and type as :meth:`_too_large_error`, different cause:
+        the body was under ``max_request_body_mb``, the content itself is what
+        overflowed. Pointing at that setting would send the caller to turn a
+        knob that cannot help, so the text only says what to cut.
+        """
+        return self._json_error(
+            413,
+            "请求内容超过单次请求的内容上限；请缩减历史消息或单条消息的内容后重试。",
+            "request_too_large",
+            code="request_too_large",
+        )
+
     def _failed_error(self, exc):
         if isinstance(exc, UpstreamError):
             status = exc.status if isinstance(exc.status, int) and exc.status >= 400 else 502
         else:
             status = getattr(exc, "status", 502) or 502
+        if status == 413:
+            # 这条提示词自己太大（正文 + 历史 + 附件超过一帧的上限），不是上游出事。
+            # 回一句能照着改的话；"upstream request failed" 只会让人去查网络。
+            return self._frame_too_large_error()
         # Only the router's own 429 cooling refusal reads as a rate limit (HTTP
         # 429 and its Retry-After are kept); every other upstream failure keeps
         # the historic ``upstream_error`` type and is never a local limit.
@@ -321,39 +368,70 @@ class Gateway:
     async def _handle_health(self, request):
         return web.json_response({"status": "ok"})
 
+    async def _catalog_models(self) -> list:
+        """取本地模型清单；读不到就当空列表，绝不编一份出来。
+
+        ``ensure`` 自带保鲜期，所以这里不会每来一次请求就 spawn 一个 ``--help``。
+        读失败是"这台机器上没装 CLI / 还没读过"，只影响本接口与未知模型校验，不该
+        让 ``/v1/models`` 变成一个 5xx。
+        """
+        catalog = self._catalog
+        if catalog is None:
+            return []
+        try:
+            models = await catalog.ensure()
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - 清单读不出来不是网关故障
+            return []
+        if not isinstance(models, list):
+            return []
+        return [model for model in models if isinstance(model, str) and model]
+
+    def _known_model(self, model, models) -> bool:
+        """该模型能不能交给 CLI。
+
+        清单为空时一律放行：那说明这台机器还没成功读过清单（CLI 没装、装晚了一步），
+        此时拒绝所有请求只会把"还没准备好"变成"永远不能用"。清单非空才做校验——
+        此时一个不认识的 id 意味着 CLI 那边一定会失败，早点回 400 比让它变成一条
+        注定失败的进程 + 一条"上游异常"提醒好。
+
+        但清单得**够格**当允许列表：``models.json`` 那条回退只含运维手写的
+        ``custom-local:``，是个子集。拿子集拦人，内置模型会全部 400——那正是本次要
+        修的那个 bug，只不过发生在"``--help`` 从一开始就没读成"这条路径上。不够格就
+        降级为 advisory：放行给下游，让 CLI 报真实错误。
+        """
+        if not models:
+            return True
+        if not self._catalog_is_authoritative():
+            return True
+        return model in models
+
+    def _catalog_is_authoritative(self) -> bool:
+        """清单能否当允许列表用；见 :attr:`core.models.ModelCatalog.authoritative`。
+
+        拿不准就当"不够格"：漏拦一个模型只是让下游报真实错误，拦错一个却会把本来能
+        用的请求变成 400，而用户从错误文本里看不出是清单的锅。
+        """
+        catalog = self._catalog
+        return bool(getattr(catalog, "authoritative", False))
+
     async def _handle_models(self, request):
         if not self._authorized(request):
             return self._auth_error()
-        try:
-            details = await self._client.model_details()
-        except UpstreamError as exc:
-            return self._failed_error(exc)
-        except (aiohttp.ClientError, asyncio.TimeoutError):
-            # A transport failure is a fixed JSON 502, never an unhandled 500.
-            return self._failed_error(ChatStreamError("upstream request failed"))
-        data = []
-        for detail in details or []:
-            if not isinstance(detail, dict):
-                continue
-            upstream_id = detail.get("id")
-            if not isinstance(upstream_id, str) or not upstream_id:
-                continue
-            data.append(
-                {
-                    "id": display_model_id(detail),
-                    "upstream_id": upstream_id,
-                    "object": "model",
-                    "created": 0,
-                    "owned_by": "workbuddy",
-                    "credits": detail.get("credits"),
-                    "effective_credits": detail.get("effective_credits"),
-                    "promo_label": detail.get("promo_label"),
-                    "promo_note": detail.get("promo_note"),
-                }
-            )
+        models = await self._catalog_models()
+        data = [
+            {
+                "id": model,
+                "object": "model",
+                "created": 0,
+                "owned_by": "workbuddy",
+            }
+            for model in models
+        ]
         if self._route_enabled():
-            # Appended after every live entry and without a fixed multiplier: the
-            # virtual id is a route, not a price-bearing model.
+            # Appended after every real entry: the virtual id is a route, never a
+            # model the CLI knows how to start.
             data.append(
                 {
                     "id": ORDERED_MODEL_ID,
@@ -395,21 +473,42 @@ class Gateway:
                 "both 'model' and a non-empty 'messages' list are required",
                 "invalid_request_error",
             )
-        # Shallow-copy and remap only ``model``: a display alias becomes the pure
-        # upstream id while messages / system / tools / persona / stream are left
-        # untouched.  A plain id -- and the virtual id -- passes through unchanged.
-        # Normalizing *once*, before the route check, is what makes the virtual
-        # id's own standard display alias land on the same fixed local 400.
+        # 旧版把倍率拼在模型 ID 后面（``wb-1 [0.11x]``），升级后 Provider 里存着的
+        # 可能还是这种别名。按同一条规则剥掉再往下走：不剥的话，清单非空时它是一个
+        # 本地 400（把升级前的配置直接打死），清单为空时又会带着后缀进 ``--model``。
+        # 剥完往后每一层（路由判断、目录校验、下发）都只见纯 ID。
         payload = dict(payload)
-        payload["model"] = upstream_model_id(payload["model"])
-        if payload["model"] == ORDERED_MODEL_ID and not self._route_enabled():
-            # The virtual id only exists with an enabled route: a fixed local 4xx
-            # and never a single upstream request.
+        model = strip_model_alias(payload["model"])
+        if not isinstance(model, str) or not model.strip():
+            return self._json_error(
+                400, "model must be a non-empty string", "invalid_request_error"
+            )
+        model = model.strip()
+        if len(model) > MAX_MODEL_ID_CHARS:
+            # 上限与"清单里能出现什么"是同一个常量（:data:`core.models.MAX_MODEL_ID_CHARS`）：
+            # 清单是这道检查的广告，两边一旦分叉，就会出现"列出来的模型选不了"。
+            # 固定文案，**不回声**：这个值来自请求体，可以有几 MB，原样拼回去就把
+            # 网关变成了放大器。而且这道检查在限流之前，回显等于免费放大。
+            return self._json_error(
+                400, "model id is too long", "invalid_request_error"
+            )
+        payload["model"] = model
+        if model == ORDERED_MODEL_ID:
+            if not self._route_enabled():
+                # The virtual id only exists with an enabled route: a fixed local
+                # 4xx and never a single CLI process.
+                return self._json_error(
+                    400,
+                    "the '{}' model requires an enabled routing list".format(
+                        ORDERED_MODEL_ID
+                    ),
+                    "invalid_request_error",
+                )
+        elif not self._known_model(model, await self._catalog_models()):
             return self._json_error(
                 400,
-                "the '{}' model requires an enabled routing list".format(
-                    ORDERED_MODEL_ID
-                ),
+                "unknown model '{}': check /v1/models for the ids this install "
+                "can serve".format(model),
                 "invalid_request_error",
             )
         stream = bool(payload.get("stream"))
@@ -441,6 +540,10 @@ class Gateway:
             except (UpstreamError, ChatStreamError) as exc:
                 return self._failed_error(exc)
             except Exception:
+                # 未预料的异常到调用方只剩一句固定的 502，不打日志根因就彻底消失了。
+                # 真实踩过：Path 混进 JSON 报 TypeError，外面看到的就是没头没尾的
+                # "upstream request failed"。异常原文只进日志，绝不进响应。
+                _log.warning("gateway: unexpected chat failure", exc_info=True)
                 return self._failed_error(ChatStreamError("upstream chat request failed"))
             finally:
                 await _aclose(agen)
@@ -460,6 +563,8 @@ class Gateway:
             return self._failed_error(exc)
         except Exception:
             await _aclose(agen)
+            # 同上：首帧之前的未预知失败也要留下根因，不能再是无声的 502。
+            _log.warning("gateway: unexpected chat failure before the first frame", exc_info=True)
             return self._failed_error(ChatStreamError("upstream chat request failed"))
         except BaseException:
             await _aclose(agen)

@@ -1,153 +1,65 @@
-"""Real-socket behaviour tests: the ordered model route **inside** the gateway.
+"""本地网关的对外契约：模型清单、虚拟入口、失败不拼接、请求体上限。
 
-Scope of this file (T2-red, write-failing-tests-first):
+分工：``core/routing.py`` 的决策细节（冷却、作用域、备用顺序）由 ``test_routing.py``
+在单元层覆盖；这里只验**网关这一层**能不能把路由的结果如实交出去——清单里有没有虚拟
+入口、一次虚拟请求到底问了几次后端、流断在中途会不会拼两个模型、请求体超限会不会
+去碰下游。
 
-* the virtual model (:data:`core.routing.ORDERED_MODEL_ID`) only exists through
-  the real ``Gateway`` -> ``ChatService`` -> ``UpstreamClient`` chain;
-* the shared admission budget (``ConcurrencyGate``) is consumed once per *real*
-  chat POST -- before the first attempt, again before a refresh resend and again
-  before every standby attempt -- while a refused attempt consumes nothing and
-  never becomes a 502;
-* a routed candidate failure is silent for the ``on_error`` observer, while an
-  ordinary chat failure still reports its fixed category (no global mute);
-* the approved configurable request-body limit (default 16 MiB) is enforced by
-  the gateway itself: byte-exact, chunk-aware, JSON 413 with no content leak.
-
-Nothing of ours is doubled: the fake WorkBuddy upstream is a real ``aiohttp.web``
-server bound to ``127.0.0.1:0``, and the assertions drive a real
-``AuthManager`` / ``UpstreamClient`` / ``ChatService`` / ``Gateway`` /
-``ModelRouter`` / ``ConcurrencyGate`` / ``StateStore`` over a real socket.
-
-Portions of the interface are still missing on purpose (see the ticket): the
-capability guard in :meth:`_GatewayCase._require_new_interfaces` turns such a
-gap into one explicit ``AssertionError`` per test instead of a ``TypeError``
-buried in a fixture.  Do not "fix" that here.
-
-Every credential / token below is a FICTIONAL FIXED SAMPLE copied from the
-contract suite.  Scratch data uses ``WORKBUDDY_TEST_TMP`` or the NAS-hosted
-``tmp`` root; the system temp dir is never used.
-
-Remote verification (manager): ``python -B -m unittest
-tests.test_routing_gateway tests.test_routing -v``.  Local: NOT RUN.
+聊天后端是脚本化的（``support.ScriptedChat``），因为它扮演的是一个"已经按契约出错"
+的后端；ACP 适配层自己的错误映射在 ``test_acp_backend`` 里用假 CLI 验。
 """
 
-from __future__ import annotations
-
-import asyncio
-import collections
 import contextlib
-import inspect
 import json
-import shutil
 import sys
-import tempfile
 import unittest
 from pathlib import Path
 
 import aiohttp
-from aiohttp import web
 
-# --- Make ``astrbot_plugin_workbuddy`` importable when discovered from anywhere.
 _HERE = Path(__file__).resolve()
-_SOURCE_ROOT = _HERE.parents[2]  # directory that contains astrbot_plugin_workbuddy/
+_SOURCE_ROOT = _HERE.parents[2]
 if str(_SOURCE_ROOT) not in sys.path:
     sys.path.insert(0, str(_SOURCE_ROOT))
 
-from astrbot_plugin_workbuddy.core.auth import AuthManager  # noqa: E402
-from astrbot_plugin_workbuddy.core.chat import ChatService  # noqa: E402
-from astrbot_plugin_workbuddy.core.client import UpstreamClient  # noqa: E402
 from astrbot_plugin_workbuddy.core.config import ConfigError, load_settings  # noqa: E402
-from astrbot_plugin_workbuddy.core.credits import upstream_model_id  # noqa: E402
-from astrbot_plugin_workbuddy.core.gateway import Gateway  # noqa: E402
-from astrbot_plugin_workbuddy.core.limits import ConcurrencyGate, LimitExceeded  # noqa: E402
-from astrbot_plugin_workbuddy.core.routing import ModelRouter, ORDERED_MODEL_ID  # noqa: E402
-from astrbot_plugin_workbuddy.core.storage import CredentialStore, StateStore  # noqa: E402
+from astrbot_plugin_workbuddy.core.errors import (  # noqa: E402
+    ChatStreamError,
+    UpstreamError,
+)
+from astrbot_plugin_workbuddy.core.gateway import (  # noqa: E402
+    COMPLETIONS_PATH,
+    MODELS_PATH,
+    Gateway,
+)
+from astrbot_plugin_workbuddy.core.models import CUSTOM_PREFIX  # noqa: E402
+from astrbot_plugin_workbuddy.core.routing import (  # noqa: E402
+    ORDERED_MODEL_ID,
+    ModelRouter,
+)
+from astrbot_plugin_workbuddy.core.storage import StateStore  # noqa: E402
 
-# Reuse the contract suite's real fake-upstream fixtures -- but NOT its test case
-# (subclassing ``_GatewayTestCase`` would re-run every contract test).
-try:  # package discovery: ``python -m unittest tests.test_routing_gateway``.
-    from tests.test_chat_gateway import (  # noqa: E402
-        _FakeUpstream,
-        _chunk,
-        _frame,
-        _DONE,
-        API_KEY,
-        AT_OLD,
-        BASE_TMP,
-        CHAT_PATH,
-        COMPLETIONS_PATH,
-        MASTER_KEY,
-        MODEL,
-        MODELS_PATH,
-        SEED_CREDENTIALS,
-    )
-except ImportError:  # top-level discovery: ``python -m unittest discover -s tests``.
-    from test_chat_gateway import (  # noqa: E402
-        _FakeUpstream,
-        _chunk,
-        _frame,
-        _DONE,
-        API_KEY,
-        AT_OLD,
-        BASE_TMP,
-        CHAT_PATH,
-        COMPLETIONS_PATH,
-        MASTER_KEY,
-        MODEL,
-        MODELS_PATH,
-        SEED_CREDENTIALS,
-    )
+try:  # 包内发现
+    from tests import support
+except ImportError:  # 顶层发现
+    import support  # type: ignore
 
 _UNSET = object()
-
 _MIB = 1024 * 1024
+
+MODELS = ("wb-alpha", "wb-beta", "wb-gamma")
 
 
 # --------------------------------------------------------------------------- #
 # helpers
 # --------------------------------------------------------------------------- #
 
-def _signature_params(target) -> set:
-    """Parameter names of ``target`` (``asynccontextmanager`` wrappers unwrap)."""
-    try:
-        return set(inspect.signature(target).parameters)
-    except (TypeError, ValueError):  # pragma: no cover - defensive
-        return set()
-
-
 def _routing_section(models, **overrides) -> dict:
     """The validated ``routing`` settings group for an enabled route."""
     raw = {"enabled": True, "models": list(models)}
     raw.update(overrides)
     settings = load_settings({"routing": raw})
-    if not isinstance(settings, dict) or "routing" not in settings:
-        raise AssertionError("load_settings() did not return a 'routing' section")
     return settings["routing"]
-
-
-def _sse_frames(model, text):
-    """One complete SSE answer, tagged with the model that produced it."""
-    return [
-        _frame(_chunk({"role": "assistant"}, model=model)),
-        _frame(_chunk({"content": text}, model=model)),
-        _frame(_chunk({}, finish="stop", model=model)),
-        _DONE,
-    ]
-
-
-def _merged_content(events) -> str:
-    """Join every streamed ``delta.content`` fragment (gateway side only)."""
-    parts = []
-    for event in events:
-        if not isinstance(event, dict):
-            continue
-        for choice in event.get("choices") or []:
-            if not isinstance(choice, dict):
-                continue
-            delta = choice.get("delta") or {}
-            if isinstance(delta, dict) and delta.get("content"):
-                parts.append(delta["content"])
-    return "".join(parts)
 
 
 async def _read_sse(resp):
@@ -169,10 +81,29 @@ async def _read_sse(resp):
     return events, done, "\n".join(raw_lines)
 
 
-def _body_of_exact_bytes(total, *, model=MODEL, prefix="") -> bytes:
-    """A valid chat JSON body whose UTF-8 encoding is exactly ``total`` bytes."""
+def _merged_content(events) -> str:
+    """Join every streamed ``delta.content`` fragment (gateway side only)."""
+    parts = []
+    for event in events:
+        if not isinstance(event, dict):
+            continue
+        for choice in event.get("choices") or []:
+            if not isinstance(choice, dict):
+                continue
+            delta = choice.get("delta") or {}
+            if isinstance(delta, dict) and delta.get("content"):
+                parts.append(delta["content"])
+    return "".join(parts)
+
+
+def _body_of_exact_bytes(total, *, model=None, prefix="") -> bytes:
+    """A valid chat JSON body whose UTF-8 encoding is exactly ``total`` bytes.
+
+    ``model`` 默认取清单里的第一个真模型：请求体会先过"未知模型 → 固定 400"
+    这道闸，用清单外的 id 会让请求体上限的用例全部变成 400。
+    """
     payload = {
-        "model": model,
+        "model": MODELS[0] if model is None else model,
         "messages": [{"role": "user", "content": prefix}],
         "stream": False,
     }
@@ -189,104 +120,11 @@ def _body_of_exact_bytes(total, *, model=MODEL, prefix="") -> bytes:
 
 async def _iter_slices(body, size=65536):
     """Yield ``body`` in slices so aiohttp must use chunked encoding."""
+    import asyncio
+
     for start in range(0, len(body), size):
         yield body[start:start + size]
         await asyncio.sleep(0)
-
-
-# --------------------------------------------------------------------------- #
-# the fake upstream, scripted per model id
-# --------------------------------------------------------------------------- #
-
-class _ModelUpstream(_FakeUpstream):
-    """Real aiohttp upstream that answers each *model* from its own program.
-
-    ``sent_models`` records the pure model id of every real chat POST in order,
-    which is how these tests observe what the real route actually asked for.
-    """
-
-    def __init__(self) -> None:
-        super().__init__()
-        # The inherited ``_FakeUpstream`` app keeps aiohttp's 1 MiB request-body
-        # default, which would refuse the >1 MiB bodies the gateway's own limit
-        # tests legitimately send.  Raise it for *this* fake upstream only, so
-        # the 1.12 MiB body reaches the upstream instead of dying in the fixture;
-        # the shared ``test_chat_gateway`` fixture, the test payloads and every
-        # assertion stay untouched.
-        self.app._client_max_size = 32 * _MIB
-        self.by_model = {}
-        self.sent_models = []
-
-    # -- scripting -------------------------------------------------------
-
-    def _queue(self, model, program) -> None:
-        self.by_model.setdefault(model, collections.deque()).append(program)
-
-    def queue_model_sse(self, model, text) -> None:
-        self._queue(model, {"kind": "sse", "chunks": _sse_frames(model, text)})
-
-    def queue_model_frames(self, model, chunks) -> None:
-        self._queue(model, {"kind": "sse", "chunks": list(chunks)})
-
-    def queue_model_status(self, model, status, body=None, headers=None) -> None:
-        self._queue(
-            model,
-            {
-                "kind": "status",
-                "status": status,
-                "body": body if body is not None else {},
-                "headers": headers or {},
-            },
-        )
-
-    def queue_model_abort(self, model, chunks=()) -> None:
-        self._queue(model, {"kind": "abort", "chunks": list(chunks)})
-
-    # -- routing ---------------------------------------------------------
-
-    async def _chat(self, request):
-        # ``_dispatch`` already read the body; aiohttp caches it, so this is cheap.
-        raw = await request.read()
-        try:
-            body = json.loads(raw.decode("utf-8")) if raw else {}
-        except Exception:
-            body = {}
-        model = body.get("model") if isinstance(body, dict) else None
-        self.sent_models.append(model)
-        queue = self.by_model.get(model)
-        program = queue.popleft() if queue else None
-        if program is None:
-            program = {
-                "kind": "sse",
-                "chunks": _sse_frames(model, "answer from {}".format(model)),
-            }
-        kind = program.get("kind")
-        if kind == "status":
-            return web.json_response(
-                program.get("body") or {},
-                status=program["status"],
-                headers=program.get("headers") or {},
-            )
-        if kind == "abort":
-            # Frames first, then an abrupt drop: no SSE terminator, ever.
-            resp = web.StreamResponse(
-                status=200, headers={"Content-Type": "text/event-stream"}
-            )
-            await resp.prepare(request)
-            for chunk in program.get("chunks") or []:
-                await resp.write(chunk)
-            await asyncio.sleep(0.05)
-            raise RuntimeError("simulated upstream disconnect")
-        resp = web.StreamResponse(
-            status=200, headers={"Content-Type": "text/event-stream"}
-        )
-        await resp.prepare(request)
-        for chunk in program.get("chunks") or []:
-            await resp.write(chunk)
-            await asyncio.sleep(0)
-        with contextlib.suppress(Exception):
-            await resp.write_eof()
-        return resp
 
 
 # --------------------------------------------------------------------------- #
@@ -294,74 +132,15 @@ class _ModelUpstream(_FakeUpstream):
 # --------------------------------------------------------------------------- #
 
 class _GatewayCase(unittest.IsolatedAsyncioTestCase):
-    """Real gateway + real service stack in front of the scripted upstream."""
-
-    MODELS = ("wb-alpha", "wb-beta", "wb-gamma")
-
-    # -- capability guard ------------------------------------------------
-
-    def _require_new_interfaces(self) -> None:
-        """Fail once, clearly, when a decided interface is still missing."""
-        gateway_params = _signature_params(Gateway.__init__)
-        self.assertIn(
-            "router",
-            gateway_params,
-            "Gateway(...) must accept an optional router= keyword",
-        )
-        self.assertIn(
-            "max_request_body_mb",
-            gateway_params,
-            "Gateway(...) must accept max_request_body_mb= (approved default 16)",
-        )
-        self.assertIn(
-            "observe_errors",
-            _signature_params(ChatService.stream),
-            "ChatService.stream must accept observe_errors=",
-        )
-        chat_stream_params = _signature_params(UpstreamClient.chat_stream)
-        for name in ("before_post", "observe_errors"):
-            self.assertIn(
-                name,
-                chat_stream_params,
-                "UpstreamClient.chat_stream must accept {}=".format(name),
-            )
-        for name in ("acquire", "slot"):
-            self.assertIn(
-                "count_rpm",
-                _signature_params(getattr(ConcurrencyGate, name)),
-                "ConcurrencyGate.{} must accept count_rpm=".format(name),
-            )
-        self.assertTrue(
-            asyncio.iscoroutinefunction(getattr(ConcurrencyGate, "consume_rpm", None)),
-            "ConcurrencyGate.consume_rpm must be an async method",
-        )
-
-    # -- lifecycle -------------------------------------------------------
+    """Real gateway + real router in front of a scripted chat backend."""
 
     async def asyncSetUp(self) -> None:
-        self._require_new_interfaces()
-        BASE_TMP.mkdir(parents=True, exist_ok=True)
-        self.data_dir = Path(tempfile.mkdtemp(prefix="wb-rtgw-", dir=str(BASE_TMP)))
-        self.up = _ModelUpstream()
-        await self.up.start()
+        self.data_dir = support.make_temp_dir("wb-rtgw-")
         self.session = aiohttp.ClientSession()
-        self.store = CredentialStore(self.data_dir, MASTER_KEY)
-        self.store.save(dict(SEED_CREDENTIALS))
-        self.manager = AuthManager(
-            self.session, self.store, chat_base=self.up.base, poll_interval=0.01
-        )
-        self.observed = []
-        self.client = UpstreamClient(
-            self.session,
-            self.manager,
-            chat_base=self.up.base,
-            billing_base=self.up.base,
-            web_base=self.up.base,
-            on_error=self._observe,
-        )
-        self.chat = ChatService(self.client)
+        self.chat = support.ScriptedChat(on_error=self._observe)
+        self.catalog = support.StubCatalog(MODELS)
         self.state = StateStore(self.data_dir)
-        self.router = ModelRouter(_routing_section(self.MODELS), self.state)
+        self.router = ModelRouter(_routing_section(MODELS), self.state)
         self.gateway = None
         await self.start_gateway()
 
@@ -370,18 +149,18 @@ class _GatewayCase(unittest.IsolatedAsyncioTestCase):
             with contextlib.suppress(Exception):
                 await self.gateway.stop()
         await self.session.close()
-        await self.up.stop()
+        import shutil
+
         shutil.rmtree(self.data_dir, ignore_errors=True)
 
     # -- fixtures --------------------------------------------------------
 
     def _observe(self, category) -> None:
-        """The real ``on_error`` string observer (sync callable)."""
         self.observed.append(category)
 
-    async def start_gateway(self, *, router=_UNSET, **overrides) -> None:
+    async def start_gateway(self, *, router=_UNSET, catalog=_UNSET, **overrides) -> None:
         params = {
-            "api_key": API_KEY,
+            "api_key": support.API_KEY,
             "host": "127.0.0.1",
             "port": 0,
             "concurrency": 4,
@@ -392,15 +171,18 @@ class _GatewayCase(unittest.IsolatedAsyncioTestCase):
         params.update(overrides)
         if router is _UNSET:
             router = self.router
-        self.gateway = Gateway(self.chat, self.client, router=router, **params)
+        if catalog is _UNSET:
+            catalog = self.catalog
+        self.gateway = Gateway(self.chat, router=router, catalog=catalog, **params)
         await self.gateway.start()
         self.base_url = "http://127.0.0.1:{}".format(self.gateway.bound_port)
 
     async def restart_gateway(self, **overrides) -> None:
+        self.observed = []
         await self.gateway.stop()
         await self.start_gateway(**overrides)
 
-    def headers(self, key=API_KEY) -> dict:
+    def headers(self, key=support.API_KEY) -> dict:
         return {"Authorization": "Bearer " + key} if key else {}
 
     def chat_payload(self, *, model=None, stream=False, **extra) -> dict:
@@ -419,7 +201,7 @@ class _GatewayCase(unittest.IsolatedAsyncioTestCase):
             headers=self.headers(),
         )
 
-    async def post_raw(self, body, *, key=API_KEY, chunked=False):
+    async def post_raw(self, body, *, key=support.API_KEY, chunked=False):
         head = self.headers(key)
         head["Content-Type"] = "application/json"
         if chunked:
@@ -433,68 +215,56 @@ class _GatewayCase(unittest.IsolatedAsyncioTestCase):
             self.base_url + COMPLETIONS_PATH, data=body, headers=head
         )
 
-
-# --------------------------------------------------------------------------- #
-# 1..12 -- routing behaviour through the gateway
-# --------------------------------------------------------------------------- #
-
-class RoutingGatewayTests(_GatewayCase):
-    """The virtual model end to end: models list, failover, budget, observer."""
-
-    # -- 1. catalog ------------------------------------------------------
-
-    async def test_models_listing_appends_the_virtual_entry_only_when_enabled(self):
+    async def get_models(self):
         async with self.session.get(
             self.base_url + MODELS_PATH, headers=self.headers()
         ) as resp:
             self.assertEqual(resp.status, 200)
-            body = await resp.json()
+            return await resp.json()
 
+    async def _setUp(self):  # pragma: no cover - IsolatedAsyncioTestCase hook
+        self.observed = []
+        await super()._setUp()
+
+
+class RoutingThroughGatewayTests(_GatewayCase):
+    """The virtual entry end to end: catalog, failover, no splicing, local 4xx."""
+
+    def setUp(self) -> None:
+        self.observed = []
+
+    # -- catalog ---------------------------------------------------------
+
+    async def test_models_listing_is_exactly_the_local_catalog_plus_the_virtual_entry(self):
+        body = await self.get_models()
         data = body.get("data")
         self.assertIsInstance(data, list)
-        self.assertTrue(data, "the live upstream catalog must still be served")
-
-        real = [
-            item
-            for item in data
-            if isinstance(item, dict) and item.get("upstream_id") == MODEL
-        ]
-        self.assertEqual(len(real), 1, "the real entry must keep its upstream_id")
-        entry = real[0]
-        self.assertEqual(
-            entry.get("id"),
-            "{} [倍率未知]".format(MODEL),
-            "an existing model keeps its multiplier suffix",
-        )
-        for key in ("credits", "effective_credits", "object", "owned_by"):
-            self.assertIn(key, entry, "the existing /v1/models fields must survive")
-
         ids = [item.get("id") for item in data if isinstance(item, dict)]
-        self.assertEqual(ids.count(ORDERED_MODEL_ID), 1, "exactly one virtual entry")
-        self.assertEqual(
-            ids[-1],
-            ORDERED_MODEL_ID,
-            "the virtual entry is appended after the real models",
-        )
+        self.assertEqual(ids, list(MODELS) + [ORDERED_MODEL_ID])
+        for item in data:
+            self.assertEqual(item.get("object"), "model")
+            self.assertEqual(item.get("owned_by"), "workbuddy")
+            self.assertEqual(item.get("created"), 0)
         self.assertEqual(ORDERED_MODEL_ID, "按顺序调用")
 
         await self.restart_gateway(router=None)
-        async with self.session.get(
-            self.base_url + MODELS_PATH, headers=self.headers()
-        ) as resp:
-            self.assertEqual(resp.status, 200)
-            body = await resp.json()
+        body = await self.get_models()
         ids = [item.get("id") for item in body.get("data") or []]
-        self.assertNotIn(
-            ORDERED_MODEL_ID, ids, "a disabled route must not advertise the virtual model"
+        self.assertEqual(
+            ids, list(MODELS), "a disabled route must not advertise the virtual model"
         )
-        self.assertIn("{} [倍率未知]".format(MODEL), ids)
 
-    # -- 2. non-stream failover ------------------------------------------
+    async def test_an_empty_catalog_serves_no_real_model_and_still_hides_no_request(self):
+        await self.restart_gateway(catalog=support.StubCatalog([]))
+        body = await self.get_models()
+        ids = [item.get("id") for item in body.get("data") or []]
+        self.assertEqual(ids, [ORDERED_MODEL_ID])
+
+    # -- failover --------------------------------------------------------
 
     async def test_json_virtual_request_fails_over_and_keeps_the_payload_verbatim(self):
-        self.up.queue_model_status("wb-alpha", 429, {"code": 4290, "msg": "slow"})
-        self.up.queue_model_sse("wb-beta", "beta answer")
+        self.chat.queue_error("wb-alpha", support.upstream_error(502))
+        self.chat.queue_text("wb-beta", "beta answer")
         messages = [
             {"role": "system", "content": "persona"},
             {
@@ -531,14 +301,14 @@ class RoutingGatewayTests(_GatewayCase):
             await resp.release()
 
         self.assertEqual(
-            self.up.sent_models,
+            self.chat.sent_models,
             ["wb-alpha", "wb-beta"],
-            "the upstream may only see the pure candidate ids",
+            "the backend may only see the pure candidate ids",
         )
         self.assertEqual(body.get("model"), "wb-beta", "the answer belongs to the standby")
         self.assertEqual(body["choices"][0]["message"]["content"], "beta answer")
 
-        sent = self.up.chat_bodies()
+        sent = self.chat.chat_bodies()
         self.assertEqual(len(sent), 2)
         expected_keys = {
             "model",
@@ -550,23 +320,18 @@ class RoutingGatewayTests(_GatewayCase):
         }
         for index, call in enumerate(sent):
             self.assertEqual(
-                set(call),
-                expected_keys,
-                "no extra metadata may be added for the upstream",
+                set(call), expected_keys, "no extra metadata may be added for the backend"
             )
             self.assertEqual(call["messages"], messages)
             self.assertEqual(call["tools"], tools)
             self.assertEqual(call["tool_choice"], tool_choice)
             self.assertEqual(call["temperature"], 0.25)
-            self.assertIs(call["stream"], True)
-            self.assertEqual(call["model"], self.up.sent_models[index])
+            self.assertEqual(call["model"], self.chat.sent_models[index])
             self.assertNotIn(ORDERED_MODEL_ID, json.dumps(call, ensure_ascii=False))
 
-    # -- 3. stream failover ----------------------------------------------
-
     async def test_sse_virtual_request_fails_over_and_ends_with_done(self):
-        self.up.queue_model_status("wb-alpha", 503, {"code": 5030})
-        self.up.queue_model_sse("wb-beta", "beta stream")
+        self.chat.queue_error("wb-alpha", support.upstream_error(503))
+        self.chat.queue_text("wb-beta", "beta stream")
 
         resp = await self.post_chat(self.chat_payload(stream=True))
         self.assertEqual(resp.status, 200)
@@ -582,33 +347,11 @@ class RoutingGatewayTests(_GatewayCase):
             json.dumps(events, ensure_ascii=False),
             "the refused candidate may not appear in the client output",
         )
-        self.assertEqual(self.up.sent_models, ["wb-alpha", "wb-beta"])
-
-    # -- 4. a committed stream is never replayed -------------------------
+        self.assertEqual(self.chat.sent_models, ["wb-alpha", "wb-beta"])
 
     async def test_stream_break_after_a_partial_frame_never_splices_two_models(self):
-        self.up.queue_model_abort(
-            "wb-alpha",
-            [
-                _frame(_chunk({"role": "assistant"}, model="wb-alpha")),
-                _frame(
-                    _chunk(
-                        {
-                            "tool_calls": [
-                                {
-                                    "index": 0,
-                                    "id": "call-1",
-                                    "type": "function",
-                                    "function": {"name": "ping", "arguments": "{}"},
-                                }
-                            ]
-                        },
-                        model="wb-alpha",
-                    )
-                ),
-            ],
-        )
-        self.up.queue_model_sse("wb-beta", "beta answer")
+        self.chat.queue_abort("wb-alpha", "partial from alpha")
+        self.chat.queue_text("wb-beta", "beta answer")
 
         resp = await self.post_chat(self.chat_payload(stream=True))
         self.assertEqual(resp.status, 200)
@@ -620,11 +363,10 @@ class RoutingGatewayTests(_GatewayCase):
             await resp.release()
 
         self.assertEqual(
-            self.up.sent_models,
+            self.chat.sent_models,
             ["wb-alpha"],
             "once a frame was emitted the stream belongs to that model",
         )
-        self.assertNotIn("wb-beta", self.up.sent_models)
         self.assertFalse(done, "a broken stream must never get a fabricated [DONE]")
         text = json.dumps(events, ensure_ascii=False)
         self.assertNotIn("beta answer", text, "two models' output must not be spliced")
@@ -633,305 +375,139 @@ class RoutingGatewayTests(_GatewayCase):
             events,
         )
 
-    # -- 5. real 429 handling --------------------------------------------
-
-    async def test_two_real_429s_stop_before_the_third_candidate(self):
-        for model in ("wb-alpha", "wb-beta"):
-            self.up.queue_model_status(model, 429, {"code": 4290}, {"Retry-After": "9"})
-
-        resp = await self.post_chat(self.chat_payload())
-        try:
-            self.assertEqual(
-                resp.status, 429, "an exhausted route is a local 429, never a 502"
-            )
-            retry_after = resp.headers.get("Retry-After")
-            body = await resp.json()
-        finally:
-            await resp.release()
-
-        self.assertIsNotNone(retry_after, "the route must keep the upstream Retry-After")
-        self.assertEqual(body["error"]["type"], "rate_limit_error")
-        self.assertEqual(self.up.sent_models, ["wb-alpha", "wb-beta"])
-        self.assertNotIn(
-            "wb-gamma",
-            self.up.sent_models,
-            "the second real 429 cools the whole route instead of walking on",
-        )
-
-    async def test_account_scope_429_tries_only_the_primary(self):
-        self.up.queue_model_status(
-            "wb-alpha", 429, {"scope": "account"}, {"Retry-After": "30"}
-        )
-        self.up.queue_model_sse("wb-beta", "beta answer")
-
-        resp = await self.post_chat(self.chat_payload())
-        try:
-            self.assertEqual(resp.status, 429)
-            await resp.read()
-        finally:
-            await resp.release()
-
-        self.assertEqual(
-            self.up.sent_models,
-            ["wb-alpha"],
-            "an account-scoped limit must not be handed to the standby model",
-        )
-
-    async def test_retry_after_is_kept_as_the_standby_cooldown(self):
-        self.up.queue_model_status("wb-alpha", 429, {"code": 4290}, {"Retry-After": "7"})
-        self.up.queue_model_sse("wb-beta", "beta answer")
-
-        resp = await self.post_chat(self.chat_payload())
-        try:
-            self.assertEqual(resp.status, 200)
-            body = await resp.json()
-        finally:
-            await resp.release()
-        self.assertEqual(body["choices"][0]["message"]["content"], "beta answer")
-
-        resp = await self.post_chat(self.chat_payload())
-        try:
-            self.assertEqual(resp.status, 200)
-            await resp.read()
-        finally:
-            await resp.release()
-        self.assertEqual(
-            self.up.sent_models,
-            ["wb-alpha", "wb-beta", "wb-beta"],
-            "the 7s Retry-After must keep the primary cooling on the next round",
-        )
-
-    # -- 6. a concrete model is never routed -----------------------------
+    # -- a concrete model never borrows a standby ------------------------
 
     async def test_concrete_model_never_borrows_a_standby(self):
-        self.up.queue_model_status("wb-alpha", 429, {"code": 4290})
-        self.up.queue_model_sse("wb-beta", "beta answer")
+        self.chat.queue_error("wb-alpha", support.upstream_error(502))
+        self.chat.queue_text("wb-beta", "beta answer")
 
         resp = await self.post_chat(self.chat_payload(model="wb-alpha"))
         try:
-            self.assertEqual(resp.status, 429)
+            self.assertEqual(resp.status, 502)
             await resp.read()
         finally:
             await resp.release()
 
-        self.assertEqual(
-            self.up.sent_models,
-            ["wb-alpha"],
-            "a request for a concrete model is forwarded verbatim and never routed",
-        )
+        self.assertEqual(self.chat.sent_models, ["wb-alpha"])
 
-    # -- 7. the virtual id without a route -------------------------------
+    # -- local 4xx -------------------------------------------------------
 
     async def test_virtual_model_with_routing_disabled_is_a_fixed_local_4xx(self):
         await self.restart_gateway(router=None)
-
         resp = await self.post_chat(self.chat_payload())
         try:
-            self.assertEqual(
-                resp.status,
-                400,
-                "a virtual model with routing disabled must be a fixed local 400",
-            )
+            self.assertEqual(resp.status, 400)
+            body = await resp.json()
+        finally:
+            await resp.release()
+        self.assertEqual(body["error"]["type"], "invalid_request_error")
+        self.assertIn(ORDERED_MODEL_ID, body["error"]["message"])
+        self.assertEqual(self.chat.sent_models, [], "a local 400 never asks the backend")
+
+    async def test_unknown_model_is_a_fixed_local_4xx(self):
+        resp = await self.post_chat(self.chat_payload(model="wb-not-in-catalog"))
+        try:
+            self.assertEqual(resp.status, 400)
+            body = await resp.json()
+        finally:
+            await resp.release()
+        self.assertEqual(body["error"]["type"], "invalid_request_error")
+        self.assertIn("wb-not-in-catalog", body["error"]["message"])
+        self.assertIn("/v1/models", body["error"]["message"])
+        self.assertEqual(self.chat.sent_models, [])
+
+    async def test_an_oversized_model_id_is_rejected_without_echoing_it(self):
+        # ``model`` 能顶满整个请求体上限（默认 16 MB），而这道检查排在限流之前：
+        # 原样拼进错误文本就等于把网关当放大器；不掐长度它还会进 argv 和日志。
+        huge = "wb-" + "x" * 4096
+        resp = await self.post_chat(self.chat_payload(model=huge))
+        try:
+            self.assertEqual(resp.status, 400)
+            body = await resp.json()
+        finally:
+            await resp.release()
+        self.assertEqual(body["error"]["type"], "invalid_request_error")
+        self.assertNotIn("x" * 64, body["error"]["message"], "错误文本不许回声请求体")
+        self.assertEqual(self.chat.sent_models, [], "本地 400 不碰后端")
+
+    async def test_an_empty_catalog_does_not_reject_anything(self):
+        # 清单还没读成过（CLI 没装 / 装晚了一步）：此时拒绝一切请求只会把"还没准备好"
+        # 变成"永远不能用"。
+        await self.restart_gateway(catalog=support.StubCatalog([]))
+        self.chat.queue_text("wb-anything", "ok")
+        resp = await self.post_chat(self.chat_payload(model="wb-anything"))
+        try:
+            self.assertEqual(resp.status, 200)
+            await resp.read()
+        finally:
+            await resp.release()
+        self.assertEqual(self.chat.sent_models, ["wb-anything"])
+
+    async def test_a_config_only_catalog_is_advisory_instead_of_a_refusal(self):
+        # ``--help`` 从第一次就没读成（冷启动超时、CLI 被换掉）：清单里只有
+        # ``models.json`` 那几条 ``custom-local:``。它照样被当成允许列表的话，内置
+        # 模型会全部 400——跟"子集顶替全集"那个 bug 同一个症状，只是发生在首次读取
+        # 这条路上。子集不够格拦人：放行，让 CLI 报真实错误。
+        await self.restart_gateway(
+            catalog=support.StubCatalog([CUSTOM_PREFIX + "wb-local"], source="config")
+        )
+        self.chat.queue_text("wb-builtin", "ok")
+        resp = await self.post_chat(self.chat_payload(model="wb-builtin"))
+        try:
+            self.assertEqual(resp.status, 200)
+            await resp.read()
+        finally:
+            await resp.release()
+        self.assertEqual(self.chat.sent_models, ["wb-builtin"], "降级清单不许拦人")
+
+    async def test_a_missing_catalog_skips_the_check_entirely(self):
+        await self.restart_gateway(catalog=None)
+        self.chat.queue_text("wb-anything", "ok")
+        resp = await self.post_chat(self.chat_payload(model="wb-anything"))
+        try:
+            self.assertEqual(resp.status, 200)
             await resp.read()
         finally:
             await resp.release()
 
+    # -- observer --------------------------------------------------------
+
+    async def test_candidate_failures_are_not_announced_but_a_direct_failure_is(self):
+        self.observed = []
+        self.chat.queue_error("wb-alpha", support.upstream_error(502))
+        self.chat.queue_text("wb-beta", "beta answer")
+
+        resp = await self.post_chat(self.chat_payload())
+        try:
+            await resp.read()
+        finally:
+            await resp.release()
         self.assertEqual(
-            self.up.hits[("POST", CHAT_PATH)], 0, "no upstream request may be made"
+            self.observed, [], "a standby attempt that succeeded is not an incident"
         )
-        encoded = ORDERED_MODEL_ID.encode("utf-8")
-        for call in self.up.calls:
-            self.assertNotIn(
-                encoded, call["body"], "the Chinese virtual id must never reach the upstream"
-            )
 
-    # -- 7b. the virtual id's own display alias, still without a route ---
+        self.observed = []
+        self.chat.queue_error("wb-beta", support.upstream_error(502))
+        resp = await self.post_chat(self.chat_payload(model="wb-beta"))
+        try:
+            await resp.read()
+        finally:
+            await resp.release()
+        self.assertEqual(self.observed, ["upstream"], "a real failure is announced once")
 
-    async def test_virtual_display_alias_with_routing_disabled_is_the_same_fixed_local_4xx(
-        self,
-    ):
-        """``"按顺序调用 [倍率未知]"`` is the virtual id, not a concrete model.
+    # -- budget ----------------------------------------------------------
 
-        The alias is this plugin's own standard suffix (``credits.upstream_model_id``
-        strips exactly that shape), so it normalizes to the pure virtual id and
-        must land on the *same* fixed local ``400 invalid_request_error``: no
-        upstream chat POST, no 5xx from a missing/disabled router, and no routing
-        round recorded.  Both route states are covered by one real HTTP request
-        each -- ``router=None`` and a real router whose route is ``enabled=False``.
+    async def test_every_real_attempt_spends_one_permit(self):
+        """额度按"真的问了一次上游"计：两个候选的一轮花两个额度。
+
+        迁移到 ACP 之后每一次候选尝试都是一次真实的 CLI prompt，所以
+        ``AcpChatBackend`` 是按次扣的（见 ``core/acp/backend.py`` 里
+        ``consume_rpm`` 的位置）。网关自己只判不扣，于是这里要验的是"判"：
+        额度花光后同一分钟内再来一个请求必须是本地 429。
         """
-        alias = "{} [倍率未知]".format(ORDERED_MODEL_ID)
-        self.assertNotEqual(alias, ORDERED_MODEL_ID, "the alias must differ textually")
-        self.assertEqual(
-            upstream_model_id(alias),
-            ORDERED_MODEL_ID,
-            "the '[倍率未知]' suffix is the standard alias, so the gateway's own "
-            "normalization reaches the pure virtual id",
-        )
-
-        disabled_router = ModelRouter(
-            _routing_section(self.MODELS, enabled=False), self.state
-        )
-        cases = (
-            ("router=None", None, self.router),
-            ("router enabled=False", disabled_router, disabled_router),
-        )
-        for label, router, watched in cases:
-            with self.subTest(routing=label):
-                await self.restart_gateway(router=router)
-                before = self.up.hits[("POST", CHAT_PATH)]
-
-                resp = await self.post_chat(self.chat_payload(model=alias))
-                try:
-                    self.assertEqual(
-                        resp.status,
-                        400,
-                        "the virtual id's own alias is the same fixed local 400 as "
-                        "the pure id, never a 5xx",
-                    )
-                    self.assertIn(
-                        "application/json",
-                        resp.headers.get("Content-Type", ""),
-                        "the refusal stays an OpenAI-compatible JSON error",
-                    )
-                    body = await resp.json()
-                finally:
-                    await resp.release()
-
-                error = (body or {}).get("error") or {}
-                self.assertEqual(
-                    error.get("type"),
-                    "invalid_request_error",
-                    "a disabled-route refusal is a request-validation error",
-                )
-                self.assertEqual(
-                    self.up.hits[("POST", CHAT_PATH)],
-                    before,
-                    "no upstream chat request may be made for the alias",
-                )
-                self.assertIsNone(
-                    watched.status().get("last_result"),
-                    "a refused alias must not record a routing round",
-                )
-
-    # -- 8. the rpm budget bounds the failover ---------------------------
-
-    async def test_single_rpm_budget_stops_the_standby_attempt(self):
-        await self.restart_gateway(concurrency=1, queue_size=2, rpm=1)
-        self.up.queue_model_status("wb-alpha", 429, {"code": 4290})
-        self.up.queue_model_sse("wb-beta", "beta answer")
-        self.up.queue_model_sse("wb-gamma", "gamma answer")
-
-        resp = await self.post_chat(self.chat_payload())
-        try:
-            self.assertEqual(
-                resp.status,
-                429,
-                "an exhausted budget is a local 429 for the client, never a 502",
-            )
-            body = await resp.json()
-        finally:
-            await resp.release()
-
-        self.assertEqual(body["error"]["type"], "rate_limit_error")
-        self.assertEqual(
-            self.up.sent_models,
-            ["wb-alpha"],
-            "the standby attempt must not exceed the chat rpm budget",
-        )
-        self.assertNotIn("wb-gamma", self.up.sent_models)
-
-    # -- 9/10. the budget also bounds a refresh resend -------------------
-
-    async def test_refresh_resend_is_refused_when_the_budget_is_spent(self):
-        await self.restart_gateway(concurrency=1, queue_size=2, rpm=1)
-        self.up.queue_model_status("wb-alpha", 401, {"code": 1001, "msg": "expired"})
-        self.up.queue_model_sse("wb-alpha", "never streamed")
-        self.up.queue_model_sse("wb-beta", "beta answer")
-
-        resp = await self.post_chat(self.chat_payload())
-        try:
-            self.assertEqual(
-                resp.status,
-                429,
-                "the refused resend is a local 429, not an upstream transport error",
-            )
-            await resp.read()
-        finally:
-            await resp.release()
-
-        self.assertEqual(
-            self.up.hits[("POST", CHAT_PATH)],
-            1,
-            "only the first chat POST may be sent when the budget is 1",
-        )
-        self.assertEqual(
-            self.up.refresh_hits, 1, "the token refresh itself is not a chat rpm"
-        )
-        self.assertEqual(self.up.sent_models, ["wb-alpha"])
-
-    async def test_two_rpm_allows_the_refresh_resend_then_blocks_the_next_request(self):
-        await self.restart_gateway(concurrency=1, queue_size=2, rpm=2)
-        self.up.queue_model_status("wb-alpha", 401, {"code": 1001, "msg": "expired"})
-        self.up.queue_model_sse("wb-alpha", "after refresh")
-
-        resp = await self.post_chat(self.chat_payload())
-        try:
-            self.assertEqual(resp.status, 200)
-            body = await resp.json()
-        finally:
-            await resp.release()
-        self.assertEqual(body["choices"][0]["message"]["content"], "after refresh")
-        self.assertEqual(self.up.hits[("POST", CHAT_PATH)], 2)
-        self.assertEqual(self.up.refresh_hits, 1)
-
-        before = self.up.hits[("POST", CHAT_PATH)]
-        resp = await self.post_chat(self.chat_payload(model=MODEL))
-        try:
-            self.assertEqual(
-                resp.status, 429, "both permits are spent, so the next request is refused"
-            )
-            await resp.read()
-        finally:
-            await resp.release()
-        self.assertEqual(
-            self.up.hits[("POST", CHAT_PATH)],
-            before,
-            "a refused request must never reach the upstream",
-        )
-
-    # -- 11. one slot serves the whole round; growth shares the budget ---
-
-    async def test_single_concurrency_round_fails_over_without_deadlock(self):
-        await self.restart_gateway(concurrency=1, queue_size=1, rpm=2)
-        self.up.queue_model_status("wb-alpha", 429, {"code": 4290})
-        self.up.queue_model_sse("wb-beta", "beta answer")
-
-        resp = await asyncio.wait_for(self.post_chat(self.chat_payload()), 10.0)
-        try:
-            self.assertEqual(
-                resp.status, 200, "the standby attempt runs inside the already held slot"
-            )
-            body = await resp.json()
-        finally:
-            await resp.release()
-
-        self.assertEqual(body["choices"][0]["message"]["content"], "beta answer")
-        self.assertEqual(self.up.sent_models, ["wb-alpha", "wb-beta"])
-        self.assertEqual(self.gateway.limits.active, 0, "the round must release its slot")
-        self.assertEqual(self.gateway.limits.queued, 0)
-
-        # Both permits were consumed by the round: a direct growth call is now
-        # refused on the *same* gate, so gateway and growth chat share a budget.
-        with self.assertRaises(LimitExceeded):
-            await self.chat.complete(
-                {"model": MODEL, "messages": [{"role": "user", "content": "hi"}]}
-            )
-
-    # -- 12. candidate failures are silent, ordinary ones are not --------
-
-    async def test_candidate_failures_are_not_announced_but_normal_429s_are(self):
-        self.up.queue_model_status("wb-alpha", 429, {"code": 4290})
-        self.up.queue_model_sse("wb-beta", "beta answer")
+        self.chat.queue_error("wb-alpha", support.upstream_error(502))
+        self.chat.queue_text("wb-beta", "beta answer")
+        await self.restart_gateway(rpm=2)
 
         resp = await self.post_chat(self.chat_payload())
         try:
@@ -939,24 +515,47 @@ class RoutingGatewayTests(_GatewayCase):
             await resp.read()
         finally:
             await resp.release()
-        self.assertEqual(
-            self.observed,
-            [],
-            "an absorbed candidate failure must not be reported as an error",
-        )
 
-        self.up.queue_model_status(MODEL, 429, {"code": 4290})
-        resp = await self.post_chat(self.chat_payload(model=MODEL))
+        # 备用尝试不额外占**并发**名额，但两个额度确实是这一轮花掉的。
+        resp = await self.post_chat(self.chat_payload(model="wb-beta"))
         try:
             self.assertEqual(resp.status, 429)
             await resp.read()
         finally:
             await resp.release()
-        self.assertIn(
-            "rate",
-            self.observed,
-            "an ordinary chat failure must still reach the observer (no global mute)",
-        )
+
+    async def test_single_concurrency_round_fails_over_without_deadlock(self):
+        self.chat.queue_error("wb-alpha", support.upstream_error(502))
+        self.chat.queue_text("wb-beta", "beta answer")
+        await self.restart_gateway(concurrency=1, queue_size=0)
+
+        resp = await self.post_chat(self.chat_payload())
+        try:
+            self.assertEqual(resp.status, 200)
+            await resp.read()
+        finally:
+            await resp.release()
+        self.assertEqual(self.chat.sent_models, ["wb-alpha", "wb-beta"])
+
+    async def test_a_local_limit_error_is_never_reported_as_an_upstream_failure(self):
+        self.observed = []
+        await self.restart_gateway(rpm=1, concurrency=1, queue_size=0)
+
+        self.chat.queue_text(MODELS[0], "first")
+        resp = await self.post_chat(self.chat_payload(model=MODELS[0]))
+        try:
+            await resp.read()
+        finally:
+            await resp.release()
+
+        resp = await self.post_chat(self.chat_payload(model=MODELS[0]))
+        try:
+            self.assertEqual(resp.status, 429)
+            body = await resp.json()
+        finally:
+            await resp.release()
+        self.assertEqual(body["error"]["type"], "rate_limit_error")
+        self.assertEqual(self.observed, [], "a local limit is not an upstream incident")
 
 
 # --------------------------------------------------------------------------- #
@@ -965,6 +564,9 @@ class RoutingGatewayTests(_GatewayCase):
 
 class RequestBodyLimitTests(_GatewayCase):
     """The gateway itself enforces the configured body limit, byte-exactly."""
+
+    def setUp(self) -> None:
+        self.observed = []
 
     async def test_default_limit_accepts_a_body_above_the_aiohttp_one_mib_default(self):
         body = _body_of_exact_bytes(int(1.12 * _MIB))
@@ -981,12 +583,12 @@ class RequestBodyLimitTests(_GatewayCase):
         finally:
             await resp.release()
 
-        sent = self.up.chat_bodies()
+        sent = self.chat.chat_bodies()
         self.assertEqual(len(sent), 1)
         self.assertGreater(
             len(sent[0]["messages"][0]["content"].encode("utf-8")),
             _MIB,
-            "the whole body must reach the upstream",
+            "the whole body must reach the backend",
         )
 
     async def test_one_mib_limit_accepts_just_below_and_rejects_above(self):
@@ -1020,7 +622,6 @@ class RequestBodyLimitTests(_GatewayCase):
         under = _body_of_exact_bytes(_MIB - 4, prefix="中文内容")
         self.assertLess(len(under), _MIB)
 
-        # Multibyte, with Content-Length: bytes are what count.
         resp = await self.post_raw(over)
         try:
             self.assertEqual(resp.status, 413)
@@ -1036,7 +637,6 @@ class RequestBodyLimitTests(_GatewayCase):
         finally:
             await resp.release()
 
-        # Chunked (no Content-Length at all): the streamed byte count decides.
         resp = await self.post_raw(over, chunked=True)
         try:
             self.assertEqual(
@@ -1076,8 +676,27 @@ class RequestBodyLimitTests(_GatewayCase):
             message,
             "the message must say which setting to change",
         )
-        for leak in (marker, API_KEY, AT_OLD):
+        for leak in (marker, support.API_KEY, support.SEED_CREDENTIALS["accessToken"]):
             self.assertNotIn(leak, text, "the 413 body must not echo request data")
+
+    async def test_a_prompt_that_overflows_one_frame_is_a_413_with_guidance(self):
+        # 请求体在 ``max_request_body_mb`` 以内，但内容装不进一帧。这不是上游故障，
+        # 回 "upstream request failed" 只会把调用方引去查网络。
+        self.chat.queue_error(MODELS[0], support.upstream_error(413))
+
+        resp = await self.post_chat(self.chat_payload(model=MODELS[0]))
+        try:
+            self.assertEqual(resp.status, 413)
+            text = await resp.text()
+        finally:
+            await resp.release()
+
+        error = (json.loads(text) or {}).get("error") or {}
+        self.assertEqual(error.get("type"), "request_too_large")
+        self.assertEqual(error.get("code"), "request_too_large")
+        message = error.get("message") or ""
+        self.assertNotIn("upstream request failed", message, "这不是上游出事的文案")
+        self.assertIn("缩减", message, "得说清调用方能做什么")
 
     async def test_malformed_json_is_still_400_and_distinct_from_413(self):
         await self.restart_gateway(max_request_body_mb=1)
@@ -1111,7 +730,7 @@ class RequestBodyLimitTests(_GatewayCase):
 
     async def test_oversized_virtual_request_never_reaches_the_route(self):
         await self.restart_gateway(max_request_body_mb=1)
-        self.up.queue_model_sse("wb-alpha", "alpha answer")
+        self.chat.queue_text("wb-alpha", "alpha answer")
 
         resp = await self.post_raw(
             _body_of_exact_bytes(_MIB + 64, model=ORDERED_MODEL_ID)
@@ -1124,11 +743,8 @@ class RequestBodyLimitTests(_GatewayCase):
             await resp.release()
 
         self.assertEqual(
-            self.up.hits[("POST", CHAT_PATH)],
-            0,
-            "a 413 must never touch the upstream",
+            self.chat.sent_models, [], "a 413 must never touch the backend"
         )
-        self.assertEqual(self.up.sent_models, [])
         self.assertIsNone(
             self.router.status().get("last_result"),
             "a 413 must not consume a candidate or record a round",
@@ -1139,7 +755,7 @@ class GatewayBodyLimitConfigTests(unittest.TestCase):
     """The approved setting: ``gateway.max_request_body_mb``, default 16."""
 
     def test_gateway_settings_expose_the_sixteen_mib_default(self):
-        gateway = (load_settings({}).get("gateway") or {})
+        gateway = load_settings({}).get("gateway") or {}
         self.assertIn(
             "max_request_body_mb",
             gateway,
@@ -1149,7 +765,7 @@ class GatewayBodyLimitConfigTests(unittest.TestCase):
             gateway["max_request_body_mb"], 16, "the approved default is 16 MiB"
         )
 
-        custom = (load_settings({"gateway": {"max_request_body_mb": 3}}).get("gateway") or {})
+        custom = load_settings({"gateway": {"max_request_body_mb": 3}}).get("gateway") or {}
         self.assertEqual(custom.get("max_request_body_mb"), 3)
 
     def test_invalid_body_limits_are_rejected_without_echo(self):
@@ -1163,6 +779,17 @@ class GatewayBodyLimitConfigTests(unittest.TestCase):
                 self.assertNotIn(
                     marker, message, "the raw setting value leaked into the error"
                 )
+
+
+class GatewayInterfaceTests(unittest.TestCase):
+    def test_gateway_has_no_upstream_client_and_no_alias_mapping(self):
+        """网关不再认识"上游客户端"，也不再做显示别名到模型 ID 的翻译。"""
+        import inspect
+
+        params = set(inspect.signature(Gateway.__init__).parameters)
+        self.assertIn("catalog", params)
+        self.assertIn("router", params)
+        self.assertNotIn("client", params)
 
 
 if __name__ == "__main__":  # pragma: no cover
