@@ -121,6 +121,12 @@ class WorkBuddyPlugin(Star):
         self.catalog = None
 
         self._login_task = None
+        # 登录、登出、拆卸三条路都要「读走—取消—收尸」同一条 ``_login_task``。
+        # 没有这把锁，两条命令交错时谁都能把对方的任务从槽里摘走再各塞一条新的：
+        # 留下的那条没人认领，攥着运行时和 token 一直跑下去，而命令已经回了
+        # "已退出登录"。锁只圈换任务这一小段——``_begin_login`` 等扫码的那几秒
+        # 必须在锁外，不然一条登出能被登录链接堵住。
+        self._login_task_lock = asyncio.Lock()
         # 定时重读模型清单的那条任务；同一时刻只允许存在一条。
         self._model_refresh_task = None
         # 已经作废、但还有子进程没死的池。``AcpRuntimePool.shutdown()`` 关不掉的
@@ -373,13 +379,11 @@ class WorkBuddyPlugin(Star):
         # Block new notifications before any producer is stopped.
         self._notify_stopped = True
 
-        login_task = self._login_task
-        self._login_task = None
-        if login_task is not None and not login_task.done():
-            login_task.cancel()
-            # 同 ``_logout``：不用 ``suppress(BaseException)``，它分不清"我们自己
-            # 取消的那条"与"外层把 release 本身取消了"。
-            await asyncio.gather(login_task, return_exceptions=True)
+        # 拆卸也要走同一把锁：一条登录命令正卡在换任务那一步时，这里读到的
+        # ``None`` 只是"它还没塞进去"，不是"没有登录在跑"。摘空了就等于把一条
+        # 攥着运行时和 token 的协程留在拆卸之后。
+        async with self._login_task_lock:
+            await self._cancel_login_task()
 
         # 定时重读必须停在 ``self.catalog`` 被丢掉之前：它每轮最后一步是发布候选，
         # 而 ``catalog`` 已置空时发布等于把候选刷成只剩已保存的那几项。cancel 只是
@@ -914,23 +918,30 @@ class WorkBuddyPlugin(Star):
     # login / logout
     # ------------------------------------------------------------------ #
 
+    async def _cancel_login_task(self) -> None:
+        """把在跑的登录协程摘下来、取消、收尸。
+
+        调用方必须持有 ``self._login_task_lock``。「读走—取消—收尸」三件事拆开做，
+        两条命令交错时都能读到 ``None``，各自再塞一条新任务进去：后塞的那条没人
+        取消，攥着运行时和 token 活到下次登录。
+        """
+        existing = self._login_task
+        self._login_task = None
+        if existing is None or existing.done():
+            return
+        existing.cancel()
+        # 收尸不用 ``suppress(BaseException)``：它分不清"我们自己取消的那条"与
+        # "外层取消了这个协程"——两者抛的都是 ``CancelledError``，一 suppress 就
+        # 把重载/卸载时的取消一起咽了，函数接着往下走（登录处会去发起新的登录，
+        # 退出登录处会边被取消边删凭据）。``gather`` 把前者的 ``CancelledError``
+        # 收成返回值，后者照常往外抛。
+        await asyncio.gather(existing, return_exceptions=True)
+
     async def _begin_login(self, event: AstrMessageEvent) -> str:
         pool = self.acp
         if pool is None:
             return "ACP 运行时尚未初始化，请重载插件后再试。"
         runtime = pool.primary
-        existing = self._login_task
-        self._login_task = None
-        if existing is not None and not existing.done():
-            existing.cancel()
-            # 收尸不用 ``suppress(BaseException)``：它分不清"我们自己取消的那条"与
-            # "外层取消了这个协程"——两者抛的都是 ``CancelledError``，一 suppress 就
-            # 把重载/卸载时的取消一起咽了，函数接着往下走（登录处会去发起新的登录，
-            # 退出登录处会边被取消边删凭据）。``gather`` 把前者的 ``CancelledError``
-            # 收成返回值，后者照常往外抛。
-            await asyncio.gather(existing, return_exceptions=True)
-
-        self._notify_umo = event.unified_msg_origin
         captured = {"url": None}
         ready = asyncio.Event()
         # 这条命令的回复一旦交出去，再推一次链接就是第二份。只有"回复里没有链接"的
@@ -950,11 +961,16 @@ class WorkBuddyPlugin(Star):
                 task = asyncio.create_task(self._notify("登录链接：\n" + url))
                 task.add_done_callback(self._consume_task)
 
-        task = asyncio.create_task(
-            self._run_acp_login(runtime, _on_auth_url), name="wb-acp-login"
-        )
-        self._login_task = task
-        task.add_done_callback(self._consume_task)
+        # 换任务这一段要在锁里：否则正在跑的登出会把"槽里是 None"当成"没有登录在
+        # 跑"，取消落空之后再让它把这条新任务塞进去。
+        async with self._login_task_lock:
+            await self._cancel_login_task()
+            self._notify_umo = event.unified_msg_origin
+            task = asyncio.create_task(
+                self._run_acp_login(runtime, _on_auth_url), name="wb-acp-login"
+            )
+            self._login_task = task
+            task.add_done_callback(self._consume_task)
 
         # 链接通常几百毫秒内到达；最多等几秒，拿到就回复，拿不到也先把登录任务
         # 留着等扫码，不重复发起第二次 authenticate。
@@ -1069,16 +1085,10 @@ class WorkBuddyPlugin(Star):
         return True
 
     async def _logout(self) -> str:
-        existing = self._login_task
-        self._login_task = None
-        if existing is not None and not existing.done():
-            existing.cancel()
-            # 收尸不用 ``suppress(BaseException)``：它分不清"我们自己取消的那条"与
-            # "外层取消了这个协程"——两者抛的都是 ``CancelledError``，一 suppress 就
-            # 把重载/卸载时的取消一起咽了，函数接着往下走（登录处会去发起新的登录，
-            # 退出登录处会边被取消边删凭据）。``gather`` 把前者的 ``CancelledError``
-            # 收成返回值，后者照常往外抛。
-            await asyncio.gather(existing, return_exceptions=True)
+        # 跟 ``_begin_login`` 用同一把锁，只圈"摘走并取消"这一小段。后面删凭据、
+        # 关进程要几秒，攥着锁会把一条并发的登录整个堵住。
+        async with self._login_task_lock:
+            await self._cancel_login_task()
         # 标记"这次登出是有意的"：凭据是被主动清掉的，中途出岔子也不该弹一条假的
         # 告警。**置在这里而不是函数开头**——上面那步被取消时进程没关、凭据也没删，
         # 什么都不该留下；而这个标志是告警的闸门，漏在 True 上就等于从此不再报任何

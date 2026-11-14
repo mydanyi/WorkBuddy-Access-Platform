@@ -368,6 +368,7 @@ class _StubAcpRuntime:
         block=False,
         link_delay=0.0,
         after_link=None,
+        logout_ends_login=True,
     ):
         self.url = url
         self.block = block
@@ -375,6 +376,10 @@ class _StubAcpRuntime:
         # 链接刚交出去的那一刻要做的事（同步）。用来把"链接已到手"与"回复还没交出去"
         # 这个窗口钉死——测试里靠它换掉 ``plugin.acp``，不用赌调度顺序。
         self.after_link = after_link
+        # 真运行时退出登录会关掉进程，挂着的那条 ``login()`` 跟着结束。并发命令的用例
+        # 要的正是"没人来收这条登录"，所以留一个开关：关掉它就等于"登出没把这条登录
+        # 收走"，泄漏才看得见。
+        self.logout_ends_login = logout_ends_login
         self.calls = 0
         self.closed = False
         self._gate = asyncio.Event()
@@ -405,7 +410,8 @@ class _StubAcpRuntime:
         return {"authUrl": self.url, "result": {}}
 
     async def logout(self, *, purge_config=False):
-        self._gate.set()
+        if self.logout_ends_login:
+            self._gate.set()
         if purge_config:
             # 镜像真实运行时：凭据在 data_dir/cli-home 下，退出登录就删掉。
             shutil.rmtree(os.path.join(str(_PLUGIN_DATA), "cli-home"), ignore_errors=True)
@@ -1198,6 +1204,42 @@ class _PluginIntegrationTestCase(unittest.IsolatedAsyncioTestCase):
             await pending
 
         self.assertFalse(plugin._logout_in_progress, "登出没做成，闸门不许关上")
+
+    async def test_a_login_started_during_logout_does_not_outlive_it(self):
+        # 登出先把 ``_login_task`` 摘空、再等它咽气；这中间进来的登录读到的是空槽。
+        # 没有同一把锁，它就会自己另起一条：登出的取消落在空槽上、照样回"已退出
+        # 登录"，那条登录却还活着——扫完码会再走一遍 ``_on_login_success``，把凭据
+        # 写回去，而命令早就说过已经退出了。
+        plugin = await self._make_plugin(**self._make_ready_plugin_config())
+        runtime = _StubAcpRuntime(block=True, logout_ends_login=False)
+        plugin.acp = _StubAcpPool(runtime)
+
+        async def _slow_to_die():
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                # 拖一下，把"摘空槽位"和"塞进新任务"之间拉出一条缝。
+                await asyncio.sleep(0.2)
+                raise
+
+        plugin._login_task = asyncio.create_task(_slow_to_die())
+        login = asyncio.create_task(
+            _invoke(plugin.wb, _make_event("wb login"), "login", "")
+        )
+        await asyncio.sleep(0.05)
+        logout = asyncio.create_task(
+            _invoke(plugin.wb, _make_event("wb logout"), "logout", "")
+        )
+        await asyncio.wait_for(asyncio.gather(login, logout), timeout=5)
+
+        task = plugin._login_task
+        leaked = task is not None and not task.done()
+        if leaked:
+            # 让留下那条自己收尾，别把"协程还没跑完"的警告带进下一轮。
+            runtime._gate.set()
+            with contextlib.suppress(BaseException):
+                await asyncio.wait_for(task, timeout=5)
+        self.assertFalse(leaked, "登出之后不许留下一条还在跑的登录：它会把凭据写回去")
 
     # -- 5b. logout revokes; manual signin allowed when auto is off -------
     async def test_logout_revokes_and_manual_signin_allowed_when_auto_disabled(self):

@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import sys
 import unittest
 from pathlib import Path
@@ -24,6 +25,8 @@ from astrbot_plugin_workbuddy.core.acp import (  # noqa: E402
     AcpClient,
     AcpError,
     AcpFrameTooLarge,
+    AcpProcessError,
+    AcpTimeoutError,
     AcpTransport,
 )
 from astrbot_plugin_workbuddy.core.acp.backend import (  # noqa: E402
@@ -617,6 +620,49 @@ class LeaseRefusalTests(unittest.IsolatedAsyncioTestCase):
     async def test_a_closed_pool_becomes_a_503(self):
         exc = await self._status_for("acp runtime pool is closed")
         self.assertEqual(exc.status, 503)
+
+
+class LazyStartFailureTests(unittest.IsolatedAsyncioTestCase):
+    """懒启动失败要分得清"上游卡住"和"装错了"。
+
+    握手超时时进程已经起来了，只是 ``initialize`` 没在期限内回话：换个候选确实可能
+    成功，所以必须是可重试的 504。路径配错则是每个候选都会以同样的方式失败，留在
+    ``ChatStreamError`` 上——换成 ``UpstreamError`` 会让路由把主备顺序挨个试一遍、
+    再给每个模型扣一次 60 秒冷却，最后还是同一个 502。
+    """
+
+    class _FailingRuntime:
+        def __init__(self, error):
+            self._error = error
+
+        async def ensure_started(self):
+            raise self._error
+
+    class _Pool:
+        def __init__(self, runtime):
+            self._runtime = runtime
+
+        @contextlib.asynccontextmanager
+        async def lease(self, model):
+            yield self._runtime
+
+    async def _drain(self, error):
+        backend = AcpChatBackend(
+            None,
+            pool=self._Pool(self._FailingRuntime(error)),
+            model="glm-5.2",
+        )
+        return [chunk async for chunk in backend.stream(_payload())]
+
+    async def test_a_handshake_timeout_maps_to_504(self):
+        with self.assertRaises(UpstreamError) as ctx:
+            await self._drain(AcpTimeoutError("initialize timed out"))
+        self.assertEqual(ctx.exception.status, 504)
+
+    async def test_a_missing_cli_is_still_a_config_error(self):
+        with self.assertRaises(ChatStreamError) as ctx:
+            await self._drain(AcpProcessError("no such file"))
+        self.assertEqual(ctx.exception.status, 502)
 
 
 if __name__ == "__main__":

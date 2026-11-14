@@ -27,13 +27,15 @@ OpenAI 的 chunk 形状。只要这一层产出同样的形状，网关、流式
 * 进程中途不可用 → ``UpstreamError(502)``；
 * 其余 JSON-RPC 错误 → ``UpstreamError(502)``；
 * CLI 根本起不来（路径错 / 没装）→ ``ChatStreamError(status=502)``；
+* 懒启动的握手超时 → ``UpstreamError(504)``，见下；
 * 坏帧 → ``ChatStreamError``；一帧正文都没有 → ``ChatStreamError``。
 
 **为什么「进程不可用」是 ``UpstreamError`` 而「起不来」是 ``ChatStreamError``**：
 ``core.routing`` 只在 ``UpstreamError`` 且状态可重试、且还没吐出任何正文时换下一个
 候选。进程中途死掉、卡住、或这一轮被上游拒掉，换一条进程换个模型确实可能成功；而
 ``acp.cli_path`` 配错时每个候选都会以同样的方式起不来，那属于配置错误，不该让路由
-把整条主备顺序挨个试一遍、再给每个模型扣一次 60 秒冷却。
+把整条主备顺序挨个试一遍、再给每个模型扣一次 60 秒冷却。**握手超时不算"起不来"**：
+进程已经 spawn 出来了，只是 ``initialize`` 不回话，那是上游卡住，照 504 走。
 
 **接线状态：已接进生产链路。** ``main.py`` 的 ``_build_gateway`` 用
 ``AcpChatBackend(None, pool=self.acp)`` 装配网关的聊天后端，CLI 由
@@ -330,10 +332,26 @@ class AcpChatBackend:
                 # 懒启动：第一轮聊天才拉起 CLI。起不来就是"进程不可用"，不是登录问题。
                 try:
                     client = await runtime.ensure_started()
+                except AcpTimeoutError as exc:
+                    # 握手超时不是"装错了"：进程已经起来了，只是 ``initialize`` 没在
+                    # 期限内回话。那是上游卡住，按 504 报出去，路由才有机会换下一个
+                    # 候选；混进下面那条配置错误的 502 里，一次卡死会被当成路径写错，
+                    # 一个候选都不换，管理员收到的仍是那句"服务异常"。
+                    _log.warning(
+                        "acp: the CLI for model %r never finished the handshake: %s",
+                        model,
+                        exc,
+                    )
+                    raise UpstreamError(504) from exc
                 except AcpError as exc:
                     # CLI 没装、路径配错、argv 非法，在这一层之后长得跟"上游挂了"
                     # 一模一样：网关回 502，管理员收到"上游服务异常"，没有任何东西
                     # 说得出是装错了。这条日志就是那个唯一的分辨点。
+                    #
+                    # 这里的 ``AcpProcessError``（压根没 spawn 起来）**故意**留在
+                    # ``ChatStreamError``：路径配错时每个候选都会以同样的方式失败，
+                    # 换成 ``UpstreamError`` 会让路由把主备顺序挨个试一遍、再给每个
+                    # 模型扣一次 60 秒冷却，最后还是同一个 502。
                     _log.warning(
                         "acp: failed to start the CLI for model %r: %s", model, exc
                     )
