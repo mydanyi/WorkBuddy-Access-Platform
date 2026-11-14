@@ -1146,18 +1146,22 @@ class WorkBuddyPlugin(Star):
         return True
 
     async def _logout(self) -> str:
-        # 跟 ``_begin_login`` 用同一把锁，只圈"摘走并取消"这一小段。后面删凭据、
-        # 关进程要几秒，攥着锁会把一条并发的登录整个堵住。
-        async with self._login_task_lock:
-            # 关门跟摘任务是同一个动作的两半。只取消、不关门的话，这之后起来的登录
-            # 谁也不管——等它扫完码把凭据写回去，这边刚好清完场，回复还是"已退出
-            # 登录"。标志在锁里置位，``_begin_login`` 也在锁里看它，两边同一把锁。
-            self._logout_pending = True
-            await self._cancel_login_task()
+        # 整个开场都在 ``try`` 里，包括置位与取消登录那一步：取消正好落在
+        # ``_cancel_login_task()`` 的收尸上时，清场根本没开始，标志却已经立起来了。
+        # 漏在 ``True`` 上就等于此后每一条 ``/wb login`` 都被挡在"正在退出登录"，
+        # 只能重载插件——而这正是本条要防的那种"关不掉的门"。
         try:
+            # 跟 ``_begin_login`` 用同一把锁，只圈"摘走并取消"这一小段。后面删凭据、
+            # 关进程要几秒，攥着锁会把一条并发的登录整个堵住。
+            async with self._login_task_lock:
+                # 关门跟摘任务是同一个动作的两半。只取消、不关门的话，这之后起来的
+                # 登录谁也不管——等它扫完码把凭据写回去，这边刚好清完场，回复还是
+                # "已退出登录"。标志在锁里置位，``_begin_login`` 也在锁里看它。
+                self._logout_pending = True
+                await self._cancel_login_task()
             return await self._finish_logout()
         finally:
-            # 失败也要开闸：卡在 True 上等于从此不许登录，只能重载插件。
+            # 失败、取消都开闸：卡在 True 上等于从此不许登录。
             self._logout_pending = False
 
     async def _finish_logout(self) -> str:

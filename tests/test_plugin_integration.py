@@ -547,6 +547,21 @@ class _PoolThatLogsOutSlowly(_StubAcpPool):
         await super().logout(purge_config=purge_config)
 
 
+class _LoginThatRefusesToDie:
+    """取消之后还赖着不走的登录任务：把"登出被取消"那个窗口撑开。"""
+
+    def __init__(self):
+        self.cancelled_at = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def run(self):
+        try:
+            await asyncio.sleep(3600)
+        except asyncio.CancelledError:
+            self.cancelled_at.set()
+            await self.release.wait()
+
+
 class _StubEvent:
     """只带 ``_begin_login`` 真会读到的那一个字段。"""
 
@@ -1054,6 +1069,23 @@ class _PluginIntegrationTestCase(unittest.IsolatedAsyncioTestCase):
             await asyncio.wait_for(attempt, 10.0), "正在退出登录，请稍后再试。"
         )
         self.assertFalse(plugin._logout_pending, "清完场要开闸，不然从此不许登录")
+
+    async def test_a_cancelled_logout_does_not_leave_the_login_gate_shut(self):
+        # 取消正好落在"取消登录"那一步的收尸上：清场一行都没跑，标志却已经立起来。
+        # 不跟着收的话，此后每一条 ``/wb login`` 都被挡在"正在退出登录"，只能重载。
+        plugin = await self._make_plugin(**self._make_ready_plugin_config())
+        stubborn = _LoginThatRefusesToDie()
+        plugin._login_task = asyncio.create_task(stubborn.run())
+
+        out = asyncio.create_task(plugin._logout())
+        await asyncio.wait_for(stubborn.cancelled_at.wait(), 5.0)
+        out.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await out
+
+        self.assertFalse(plugin._logout_pending, "登出被取消，闸门也得跟着开")
+        stubborn.release.set()
+        await asyncio.sleep(0)
 
     async def test_logout_refuses_to_purge_while_a_retired_pool_lives(self):
         # 作废池里的子进程同样攥着 token，而 ``pool.logout()`` 只看活着的那个池。

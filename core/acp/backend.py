@@ -481,7 +481,17 @@ class AcpChatBackend:
                     status=503,
                 ) from None
             return
-        yield self._runtime
+        runtime = self._runtime
+        bound = getattr(runtime, "model", None)
+        if bound and model and bound != model:
+            # 运行时的模型是**启动参数**，换不了。拿 A 的进程去答 B 的请求，还会在
+            # ``_chunk`` 里把响应标成 B——调用方以为在跟 B 说话，实际答的是 A。
+            # 这种部署只服务一个模型，别的名字当场拒，别装作能答。
+            raise ChatStreamError(
+                "this deployment serves a single model and cannot answer another",
+                status=400,
+            )
+        yield runtime
 
     @staticmethod
     def _finish_reason(stop_reason):

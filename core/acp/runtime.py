@@ -234,6 +234,12 @@ class AcpRuntime:
             ):
                 return self._client
             await self._discard()
+            if self._closed:
+                # ``_discard`` 里有 await：等旧子进程退出的这段时间，``shutdown()``
+                # 完全可能已经开跑了（它先置 ``_closed``，再来等这把 ``_start_lock``）。
+                # 此时还往下走，就是在关机的路上又拉起一条 CLI——shutdown 得陪着它
+                # 把握手走完才关得掉，而它本来只想关掉手上那条。
+                raise AcpError("acp runtime is closed")
             if self._transport is not None:
                 # ``_discard`` 只在进程真的死了才摘引用。这里还留着一条，说明上一次
                 # 关不掉：再拉一条新的就把它从 ``self._transport`` 上顶掉，那条进程

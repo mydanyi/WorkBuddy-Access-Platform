@@ -252,20 +252,11 @@ class AcpClient:
             yield {"kind": KIND_DONE, "stop_reason": stop_reason}
         finally:
             self._transport.unsubscribe(session_id, queue)
+            # **先停下发送，再喊取消。** 反过来（先 notify、后 cancel）有一段窗口：
+            # ``session/cancel`` 已经写出去，而那条任务手里还攥着一个没落地的
+            # ``session/prompt``——它随后落地，CLI 就开始生成一轮没人取消的回答。
+            # ACP 的 cancel 打的是"正在进行的那一轮"，追不上后面才来的 prompt。
             try:
-                # 只要这一轮没有正常收尾，上游就还在跑：超时、RPC 错误、消费者
-                # 提前退出都算。不发 cancel，CLI 会把这一轮生成到底——额度白烧。
-                if not completed:
-                    with contextlib.suppress(Exception):
-                        await asyncio.wait_for(
-                            self._transport.notify(
-                                M_SESSION_CANCEL, {"sessionId": session_id}
-                            ),
-                            2.0,
-                        )
-            finally:
-                # 收尾本身也要 finally：上面最多会等 2 秒，这期间若外层被取消，
-                # 后面的回收就全被跳过，留下一个跑到天荒地老的幽灵任务。
                 try:
                     if not task.done():
                         task.cancel()
@@ -275,13 +266,28 @@ class AcpClient:
                     if not task.cancelled():
                         raise
                 finally:
+                    # 只要这一轮没有正常收尾，上游就还在跑：超时、RPC 错误、消费者
+                    # 提前退出都算。不发 cancel，CLI 会把这一轮生成到底——额度白烧。
+                    # 这一段本身也要 finally：上面等那条任务时若外层被取消，取消通知
+                    # 就再也发不出去，而那一轮是真的还在跑。
                     if not completed:
-                        if outcome.done() and not outcome.cancelled():
-                            # runner 已经把异常挂在 outcome 上，但没人 await 过它。
-                            # 不取走会在 future 回收时打出 never-retrieved 告警。
-                            outcome.exception()
-                        elif not outcome.done():
-                            outcome.cancel()
+                        with contextlib.suppress(Exception):
+                            await asyncio.wait_for(
+                                self._transport.notify(
+                                    M_SESSION_CANCEL, {"sessionId": session_id}
+                                ),
+                                2.0,
+                            )
+            finally:
+                # 收尾本身也要 finally：上面最多会等 2 秒，这期间若外层被取消，
+                # 后面的回收就全被跳过，留下一个跑到天荒地老的幽灵任务。
+                if not completed:
+                    if outcome.done() and not outcome.cancelled():
+                        # runner 已经把异常挂在 outcome 上，但没人 await 过它。
+                        # 不取走会在 future 回收时打出 never-retrieved 告警。
+                        outcome.exception()
+                    elif not outcome.done():
+                        outcome.cancel()
 
 
 __all__ = ["AcpClient", "KIND_DONE", "AcpRpcError", "AcpProcessError"]

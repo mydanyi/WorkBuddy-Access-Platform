@@ -245,6 +245,33 @@ class StartTests(RuntimeTestCase):
         with self.assertRaises(AcpError):
             await runtime.ensure_started()
 
+    async def test_a_shutdown_during_discard_blocks_the_restart(self):
+        # ``ensure_started`` 已经进门（拿着 ``_start_lock``）、正卡在 ``_discard`` 里
+        # 等旧进程退出，``shutdown()`` 这时进来置了 ``_closed`` 再去等锁。醒来之后
+        # 不复查就直接 spawn，等于在关机的路上又拉起一条 CLI——shutdown 得陪着它
+        # 把握手走完才关得掉。
+        runtime = self.make_runtime()
+        entered = asyncio.Event()
+        gate = asyncio.Event()
+        real_discard = runtime._discard
+
+        async def _slow_discard():
+            entered.set()
+            await gate.wait()
+            await real_discard()
+
+        with mock.patch.object(runtime, "_discard", _slow_discard):
+            starter = asyncio.ensure_future(runtime.ensure_started())
+            await asyncio.wait_for(entered.wait(), 5.0)
+            closer = asyncio.ensure_future(runtime.shutdown())
+            await asyncio.sleep(0)  # 让 shutdown 先置 ``_closed``，再来等那把锁
+            gate.set()
+
+            with self.assertRaises(AcpError):
+                await asyncio.wait_for(starter, 10.0)
+            await asyncio.wait_for(closer, 10.0)
+        self.assertIsNone(runtime.transport, "关机路上不许再拉起一条")
+
     async def test_a_restart_is_refused_while_the_previous_child_is_alive(self):
         # ``_discard`` 关不掉时会把引用留在身上（那条进程还握着 token）。若这里照旧
         # 拉一条新的，引用一被顶掉，旧的那条就再也没人认领：池子数不到、关不掉。

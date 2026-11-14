@@ -680,5 +680,23 @@ class LazyStartFailureTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(ctx.exception.status, 502)
 
 
+class SingleRuntimeModelTests(unittest.IsolatedAsyncioTestCase):
+    """注入单条运行时的部署：模型是启动参数，答不了别的名字。"""
+
+    class _Runtime:
+        model = "glm-5.2"
+
+        async def ensure_started(self):  # pragma: no cover - 拒绝路径不该走到这里
+            raise AssertionError("不同名字的请求不该把这条运行时拉起来")
+
+    async def test_a_different_model_is_rejected_instead_of_relabelled(self):
+        # 拿 A 的进程去答 B 的请求，``_chunk`` 还会把响应标成 B：调用方以为在跟 B
+        # 说话，实际答的是 A。这种部署只服务一个模型，别的名字当场拒。
+        backend = AcpChatBackend(None, runtime=self._Runtime(), model="glm-5.2")
+        with self.assertRaises(ChatStreamError) as ctx:
+            [chunk async for chunk in backend.stream(_payload(model="glm-5.3"))]
+        self.assertEqual(ctx.exception.status, 400)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
