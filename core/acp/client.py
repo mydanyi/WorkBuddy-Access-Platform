@@ -45,7 +45,7 @@ KIND_DONE = "done"
 # ``@register(...)`` 一致**：这一串会进 ``initialize`` 的 ``clientInfo.version``，
 # 是 CLI 那边唯一能知道"谁在跟我说话"的东西，报个陈旧版本等于让它按旧行为对待。
 # 三处各写一遍是既有技术债，改版本时一起改。
-CLIENT_VERSION = "0.3.0"
+CLIENT_VERSION = "0.4.0"
 
 
 class AcpClient:

@@ -95,7 +95,7 @@ HELP_TEXT = """WorkBuddy 指令（仅管理员私聊）：
     "astrbot_plugin_workbuddy",
     "mydanyi",
     "将 WorkBuddy 接入 AstrBot：通过官方 CodeBuddy CLI 的 ACP 通道提供 OpenAI 兼容 API（普通/流式）、扫码登录、自动签到、模型列表与主备模型按顺序调用，以及可配置管理员 QQ 的签到与异常通知。",
-    "0.3.0",
+    "0.4.0",
 )
 class WorkBuddyPlugin(Star):
     """The single WorkBuddy entry point."""
