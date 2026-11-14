@@ -1,0 +1,599 @@
+"""按模型分进程的 CLI 池。
+
+**为什么必须是多个进程。** ``--model`` 是进程启动参数：ACP 没有"换模型"的请求，
+``session/new`` 也不收模型，一条进程从头到尾只用启动时那一个模型。想让调用方
+指定哪个模型就用哪个，只能按模型各起一条。另一个看似更省事的做法是
+``session/set_config_option``——但那是 CLI 自己声明的可选项，不同账号下内容不同
+（有的账号只有 ``mode``），拿它当模型开关会在部分账号上静默失效。宁可多一个进程，
+也不要一个"看起来切了其实没切"的开关。
+
+**为什么要设上限。** 每条进程是一个 Node 运行时，几十 MB 起。模型清单可能有十几
+个，全都常驻就是把插件变成内存黑洞。上限到顶时淘汰**最久未用的空闲进程**：正在
+出字的一律不碰——杀掉一个正在回答的进程，比多占几十 MB 严重得多。
+
+**为什么淘汰用 ``shutdown`` 而不是 ``close``。** 淘汰掉的运行时必须彻底作废：它
+从池里被摘掉后不会再有人拿到它，但万一有旧引用还捏着，``close`` 之后
+``ensure_started`` 还能把进程再拉起来——那条进程活过了插件生命周期，再也没人回收。
+``shutdown`` 让它永久失效。
+
+**默认模型那条是"主运行时"。** 登录、凭据读取、token 刷新都只要有一条能说话的
+进程，跟聊天用的是不是同一个模型无关。池把默认模型那条标成 primary：它不会被淘汰，
+``main`` 通过它登录与刷新，聊天请求打到同一个模型时复用同一条进程，不会多起一条。
+"""
+
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import logging
+from contextlib import asynccontextmanager
+
+from .protocol import AcpError
+
+_log = logging.getLogger(__name__)
+
+# 登出前等在手租约退出的上限（秒）。一轮长输出不该把 ``/wb logout`` 拖到它结束。
+_LOGOUT_DRAIN_SECONDS = 5.0
+
+
+def _sort_key(model):
+    """``None``（默认模型）排在最前，其余按字典序；``None`` 不能直接参与比较。"""
+    return (0, "") if model is None else (1, model)
+
+
+def _normalize(model):
+    """把调用方给的模型名归一成池里的键：空串与非字符串都是"CLI 自己的默认模型"。
+
+    ``get`` 与 ``lease`` 都走它。两份各写一遍的结果今天一样，但只要归一规则改一次
+    （比如允许去空白），``_runtimes`` 与 ``_busy`` 就会用上两个不同的键，占用计数
+    从此对不上号——所以只留一份实现。
+    """
+    return model if isinstance(model, str) and model.strip() else None
+
+
+class AcpRuntimePool:
+    """按模型懒创建 :class:`core.acp.runtime.AcpRuntime`，并保证进程数有上限。"""
+
+    def __init__(self, factory, *, max_processes=2, primary_model=None):
+        """
+        ``factory`` 是 ``(model) -> AcpRuntime``。池自己不认识命令行、目录或超时：
+        那些都是装配参数，由调用方一次配好。
+        """
+        if (
+            isinstance(max_processes, bool)
+            or not isinstance(max_processes, int)
+            or max_processes < 1
+        ):
+            raise ValueError("max_processes must be a positive integer")
+        if not callable(factory):
+            raise ValueError("factory must be callable")
+        self._factory = factory
+        self._max = max_processes
+        # 跟 ``get`` / ``lease`` 用同一个归一：``""`` 与空白串在这儿若原样存下来，
+        # 主运行时会被记在 ``None`` 这个键上，而淘汰时比的是 ``model != 主键``——
+        # 两个键永远不等，主运行时就成了可淘汰的。``max_processes=1`` 时一条备用
+        # 领取就能把主进程关掉，``CliCredentials`` 随后还会握着那条死运行时。
+        self._primary_model = _normalize(primary_model)
+        # 模型 ID → 运行时。只放"当前有效"的；被淘汰的会从这里摘掉。
+        self._runtimes = {}
+        # 模型 ID → 正在它上面跑的请求数。只有 0 才允许淘汰。
+        self._busy = {}
+        # 模型 ID → 最近一次领取的序号，用来挑最久未用的那个。
+        self._last_used = {}
+        self._sequence = 0
+        self._trim_lock = asyncio.Lock()
+        self._closed = False
+        # 登出期间大于 0。见 :meth:`logout`：光把进程关掉不够，这中间进来的请求会
+        # 把进程重新拉起来、握着 token，然后凭据被删——用户看到"已退出"而账号还在。
+        #
+        # 用深度而不是布尔：登出可以被连按两次，后一次先收工时把闸门放开，前一次
+        # 还在往下走（马上要删凭据）。那段时间放进来的租约照样能拉起一条握着 token
+        # 的进程，而删除就在它后面发生——闸门必须等到**最后一个**登出结束。
+        self._logout_depth = 0
+        # 已经摘出 ``_runtimes``、但子进程还没死的那几条。它们对 ``_runtimes``
+        # 已经不可见，登出前必须单独盯一眼，否则"淘汰正撞上登出"就是漏网之鱼：
+        # 凭据删掉了，而那条进程还握着 token。真关掉了才从这里出账。
+        self._evicting = set()
+        # 其中**已经有调用方在关**的那几条。两次 trim 交叠并不罕见（进出 lease 都会
+        # 调），而关闭必须在锁外 await：后到的那次会在账上看见前一次正在关的条目，
+        # 于是重复关、重复计数，还把别人的在飞当成占位多淘汰一条。盖上戳就都看不见了。
+        self._closing = set()
+        # 每次登出自增一次。租约进门时记一份，``trim()`` 回来再比一次：登出可能在
+        # 它等的这段时间里开始、甚至已经跑完（闸门又放开了），只查登出深度看不出
+        # 来——而那一刻放行，调用方随后就会在"已退出登录"之后拉起一条 CLI。
+        self._epoch = 0
+
+    # -- 只读视图 -----------------------------------------------------------
+
+    @property
+    def primary(self):
+        """默认模型那条运行时（登录 / 凭据 / 刷新都走它）。"""
+        return self.get(self._primary_model)
+
+    @property
+    def max_processes(self) -> int:
+        return self._max
+
+    @property
+    def has_live_children(self) -> bool:
+        """池里是否还有子进程活着（映射里的与账上的都算）。
+
+        ``shutdown()`` 把映射清空、没关掉的那几条留在 ``_evicting`` 上，所以关完之后
+        只看账就够；关之前却必须两处都看——只数账的话，一个刚建好、还没关过的池会报
+        "没有活口"，而它的 ``_runtimes`` 里全是进程。
+
+        持有者据此决定"这个池能不能丢"：关不干净的池一旦被丢掉，那条 CLI 就活过插件
+        生命周期，而账本也跟着一起没了，谁都没法再试一次（见 ``main.py`` 的
+        ``_retired_pools``）。
+        """
+        return any(
+            runtime.started
+            for runtime in list(self._runtimes.values()) + list(self._evicting)
+        )
+
+    @property
+    def auth_state(self):
+        """整池的登录态：``True`` / ``False`` / ``None``（未知）。
+
+        凭据文件是**所有**进程共用的那一份，所以只要有一条进程真跑通过，整池就是
+        已登录——别的进程说"未登录"只是它启动得比登录早，不代表账号没了。反过来
+        全都明确失败才算未登录；一条都没验证过就是未知，不猜。
+
+        "共用一份凭据"也意味着换账号**必须走** :meth:`logout`：直接覆盖登录会让
+        旧进程带着旧账号的 token 继续活着，而它报的 ``True`` 会把整池说成已登录。
+        """
+        states = [runtime.auth_state for runtime in self._runtimes.values()]
+        if any(state is True for state in states):
+            return True
+        if states and all(state is False for state in states):
+            return False
+        return None
+
+    def status(self) -> dict:
+        """状态页要的只读快照：哪些模型有进程、哪条在跑。
+
+        模型 ID 原样给出（``None`` 表示"用 CLI 自己的默认模型"）；排序时把 ``None``
+        排在最前，免得它和字符串比较时把整个状态页拖崩。
+        """
+        return {
+            "max_processes": self._max,
+            "primary_model": self._primary_model,
+            "models": sorted(self._runtimes, key=_sort_key),
+            "running": sorted(
+                (model for model, runtime in self._runtimes.items() if runtime.started),
+                key=_sort_key,
+            ),
+        }
+
+    # -- 领取 ---------------------------------------------------------------
+
+    def get(self, model=None):
+        """取该模型的运行时（首次只创建对象，不 spawn）。
+
+        同步方法：它不 await，于是不可能在"我刚检查完就被人换掉"的窗口里出错。
+        真正的进程拉起在 :meth:`core.acp.runtime.AcpRuntime.ensure_started`。
+
+        **上限只在 :meth:`lease` 上成立。** ``get`` 不 trim，所以拿它的返回值直接
+        ``ensure_started`` 就能绕过 ``max_processes`` 堆进程。除了登录/刷新那条
+        "只要一条能说话的进程"的路径（它走 :attr:`primary`），聊天一律走 ``lease``。
+        """
+        if self._closed:
+            raise AcpError("acp runtime pool is closed")
+        key = _normalize(model)
+        runtime = self._runtimes.get(key)
+        if runtime is None:
+            runtime = self._factory(key)
+            self._runtimes[key] = runtime
+        self._sequence += 1
+        self._last_used[key] = self._sequence
+        return runtime
+
+    def busy(self, model=None) -> int:
+        """该模型上正在跑的请求数；0 意味着它随时可以被淘汰。
+
+        占用计数是"淘汰谁"的唯一依据，靠 LRU 顺序去反推它会把用例钉死在当前淘汰
+        策略上，所以测试从这里读。状态页**没有**接这个接口（它要的是
+        :meth:`status` 那几个列表）——别因为这句注释以为接线已经做了。
+        """
+        return self._busy.get(_normalize(model), 0)
+
+    @asynccontextmanager
+    async def lease(self, model=None):
+        """占用该模型的运行时直到本轮结束：占用期间它不会被淘汰。"""
+        if self._closed:
+            raise AcpError("acp runtime pool is closed")
+        if self._logout_depth:
+            # 登出正在关进程、删凭据。这一刻放一条请求进去，它会把 CLI 重新拉起、
+            # 握着还没被删的 token，然后凭据被删掉——命令回复"已退出登录"，而这条
+            # 进程还活着，下次刷新会把凭据原样写回来。
+            raise AcpError("acp runtime pool is logging out")
+        key = _normalize(model)
+        epoch = self._epoch
+        runtime = self.get(key)
+        self._busy[key] = self._busy.get(key, 0) + 1
+        try:
+            # 先淘汰再交出去：这样"新起一条"与"收掉一条空闲"在同一轮里完成，
+            # 稳态下进程数不会越过上限。
+            await self.trim()
+            if self._closed:
+                # 池在 ``trim()`` 等着的时候被永久关掉了。``shutdown()`` 不碰登出深度、
+                # 也不动 ``_epoch``（那两样是登出专用的），只查它们会放行一条刚被
+                # ``_close_batch`` 关掉的运行时——调用方拿到一条作废的池里的死运行
+                # 时，紧接着的 ``ensure_started()`` 只会撞上"运行时已关闭"。
+                raise AcpError("acp runtime pool is closed")
+            if self._logout_depth or self._epoch != epoch:
+                # 进门之后才开始、甚至已经跑完的登出。``trim()`` 可能等了很久，
+                # 久到凭据已经被删、闸门重新放开——只查登出深度会漏掉后半段，而
+                # 这一刻放行，调用方下一次 ``ensure_started()`` 就会在用户看到
+                # "已退出登录"之后拉起一条 CLI。
+                raise AcpError("acp runtime pool is logging out")
+            yield runtime
+        finally:
+            remaining = self._busy.get(key, 1) - 1
+            if remaining < 0:
+                # 只有 lease 自己写这个计数，减穿只可能是本模块的 bug。静默 pop 会
+                # 把它藏成"淘汰策略随机失灵"，当场炸出来反而好定位。带上模型键，
+                # 否则看到这条只能靠栈去猜是哪一条。
+                self._busy.pop(key, None)
+                raise AcpError(
+                    "acp runtime pool busy counter went negative for model "
+                    "{!r}".format(key)
+                )
+            if remaining == 0:
+                self._busy.pop(key, None)
+                # 释放之后再收一次：并发冷启动会让两条进程同时越过限额（谁都不空闲，
+                # trim 当时挑不出牺牲者），等它们陆续结束，这里才是真正能收的时候。
+                # 没超额时这一步只看一眼列表就返回，不 spawn、不关任何东西。
+                with contextlib.suppress(Exception):
+                    await self.trim()
+            else:
+                self._busy[key] = remaining
+
+    # -- 登录 / 登出 --------------------------------------------------------
+
+    async def logout(self, *, purge_config=False) -> None:
+        """退出登录：先关掉**全部**进程，再删凭据与配置。
+
+        只关主运行时不够。别的模型进程还活着，手里握着 token，会把凭据原样写回去，
+        而命令已经回复用户"已退出登录"——那正是 ``AcpRuntime.logout`` 的注释里要
+        根除的那个谎话，只是换了一条进程来犯。
+
+        光"先关再删"也不够：``close_all`` 只调 ``close()``，而 ``close()`` 之后
+        ``ensure_started()`` 能把进程再拉起来。登出这两步之间只要进来一条聊天请求，
+        它就会拉起一条新进程、握着还没删的 token，然后凭据被删掉。所以整个期间抬高
+        :attr:`_logout_depth`，让 :meth:`lease` 直接拒掉新请求——宁可让这一刻的聊天
+        拿到 503，也不要留一条登不掉的进程。
+
+        ``AcpRuntime.logout`` 自己不需要活进程：它拿 ``self._transport``，为 ``None``
+        就只删目录。所以 ``close_all`` 之后直接调它是安全的，不会反过来又 spawn 一条。
+        """
+        self._logout_depth += 1
+        # 先记这一笔，再开始关：在飞的租约回来时比的是"有没有登出过"，而不是
+        # "此刻是不是正在登出"。见 :meth:`lease`。
+        self._epoch += 1
+        try:
+            await self._drain_leases()
+            await self.close_all()
+            if purge_config:
+                # 凭据是**共享**的一份：只要还有一条进程活着，删掉之后它手里的 token
+                # 照样能刷新、能写回磁盘。主运行时有自己的守卫（``AcpRuntime.logout``
+                # 会看 ``transport.alive``），备用进程没有——所以这里统一验一遍。
+                # 关不掉就不删：宁可这次登出失败，也不要留一条"已经退出登录"却仍握着
+                # token 的进程。
+                #
+                # 验之前先等在飞淘汰落地：``trim()`` 是**先摘、后关**，那一段里子进程
+                # 还活着而对 ``_runtimes`` 已经不可见，只查映射就是把它放过去了。
+                #
+                # 账上那几条（淘汰时没关掉的）先自己再关一次，再开始等：
+                # ``close_all`` 只管映射里的，``_drain_evictions`` 只等不关。淘汰那次
+                # 失败不代表这次也失败；不试的话，只要那条进程迟迟不退，每次登出都会
+                # 撞在"还有活进程"上，凭据永远删不掉。正在被别的任务关的那几条由
+                # ``_strays`` 跳过，两边不会抢同一笔。
+                await self._retry_evictions()
+                await self._drain_evictions()
+                if any(
+                    runtime.started
+                    for runtime in list(self._runtimes.values()) + list(self._evicting)
+                ):
+                    raise AcpError("acp process is still running")
+            await self.primary.logout(purge_config=purge_config)
+            if purge_config:
+                # 登录态是**每条**运行时各记一份的，成功聊过一轮的备用模型会是 True。
+                # 只更新主运行时的话，凭据已经删干净、网关也停了，而
+                # ``auth_state`` 因为"有一条 True"仍然报告已登录。
+                for runtime in list(self._runtimes.values()):
+                    runtime.note_logged_out()
+        finally:
+            self._logout_depth -= 1
+
+    async def _drain_leases(self) -> None:
+        """等**已经进了闸门**的租约退出，再开始关进程、删凭据。
+
+        闸门只拦新请求。先前已经进来的那条仍握着运行时，``close_all()`` 关不掉它
+        手里那一步"稍后 ``ensure_started()``"——那一步会在凭据被删之前把 CLI 重新
+        拉起、握着还没删的 token，然后凭据被删，而进程活着，下次刷新又把凭据写回来。
+        闸门既已置位，计数只降不升，等一等就一定收敛。
+
+        也不能无限等：一轮长输出会把登出拖到它自己结束为止。超时就照常往下关——
+        那条请求本来也要被登出打断。
+        """
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + _LOGOUT_DRAIN_SECONDS
+        while any(self._busy.values()):
+            if loop.time() >= deadline:
+                _log.warning(
+                    "pool: logout proceeded with %d model(s) still leased",
+                    len(self._busy),
+                )
+                return
+            await asyncio.sleep(0.02)
+
+    async def _drain_evictions(self) -> None:
+        """等在飞淘汰落地，再让登出去验存活。
+
+        ``trim()`` 先把运行时摘出 ``_runtimes``、再去 ``await`` 关进程——中间那一段
+        子进程还活着，而 ``close_all()`` 已经看不见它了。正常情况下淘汰几十毫秒就完
+        （CLI 收到 stdin EOF 自己退），等一等就能照常删凭据；等不到就把判断交给调用方
+        的存活检查，那一步会拒绝删。宁可多等这几秒，也不要留一条握着 token 的活进程。
+
+        上限跟 :meth:`_drain_leases` 共用同一个常量：两者都是"等一件本该很快的事"，
+        没有任何理由为它们各调一个魔数。
+        """
+        # 账上可能只剩尸体：淘汰那次 `shutdown()` 超时返回，之后进程自己慢慢退了。
+        # 那没什么可等的，先划掉——否则每次登出都白等满 5 秒再说"还在飞"。
+        self._forget_dead()
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + _LOGOUT_DRAIN_SECONDS
+        while self._evicting:
+            if loop.time() >= deadline:
+                _log.warning(
+                    "pool: logout proceeded with %d eviction(s) still in flight",
+                    len(self._evicting),
+                )
+                return
+            await asyncio.sleep(0.02)
+
+    # -- 回收 ---------------------------------------------------------------
+
+    def _forget_dead(self) -> None:
+        """把账上已经死掉的划掉。
+
+        进程会自己退：淘汰那次 `shutdown()` 超时返回，过一会儿它还是走了。尸体留在
+        账上没有用处——它不占位（占位只看 ``started``），却会让 ``_drain_evictions``
+        以为还有事在飞，白等满一个窗口。
+
+        **正在关的那几条不算尸体。** ``started`` 说的是"子进程还没退"，而关闭在锁外
+        await：这中间 ``started`` 可能已经变假，关闭本身却还没收工——真到那一步就撒手，
+        等于替一次**还没结束**的关闭下了"它死了"的结论。等那一轮 ``trim()`` 的
+        ``finally`` 收完，它自己会出账（判据同样是 ``started``）。
+        """
+        self._evicting.difference_update(
+            runtime
+            for runtime in list(self._evicting)
+            if not runtime.started and runtime not in self._closing
+        )
+
+    def _strays(self):
+        """账上那几条：已经摘出映射、子进程还活着、而且没人在关它。
+
+        "没人在关"这一条不能少。关闭在锁外 await，另一个 trim 会在这段里看见它——
+        它既不能算占位（有人在收了），也不能被再关一次（两边都会按"关完 not started"
+        记一笔，同一个进程数出两条）。
+        """
+        return [
+            runtime
+            for runtime in self._evicting
+            if runtime.started and runtime not in self._closing
+        ]
+
+    def _occupied(self):
+        """占着进程位的两拨，返回 ``(映射里的模型, 账上还活着的条数)``。
+
+        只数映射会把上限悄悄放宽成"上限 + 漏网的条数"，而每漏一次就多放宽一条：
+        淘汰失败之后，池子以为自己有空位，接着拉起新进程，超出的部分再也没人收。
+
+        调用方必须持 ``_trim_lock``。
+        """
+        models = [
+            model
+            for model, runtime in self._runtimes.items()
+            if runtime.started or self._busy.get(model)
+        ]
+        return models, len(self._strays())
+
+    async def _reclaim_strays(self) -> int:
+        """超编时把账上那几条再关一次，返回这次真关掉的条数。
+
+        它们已经不在映射里、没有调用方还能领取，关掉就是白赚一个位子。**只在超编
+        时试**：正常流量不该为一个罕见的分支付一整个关闭超时。关不掉的照旧留在账
+        上，下一轮或 :meth:`shutdown` 接着来。
+        """
+        async with self._trim_lock:
+            models, stray = self._occupied()
+            if len(models) + stray <= self._max:
+                return 0
+        return await self._retry_evictions()
+
+    async def _retry_evictions(self) -> int:
+        """把账上还没死、也没人在关的那几条再关一次，返回真关掉的条数。
+
+        跟 :meth:`_reclaim_strays` 只差一个条件：**这里不看是否超编**。登出关心的是
+        "还有没有活进程"，与池子挤不挤没关系——只按超编重试的话，池子闲下来之后账
+        上那条就再也没人碰，而它未必永远不退；登出便会一直卡在"还有活进程"上，凭据
+        一个字节也删不掉。
+
+        关闭对每条是有界的（``AcpRuntime.close`` 给传输层 3 秒），所以就算那几条全
+        都杀不掉，这里也只会多花"账上条数 × 3 秒"，不会挂死。关不掉的照旧留在账上。
+        """
+        async with self._trim_lock:
+            strays = self._strays()
+            if not strays:
+                return 0
+            # 先盖戳再放锁：盖完这一笔，别的 trim 就看不见它们了。
+            self._closing.update(strays)
+        try:
+            return await self._close_batch(strays, "shutdown")
+        finally:
+            self._closing.difference_update(strays)
+            self._evicting.difference_update(
+                runtime for runtime in strays if not runtime.started
+            )
+
+    async def trim(self) -> int:
+        """把空闲进程收到上限以内，返回真正关掉的条数。
+
+        选"最久未用的空闲进程"淘汰。挑不到（全在忙）就停手：宁可暂时超额，也不动
+        正在出字的进程。主运行时永不淘汰。
+
+        **占位算的是"起来的 + 正在被领取的 + 账上还没死的"。** 只数 ``runtime.started``
+        会漏掉窗口：``lease`` 里先 ``trim`` 再交给调用方，而进程是调用方稍后
+        ``ensure_started()`` 才拉起来的。只数已启动的话，"先领 A 再领 B"两次都能通过
+        限额检查，最后两条进程一起活着；释放时又没人收，上限形同虚设。账上那几条同理
+        ——它们不在映射里，但子进程确实还在占内存。
+
+        返回值只数**真关掉**的：``shutdown()`` 抛异常的那条算没关掉；正常返回但子进程
+        还活着的（``started`` 仍为真）也算没关掉。少报一条总比报一条假的强，而且和
+        下面出账用的是同一个判据——不能账本说它活着、返回值说它关掉了。
+
+        摘出映射的同时把这条记进 ``_evicting``。它从此对 ``_runtimes`` 不可见，而
+        关闭还没落地——登出那一刻正好落在这段里，就会删掉凭据、留下一条握着 token
+        的活进程。关干净了才出账；关不掉的那条**留在账上**，让登出照样看得见它。
+        """
+        # 上一轮没关掉的那几条先收拾一遍，它们和下面的淘汰一起算进上限。
+        self._forget_dead()
+        reclaimed = await self._reclaim_strays()
+        victims = []
+        async with self._trim_lock:
+            while True:
+                occupied, stray = self._occupied()
+                if len(occupied) + stray <= self._max:
+                    break
+                idle = [
+                    model
+                    for model in occupied
+                    if self._runtimes[model].started
+                    and not self._busy.get(model)
+                    and model != self._primary_model
+                ]
+                if not idle:
+                    break
+                victim = min(idle, key=lambda model: self._last_used.get(model, 0))
+                # 先从映射里摘掉再关：这样并发的 ``get`` 不会拿回一条正在关的运行时。
+                evicted = self._runtimes.pop(victim)
+                victims.append(evicted)
+                self._evicting.add(evicted)
+                # 同一刻盖戳：别的 trim 从这一笔起就看不见它了，不会再关一次、也不会
+                # 把它算成占位。见 :meth:`_strays`。
+                self._closing.add(evicted)
+                self._busy.pop(victim, None)
+                self._last_used.pop(victim, None)
+
+        try:
+            return reclaimed + await self._close_batch(victims, "shutdown")
+        finally:
+            self._closing.difference_update(victims)
+            # 只把真关掉的出账。还活着的留在账上：它已经不在映射里，除这份账之外
+            # 没有任何地方还能看见"这条进程还没死"。
+            self._evicting.difference_update(
+                runtime for runtime in victims if not runtime.started
+            )
+
+    async def _close_batch(self, runtimes, how) -> int:
+        """把一批运行时关完再放行取消，返回关成功的条数。
+
+        **这批已经从映射里摘掉了**，不会再有人回头找它们：中途被取消就撒手，剩下的
+        既不在池子里、子进程也还活着，等于凭空漏了几条 CLI。所以整批放进独立任务，
+        取消时等它跑完再把 ``CancelledError`` 往外传。
+
+        ``how`` 是方法名：淘汰与永久关闭用 ``shutdown``，登录后重启用 ``close``。
+
+        **取消可能来不止一次。** 第一次取消之后我们在这儿等 ``cleanup``；等的过程中
+        再来一次，那个 ``await`` 同样会被打断，单次 ``suppress`` 就只能放行——方法
+        抛出去而 ``cleanup`` 还在跑，之后事件循环若把它一并取消，剩下几条就没人关。
+        所以循环等到 ``done()`` 为止，循环本身也扛得住反复取消。
+
+        **同一批可能同时被别人关着。** ``shutdown`` 与 ``_reclaim_strays`` 各自快照，
+        会捞到同一条进程；谁的 ``finally`` 先撤 ``_closing`` 戳，第三方就可能再关一遍。
+        这里不做互斥，靠的是 ``AcpRuntime.close`` / ``shutdown`` 持 ``_start_lock``、
+        对已经死透的那条是 no-op——池这边只负责不重复记账。
+        """
+        async def _run():
+            count = 0
+            for runtime in runtimes:
+                with contextlib.suppress(Exception):
+                    await getattr(runtime, how)()
+                    # 没抛异常不等于关掉了：``close()`` 在子进程死活不退时会正常
+                    # 返回、把引用留在运行时身上。只数真停下来的那几条，否则池子
+                    # 会报出一个根本不存在的空位。
+                    if not runtime.started:
+                        count += 1
+            return count
+
+        cleanup = asyncio.ensure_future(_run())
+        try:
+            return await asyncio.shield(cleanup)
+        except asyncio.CancelledError:
+            while not cleanup.done():
+                with contextlib.suppress(BaseException):
+                    await asyncio.shield(cleanup)
+            raise
+
+    async def close_all(self) -> None:
+        """关掉全部进程，但池仍然可用（下次领取会重新拉起）。
+
+        登录成功后必须调它：登录发生在某一条进程上，其它进程在登录前就启动了，手里
+        还记着"未登录"。不重启它们，那些模型会一直报 401，而用户明明已经登上了。
+
+        映射**不**清空：``CliCredentials`` 手里握着某条运行时的引用，清空会让它下次
+        刷新时拉起一条池子不认识的进程——那条进程活过插件生命周期，再也没人回收。
+
+        后果要记住：这之后再 ``get(同一个 model)`` 拿回的是**同一条对象**，而它已经
+        关了。想用它必须再过一次 ``ensure_started()``，直接 ``stream()`` 会失败。
+        """
+        async with self._trim_lock:
+            runtimes = list(self._runtimes.values())
+        await self._close_batch(runtimes, "close")
+
+    async def shutdown(self) -> None:
+        """永久关闭：之后 :meth:`get` 一律抛 :class:`AcpError`。
+
+        账上那几条也要一起关。它们是**淘汰时没关掉**的进程，已经不在 ``_runtimes``
+        里；池一散，除 ``_evicting`` 之外再没人看着它们，留着就是一条活过插件生命
+        周期的 CLI。淘汰那一次失败不代表这一次也失败——重试一次比放弃强。
+
+        **先在锁内入账，关完只销真关掉的。** 映射里那几条一摘出来就得记到账上：
+        ``_close_batch`` 被取消时会**等整批关完再把异常往外抛**，所以 await 之后的
+        记账一行都执行不到。真到那一步，映射已经清空、账上又没有它们，活下来的进程
+        就两头都没有了——连再试一次的把手都不剩。在锁内入账是同步的，取消插不进来。
+
+        **这个方法可以重复调用**：第一次没关掉的留在账上，第二次接着收。别把它改成
+        "关过一次就早退"——那会让账上那条永远没人认领。
+
+        与正在进行的淘汰撞上也没事：``AcpRuntime.close`` 持 ``_start_lock``，
+        后到的那次会等前一次关完再看一眼，已经死透就什么都不做。
+        """
+        self._closed = True
+        async with self._trim_lock:
+            runtimes = list(self._runtimes.values())
+            self._runtimes.clear()
+            self._last_used.clear()
+            self._busy.clear()
+            # 摘出映射的同一笔就记到账上，中间没有可取消的点。
+            self._evicting.update(runtimes)
+            runtimes = list(self._evicting)
+            # 收尾期间对并发调用不可见：``_reclaim_strays`` 不该再关一遍、也不该把
+            # 它们算成占位。池已作废，少算不算错；重复关才是白等一次关闭超时。
+            self._closing.update(runtimes)
+        try:
+            await self._close_batch(runtimes, "shutdown")
+        finally:
+            self._closing.difference_update(runtimes)
+            # 只销真关掉的。还活着的留在账上：它已经不在映射里，除这份账之外没有
+            # 任何地方还能看见"这条进程还没死"——第二次 ``shutdown()`` 要顺着它
+            # 再试一次，登出的存活检查也要看得见它才敢删凭据。
+            self._evicting.difference_update(
+                runtime for runtime in runtimes if not runtime.started
+            )
+
+
+__all__ = ["AcpRuntimePool"]

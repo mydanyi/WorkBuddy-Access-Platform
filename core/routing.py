@@ -13,6 +13,9 @@ Contract pinned by ``tests/test_routing.py``:
   ``status`` is 429/502/503/504 *and* only while no chunk was emitted yet; once
   one chunk (role / tool / reasoning / metadata) is committed the stream
   belongs to that model and a later error is propagated, never replayed;
+  ``core.acp.backend`` maps "process died mid-prompt" / "prompt timed out" /
+  "upstream refused this turn" to ``UpstreamError`` on purpose, so this path is
+  the only thing that makes the ordered route useful under ACP;
 * an abandoned stream is closed before the next candidate is opened;
 * a 429 whose ``limit_scope`` is ``account``/``ip`` cools the whole route at
   once, and two consecutive real 429 attempts do the same, using the largest
@@ -22,7 +25,13 @@ Contract pinned by ``tests/test_routing.py``:
   upstream for that round;
 * one absolute first-frame deadline covers the whole round (it is *not* reset
   per candidate) and only guards the pre-commit window; a timeout raises a
-  fixed :class:`ChatStreamError` and stops the route;
+  fixed :class:`ChatStreamError` and stops the route.  **After the first frame
+  this deadline no longer applies** -- the round is then bounded only by the
+  backend's own prompt timeout (600 s for ACP).  That is deliberate: from here
+  a stalled stream and a slowly growing long answer look identical, and the one
+  thing worse than waiting is replaying a turn the client has already started
+  receiving.  Note "first frame" includes a reasoning block, so a model that
+  thinks and then stalls waits out the prompt timeout instead of failing over;
 * cooldowns are persisted in the ``routing`` section of the real
   :class:`core.storage.StateStore` as absolute wall-clock deadlines (only the
   visible ``status()`` view reports remaining seconds), so a rebuilt router
@@ -40,7 +49,7 @@ import asyncio
 import contextlib
 import time
 
-from .credits import is_finite_number
+from .numbers import is_finite_number
 from .errors import ChatStreamError, UpstreamError
 from .limits import LimitExceeded
 
@@ -71,6 +80,8 @@ _CATEGORY_OF_REASON = {
     # The *local* admission budget ran out: a fixed local marker, never a fake
     # upstream rate limit, so a later notification layer can skip it.
     "local_limit": "routing",
+    # 提示词本身超过一帧的上限：调用方该改请求，上游没出事。
+    "request_too_large": "error",
 }
 
 
@@ -99,7 +110,18 @@ def _reason_for(exc) -> str:
     if isinstance(exc, UpstreamError):
         if getattr(exc, "code", None) == _COOLING_CODE:
             return "cooling"
-        return "rate_limited" if exc.status == 429 else "upstream"
+        if exc.status == 429:
+            return "rate_limited"
+        # A 504 is a timeout whichever layer produced it: the ACP backend raises
+        # ``UpstreamError(504)`` for a prompt that never finished, and calling
+        # that "上游返回错误" would hide the one clue an admin needs.
+        if exc.status == 504:
+            return "timeout"
+        if exc.status == 413:
+            # 一帧装不下这条提示词：该改请求的是调用方。算成 upstream 会让
+            # ``_routing_error_category`` 给管理员推一条"上游服务异常"。
+            return "request_too_large"
+        return "upstream"
     if isinstance(exc, ChatStreamError):
         return "timeout" if str(exc) == _TIMEOUT_MESSAGE else "stream"
     return "error"

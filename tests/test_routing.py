@@ -1,19 +1,14 @@
 """Behaviour-pinning tests for the ordered model routing layer.
 
-``core.routing`` is *not* implemented yet: this module only records the contract
-the manager already decided on (an ordered primary / standby list driven by the
-plugin's ``routing`` settings group).  Every test is expected to fail until the
-implementation ticket lands.
+契约对象：虚拟入口 ``按顺序调用`` 沿配置的有序清单逐个尝试、只在"一个字节都还没吐"
+时换备用、连续两个 429 直接整体冷却、冷却截止时间以绝对时刻落盘。
 
-What is real here: ``core.config.load_settings``, ``core.errors``,
-``core.storage.StateStore`` (on a temporary directory inside the project tree)
-and the router itself.  What is a small fake: only the upstream ``send``
-boundary and the clock -- nothing business-level is doubled, so a missing or
-mis-branching router fails for the right reason.
+这里真实的东西：``config.load_settings``、``errors``、``storage.StateStore``（跑在
+项目树下的临时目录里）以及路由器本身。只有上游 ``send`` 边界和时钟是替身——没有
+任何业务层被替换，所以路由器漏分支或分错支时，红的原因是对的。
 
-The recorded ``send`` calls are how these tests observe which model the *real*
-router handed to the external boundary; assertions on the fake's own mechanics
-are deliberately absent.
+记录的 ``send`` 调用是用来观察"真实路由器把哪个模型交给了外部边界"的；对替身自身
+机制的断言刻意不写。
 """
 
 from __future__ import annotations
@@ -22,18 +17,25 @@ import asyncio
 import copy
 import os
 import shutil
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 
-from core.config import ConfigError, load_settings
-from core.errors import UpstreamError
-from core.storage import StateStore
+_HERE = Path(__file__).resolve()
+_SOURCE_ROOT = _HERE.parents[2]  # 含 astrbot_plugin_workbuddy/ 的那一层
+if str(_SOURCE_ROOT) not in sys.path:
+    sys.path.insert(0, str(_SOURCE_ROOT))
 
-try:  # added by the implementation ticket; absent means "feature missing"
-    from core import routing
-except ImportError:  # pragma: no cover - the failing-first phase
-    routing = None
+# 一律走包内绝对导入。用顶层 ``core.*`` 会造出第二份模块实例：``ConfigError``
+# 变成两个不同的类对象，``assertRaises`` 就会莫名其妙地不认。
+from astrbot_plugin_workbuddy.core import routing  # noqa: E402
+from astrbot_plugin_workbuddy.core.config import (  # noqa: E402
+    ConfigError,
+    load_settings,
+)
+from astrbot_plugin_workbuddy.core.errors import UpstreamError  # noqa: E402
+from astrbot_plugin_workbuddy.core.storage import StateStore  # noqa: E402
 
 
 ORDERED_MODEL_ID_TEXT = "按顺序调用"

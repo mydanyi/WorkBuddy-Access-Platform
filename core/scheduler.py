@@ -59,7 +59,7 @@ from zoneinfo import ZoneInfo
 
 import aiohttp
 
-from .credits import is_finite_number
+from .numbers import is_finite_number
 from .errors import UpstreamError
 
 # Bounded automatic backoff after a network / 5xx failure (seconds).
@@ -298,7 +298,7 @@ class SigninScheduler:
     def _safe_reward_credits(result):
         """Return a finite non-negative numeric ``reward_credits`` or ``None``.
 
-        Mirrors :func:`core.credits.is_finite_number` plus a ``>= 0`` bound;
+        Mirrors :func:`core.numbers.is_finite_number` plus a ``>= 0`` bound;
         ``bool``/``NaN``/``inf``/negatives/strings are rejected and ``0`` is kept.
         """
         if not isinstance(result, dict):

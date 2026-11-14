@@ -5,7 +5,7 @@ from the **final upstream errors** the plugin observes -- never by calling
 ``AdminNotifier`` by hand.  The unit contract of ``core.notifications`` and of
 ``core.config.load_settings`` lives in ``tests/test_admin_notifications.py``;
 this module proves the *wiring*: the real plugin builds a notifier from the real
-``notifications`` settings, routes scheduler / growth results and final upstream
+``notifications`` settings, routes scheduler results and final upstream
 errors to it, reports it through ``wb status``, and can be torn down mid-send.
 
 Contract exercised here -- the real plugin wiring this module asserts:
@@ -16,10 +16,10 @@ Contract exercised here -- the real plugin wiring this module asserts:
 * the plugin exposes ``plugin.notifier`` with the ``AdminNotifier`` contract
   (``await signin(result)`` / ``await error(category)`` / ``status()``);
 * a successful real check-in (automatic or manual) notifies the configured QQ,
-  not the user who ran the command, and reads the balance exactly once for the
-  message (``remaining``, never ``total``);
+  not the user who ran the command, and carries only the reward the claim itself
+  returned -- the "current total credits" read is gone with the credit feature;
 * final upstream errors are forwarded through the ``UpstreamClient(...,
-  on_error=cb)`` observer and through the scheduler/growth ``on_result`` hooks;
+  on_error=cb)`` observer and through the scheduler ``on_result`` hook;
 * observer categories are the fixed strings ``auth`` / ``permission`` / ``rate``
   / ``network`` / ``upstream`` -- never a raw body or token;
 * a cancelled send writes nothing and the runtime is fully drained on
@@ -29,8 +29,8 @@ Only the external boundaries are replaced: ``Context.send_message`` (recording,
 can return ``False`` / raise / block), the platform instance list
 (``context.platform_manager.platform_insts`` with real ``PlatformMetadata``),
 and the real ``aiohttp`` fake upstream.  Everything else -- ``WorkBuddyPlugin``,
-``SigninScheduler`` / ``SigninService`` / ``UpstreamClient`` / ``AuthManager`` /
-``StateStore`` / ``CredentialStore`` -- is the real production code.
+``SigninScheduler`` / ``SigninService`` / ``UpstreamClient`` / ``CliCredentials``
+/ ``StateStore`` -- is the real production code.
 
 ``tests.test_plugin_integration`` is imported as ``support`` to initialize the
 controlled AstrBot root; its test-case classes are deliberately not inherited or
@@ -75,20 +75,10 @@ from astrbot.api.event import MessageChain  # noqa: E402
 from astrbot.core.platform.message_session import MessageSession  # noqa: E402
 
 import astrbot_plugin_workbuddy.main as wb_main  # noqa: E402
-from astrbot_plugin_workbuddy.core.auth import AuthManager  # noqa: E402
-from astrbot_plugin_workbuddy.core.client import UpstreamClient  # noqa: E402
-from astrbot_plugin_workbuddy.core.errors import UpstreamError  # noqa: E402
-from astrbot_plugin_workbuddy.core.storage import CredentialStore  # noqa: E402
 
 # --- FICTIONAL FIXED SAMPLE values (never real). ---
 ADMIN_QQ = "123456789"                   # fictional receiving QQ
 PLATFORM_ID = "qq-notify-test"           # fictional aiocqhttp instance id
-NEW_AT = "FICTIONAL-REFRESHED-ACCESS-TOKEN"
-NEW_RT = "FICTIONAL-REFRESHED-REFRESH-TOKEN"
-REFRESH_PATH = "/v2/plugin/auth/token/refresh"
-PROTECTED = "/v2/protected/probe"
-
-VALID_CATEGORIES = ("auth", "permission", "rate", "network", "upstream")
 
 # A module-scoped sandbox, strictly under the task tmp root provided by support.
 _MODULE_TMP = Path(
@@ -147,39 +137,44 @@ class _NotifyContext(support._Context):
 # ---------------------------------------------------------------------------
 # Reusable external route handlers for the fake upstream.
 # ---------------------------------------------------------------------------
-def _refresh_success(request):
-    return web.json_response(
-        {
-            "code": 0,
-            "data": {
-                "accessToken": NEW_AT,
-                "refreshToken": NEW_RT,
-                "expiresIn": 3600,
-                "domain": "example.test.invalid",
-            },
-        }
-    )
-
-
-def _refresh_failure(request):
-    return web.json_response({"code": 5000, "msg": "REFRESH-FAILED-RAW"}, status=500)
-
-
-def _always_401(request):
-    return web.json_response({"code": 4010, "msg": "AUTH-RAW-SECRET"}, status=401)
-
-
-def _bearer_401_then_ok(request):
-    if request.headers.get("Authorization") == "Bearer " + NEW_AT:
-        return web.json_response({"code": 0, "data": {"ok": True}})
-    return web.json_response({"code": 1001, "msg": "expired"}, status=401)
-
-
 def _status_handler(status, body=None, headers=None):
     def handler(request):
         return web.json_response(body or {}, status=status, headers=headers or {})
 
     return handler
+
+
+# ---------------------------------------------------------------------------
+# ACP client stand-ins: they cover the two failures the real CLI can produce
+# at the protocol level, without spawning one.
+# ---------------------------------------------------------------------------
+class _AuthFailingClient:
+    """``session/new`` 回 ``-32000``/``category=auth``：真实 CLI 未登录的样子。"""
+
+    def prompt_once(self, text, *, cwd=None, timeout=None):
+        return self._fail()
+
+    async def _fail(self):
+        from astrbot_plugin_workbuddy.core.acp import AcpRpcError
+
+        raise AcpRpcError(-32000, "auth", "auth required")
+        yield  # pragma: no cover - 只为让它成为 async generator
+
+
+class _ProcessFailingClient:
+    """CLI 进程死了：适配层要翻成 502，而不是把原文透出去。"""
+
+    def __init__(self, message="cli died"):
+        self.message = message
+
+    def prompt_once(self, text, *, cwd=None, timeout=None):
+        return self._fail()
+
+    async def _fail(self):
+        from astrbot_plugin_workbuddy.core.acp import AcpProcessError
+
+        raise AcpProcessError(self.message)
+        yield  # pragma: no cover
 
 
 class _NotificationIntegrationTestCase(unittest.IsolatedAsyncioTestCase):
@@ -193,14 +188,8 @@ class _NotificationIntegrationTestCase(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
         await support._PluginIntegrationTestCase.asyncSetUp(self)
         self._contexts = []
-        self._temp_dirs = []
 
     async def asyncTearDown(self) -> None:
-        for session in getattr(self, "_extra_sessions", []):
-            with contextlib.suppress(Exception):
-                await session.close()
-        for directory in self._temp_dirs:
-            shutil.rmtree(directory, ignore_errors=True)
         await support._PluginIntegrationTestCase.asyncTearDown(self)
 
     # -- bound support fixtures ------------------------------------------
@@ -247,13 +236,6 @@ class _NotificationIntegrationTestCase(unittest.IsolatedAsyncioTestCase):
         if initialize:
             await plugin.initialize()
         return plugin, context
-
-    def _temp_dir(self) -> Path:
-        directory = Path(
-            tempfile.mkdtemp(prefix="wb-notify-data-", dir=str(support.BASE_TMP))
-        )
-        self._temp_dirs.append(directory)
-        return directory
 
     @staticmethod
     def _reset_plugin_data():
@@ -311,6 +293,40 @@ class _NotificationIntegrationTestCase(unittest.IsolatedAsyncioTestCase):
         except Exception:  # noqa: BLE001 - an unusable status is "no delivery"
             return None
 
+    async def _use_acp_chat(self, plugin, client) -> None:
+        """把聊天后端换成"真适配层 + 假 ACP 客户端"。
+
+        适配层的错误分类与 ``on_error`` 观察者都是真的；换掉的只有客户端——要制造
+        "CLI 说没登录""进程死了"这两种协议级故障，没必要真起一个进程。
+
+        这里**不**接运行时：``AcpChatBackend`` 注入了客户端就不会再去要进程
+        （见 ``_lease``），接进来也只是一个永远不被读的字段。401 回灌到运行时登录态
+        那条分支由 ``tests/test_acp_backend.py`` 覆盖。
+        """
+        from astrbot_plugin_workbuddy.core.acp import AcpChatBackend
+        from astrbot_plugin_workbuddy.core.routing import ORDERED_MODEL_ID
+
+        plugin.chat = AcpChatBackend(
+            client,
+            model=ORDERED_MODEL_ID,
+            on_error=plugin._on_chat_error,
+        )
+        await plugin.gateway.stop()
+        await plugin._build_gateway()
+
+    async def _post_chat(self, plugin, payload) -> int:
+        """打一次网关的 ``/v1/chat/completions``，返回 HTTP 状态码。"""
+        port = plugin.gateway.bound_port
+        self.assertTrue(port)
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                "http://127.0.0.1:{}/v1/chat/completions".format(port),
+                json=payload,
+                headers={"Authorization": "Bearer " + support.GATEWAY_KEY},
+            ) as resp:
+                await resp.read()
+                return resp.status
+
     async def _enable_notify_plugin(self, **config_overrides):
         """A ready, logged-in plugin with notifications fully enabled."""
         self._seed_credentials()
@@ -328,23 +344,13 @@ class _NotificationIntegrationTestCase(unittest.IsolatedAsyncioTestCase):
         return await self._make_plugin(**overrides)
 
     # =====================================================================
-    # 1. notifications off: no QQ send, no extra balance read; the legacy
-    #    daily growth callback is preserved.
+    # 1. notifications off: no QQ send.
     # =====================================================================
-    async def test_01_default_off_sends_no_qq_and_keeps_growth_callback(self):
+    async def test_01_default_off_sends_no_qq_and_keeps_the_signin_chain_alone(self):
         self._seed_credentials()
         plugin, ctx = await self._make_plugin(
             **support._deep_merge(
-                self._ready_config(
-                    signin={"enabled": False},
-                    growth={
-                        "auto_after_signin": True,
-                        "auto_claim": False,
-                        "task_interval": 0,
-                        "poll_interval": 0.01,
-                        "progress_timeout": 0.05,
-                    },
-                ),
+                self._ready_config(signin={"enabled": False}),
                 {"notifications": {"enabled": False}},
             )
         )
@@ -352,7 +358,6 @@ class _NotificationIntegrationTestCase(unittest.IsolatedAsyncioTestCase):
         # The switch is off by default.
         self.assertIs(plugin._settings["notifications"]["enabled"], False)
 
-        self.up.tasks = []
         reply = support._text_of(
             await self._run_wb(plugin, support._make_event("wb signin"), "signin", "")
         )
@@ -360,19 +365,19 @@ class _NotificationIntegrationTestCase(unittest.IsolatedAsyncioTestCase):
 
         # The real check-in reached the upstream...
         self.assertGreaterEqual(self.up.hits[("POST", support.CHECKIN_STATUS_PATH)], 1)
-        # ...but nothing was sent and the balance was never queried for a message.
+        # ...but nothing was sent, and no route outside the check-in pair was
+        # touched (the notification used to pull the balance as well).
         await self._wait_idle(plugin)
         self.assertEqual(ctx.send_calls, 0)
-        self.assertEqual(self.up.hits[("POST", support.BALANCE_PATH)], 0)
-
-        # The pre-existing daily-growth callback still fired (auto_after_signin).
-        growth_task = plugin.growth._task
-        self.assertIsNotNone(growth_task)
-        await asyncio.wait_for(growth_task, timeout=5)
+        touched = {path for (_method, path) in self.up.hits}
+        self.assertEqual(
+            touched,
+            {support.CHECKIN_STATUS_PATH, support.CHECKIN_CLAIM_PATH},
+        )
 
     # =====================================================================
     # 2. fully on: a real check-in notifies the configured QQ (not the
-    #    caller) with reward + remaining; repeat / rebuild dedup.
+    #    caller) with the claim's own reward; repeat / rebuild dedup.
     # =====================================================================
     async def test_02_enabled_signin_notifies_admin_qq_once_and_dedups(self):
         plugin, ctx = await self._enable_notify_plugin()
@@ -394,10 +399,9 @@ class _NotificationIntegrationTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertNotEqual(session.session_id, "wb-test-user")
 
         text = support._result_text(chain)
-        self.assertIn("10", text)       # this round's reward
-        self.assertIn("105", text)      # balance remaining
-        self.assertNotIn("150", text)   # never the total quota
-        self.assertEqual(self.up.hits[("POST", support.BALANCE_PATH)], 1)
+        self.assertIn("10", text)       # this round's reward, from the claim
+        # 余额那条线随私有接口一起下线了：消息里不该再出现任何"总积分"字样。
+        self.assertNotIn("可用总积分", text)
 
         # A repeated manual check-in the same day must not send again.
         await self._run_wb(plugin, support._make_event("wb signin"), "signin", "")
@@ -448,39 +452,39 @@ class _NotificationIntegrationTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.up.total_hits(), before)
 
     # =====================================================================
-    # 4. balance upstream 500: the sign-in stays verified, the message shows
-    #    an unknown balance, and the internal read never recurses.
+    # 4. a claim that answers HTTP 500 sends exactly one error notice: the
+    #    client observer and the scheduler hook must not each send their own.
     # =====================================================================
-    async def test_04_balance_failure_keeps_signin_and_never_recurses(self):
+    async def test_04_a_failed_claim_sends_one_notice_not_two(self):
         plugin, ctx = await self._enable_notify_plugin()
-        self.up.balance_status = 500
+        self.up.on(
+            "POST",
+            support.CHECKIN_CLAIM_PATH,
+            _status_handler(500, {"code": 9, "msg": "RAW-CLAIM-500"}),
+        )
 
         reply = support._text_of(
             await self._run_wb(plugin, support._make_event("wb signin"), "signin", "")
         )
         self.assertTrue(reply.strip())
-        self.assertIn(
-            plugin.scheduler.status()["last_outcome"], ("signed", "already_signed")
-        )
 
         self.assertTrue(await self._wait_until(lambda: ctx.send_calls >= 1))
         await self._wait_idle(plugin)
         await asyncio.sleep(0.05)
 
-        # Exactly one message (the sign-in result) -- the balance failure must
-        # not create a second error notification.
+        # 客户端观察者（source=api）与调度器 on_result（source=signin）都会想报一条，
+        # 同一 category 的冷却必须把它们收成一条——否则管理员每次失败都收两条。
         self.assertEqual(ctx.send_calls, 1)
         text = support._result_text(ctx.sent[0][1])
-        self.assertIn("未知", text)
-        self.assertNotIn("FICTIONAL-BALANCE-ERROR", text)
-        self.assertEqual(self.up.hits[("POST", support.BALANCE_PATH)], 1)
+        self.assertTrue(text.strip())
+        self.assertNotIn("RAW-CLAIM-500", text)
 
     # =====================================================================
-    # 5. final auth failures notify from a real JSON/model query; a rescued
-    #    401, an unlogged plugin and an active logout do not.
+    # 5. final auth failures notify; an unlogged plugin and an active logout
+    #    do not.
     # =====================================================================
-    async def test_05_final_auth_failure_notifies_but_rescued_and_logout_do_not(self):
-        # (a) Unlogged: the models command short-circuits, no observer, no send.
+    async def test_05_final_auth_failure_notifies_but_unlogged_and_logout_do_not(self):
+        # (a) Unlogged: the signin command short-circuits, no observer, no send.
         unlogged, unlogged_ctx = await self._make_plugin(
             **support._deep_merge(
                 self._ready_config(signin={"enabled": False}),
@@ -493,8 +497,11 @@ class _NotificationIntegrationTestCase(unittest.IsolatedAsyncioTestCase):
                 },
             )
         )
-        self.assertFalse(unlogged.auth.credentials)
-        await self._run_wb(unlogged, support._make_event("wb models"), "models", "")
+        self.assertFalse(unlogged.account.credentials)
+        reply = support._text_of(
+            await self._run_wb(unlogged, support._make_event("wb signin"), "signin", "")
+        )
+        self.assertIn("尚未登录", reply)
         await self._wait_idle(unlogged)
         self.assertEqual(unlogged_ctx.send_calls, 0)
 
@@ -505,84 +512,67 @@ class _NotificationIntegrationTestCase(unittest.IsolatedAsyncioTestCase):
         await self._wait_idle(logged_out)
         self.assertEqual(logged_out_ctx.send_calls, 0)
 
-        # (c) A final 401 (refresh cannot rescue) from a real model query.
+        # (c) A 401 the CLI cannot rescue (it is not even installed here) is a
+        #     final auth failure: one fixed notice, never the raw body.
         self._seed_credentials()
         plugin, ctx = await self._enable_notify_plugin()
-        self.up.handlers[("POST", REFRESH_PATH)] = _refresh_failure
-        self.up.handlers[("GET", support.MODELS_CATALOG_PATH)] = _always_401
+        self.up.on(
+            "POST",
+            support.CHECKIN_STATUS_PATH,
+            _status_handler(401, {"code": 4010, "msg": "AUTH-RAW-SECRET"}),
+        )
 
-        await self._run_wb(plugin, support._make_event("wb models"), "models", "")
+        await self._run_wb(plugin, support._make_event("wb signin"), "signin", "")
         self.assertTrue(await self._wait_until(lambda: ctx.send_calls >= 1))
         await self._wait_idle(plugin)
         self.assertEqual(ctx.send_calls, 1)
-        self.assertEqual(self.up.hits[("POST", REFRESH_PATH)], 1)  # exactly one refresh
         text = support._result_text(ctx.sent[0][1])
         self.assertTrue(text.strip())
         self.assertNotIn("AUTH-RAW-SECRET", text)
 
-        # (d) A 401 that a successful refresh rescues must not notify.
-        self._seed_credentials()
-        rescued, rescued_ctx = await self._enable_notify_plugin()
-        self.up.handlers[("POST", REFRESH_PATH)] = _refresh_success
-        self.up.handlers[("GET", support.MODELS_CATALOG_PATH)] = _bearer_401_then_ok
-
-        await self._run_wb(rescued, support._make_event("wb models"), "models", "")
-        await self._wait_idle(rescued)
-        await asyncio.sleep(0.05)
-        self.assertEqual(rescued_ctx.send_calls, 0)
-        self.assertGreaterEqual(self.up.hits[("POST", REFRESH_PATH)], 1)
-
     # =====================================================================
-    # 6. final chat 401 / 403 / 429 / 5xx notify from the real chat path
-    #    (no real chat conversation; a fake SSE/HTTP upstream is enough).
+    # 6. a chat failure notifies the admin exactly once, with a fixed text.
+    #    The ACP backend is real; only the client it talks to is a stub, so
+    #    the category mapping and the observer wiring are both exercised.
     # =====================================================================
-    async def test_06_chat_path_final_errors_notify(self):
+    async def test_06_chat_failures_notify_once_with_a_fixed_text(self):
         plugin, ctx = await self._enable_notify_plugin()
-        self.up.handlers[("POST", REFRESH_PATH)] = _refresh_failure
+        payload = {
+            "model": support.MODEL,
+            "messages": [{"role": "user", "content": "hi"}],
+        }
 
-        cases = (
-            (401, None),
-            (403, None),
-            (429, {"Retry-After": "7"}),
-            (500, None),
+        # 401: 真实 CLI 未登录时 session/new 会回 -32000/category=auth。
+        await self._use_acp_chat(plugin, _AuthFailingClient())
+        self.assertEqual(await self._post_chat(plugin, payload), 401)
+        self.assertTrue(
+            await self._wait_until(lambda: ctx.send_calls >= 1),
+            "no notification after a chat 401",
         )
-        expected = 0
-        for status, headers in cases:
-            self.up.queue_status(
-                status, {"code": 9, "msg": "RAW-CHAT-SECRET"}, headers
-            )
-            with contextlib.suppress(Exception):
-                await plugin.chat.complete(
-                    {"model": support.MODEL, "messages": [{"role": "user", "content": "hi"}]}
-                )
-            expected += 1
-            self.assertTrue(
-                await self._wait_until(lambda: ctx.send_calls >= expected),
-                f"no notification after chat status {status}",
-            )
-            await self._wait_idle(plugin)
+        await self._wait_idle(plugin)
 
-        self.assertEqual(ctx.send_calls, expected)
+        # 502: 进程不可用，分类是上游异常（与 auth 不同，不会被冷却去重掉）。
+        await self._use_acp_chat(plugin, _ProcessFailingClient("CLI-DIED-RAW"))
+        self.assertEqual(await self._post_chat(plugin, payload), 502)
+        self.assertTrue(
+            await self._wait_until(lambda: ctx.send_calls >= 2),
+            "no notification after a chat 502",
+        )
+        await self._wait_idle(plugin)
+
+        self.assertEqual(ctx.send_calls, 2)
         for _, chain in ctx.sent:
             text = support._result_text(chain)
             self.assertTrue(text.strip())
-            self.assertNotIn("RAW-CHAT-SECRET", text)
+            self.assertNotIn("CLI-DIED-RAW", text)
 
     # =====================================================================
-    # 7. unconfirmed sign-in and a needs_attention growth run send a fixed
-    #    safe error message; a normal success / cancel never does.
+    # 7. an unconfirmed sign-in sends a fixed safe error message.
     # =====================================================================
-    async def test_07_unconfirmed_and_needs_attention_notify_success_cancel_do_not(self):
-        plugin, ctx = await self._enable_notify_plugin(
-            growth={
-                "auto_claim": False,
-                "task_interval": 0,
-                "poll_interval": 0.01,
-                "progress_timeout": 0.05,
-            }
-        )
+    async def test_07_unconfirmed_signin_notifies_without_leaking(self):
+        plugin, ctx = await self._enable_notify_plugin()
 
-        # (a) A real sign-in whose claim reports a business error is unconfirmed.
+        # A real sign-in whose claim reports a business error is unconfirmed.
         self.up.handlers[("POST", support.CHECKIN_CLAIM_PATH)] = _status_handler(
             200, {"code": 10000, "msg": "RAW-CLAIM-SECRET"}
         )
@@ -593,40 +583,7 @@ class _NotificationIntegrationTestCase(unittest.IsolatedAsyncioTestCase):
         first = support._result_text(ctx.sent[0][1])
         self.assertTrue(first.strip())
         self.assertNotIn("RAW-CLAIM-SECRET", first)
-
-        # (b) A real growth run whose listing fails is needs_attention.
-        fail = {"on": True}
-
-        def _growth_list(request):
-            if fail["on"]:
-                return web.json_response(
-                    {"code": 4030, "msg": "RAW-GROWTH-SECRET"}, status=403
-                )
-            return web.json_response({"code": 0, "data": {"tasks": list(self.up.tasks)}})
-
-        self.up.handlers[("GET", support.GROWTH_LIST_PATH)] = _growth_list
-        self.assertTrue(plugin.growth.start().get("started"))
-        await asyncio.wait_for(plugin.growth._task, timeout=5)
-        self.assertTrue(await self._wait_until(lambda: ctx.send_calls >= 2))
-        await self._wait_idle(plugin)
-        self.assertEqual(ctx.send_calls, 2)
-        for _, chain in ctx.sent:
-            self.assertNotIn("RAW-GROWTH-SECRET", support._result_text(chain))
-
-        # (c) A normal, successful growth run does not notify.
-        fail["on"] = False
-        plugin.growth.resume()
-        self.up.tasks = []
-        self.assertTrue(plugin.growth.start().get("started"))
-        await asyncio.wait_for(plugin.growth._task, timeout=5)
-        await self._wait_idle(plugin)
-        await asyncio.sleep(0.05)
-        self.assertEqual(ctx.send_calls, 2)
-
-        # (d) A normal cancel does not notify.
-        await plugin.growth.cancel()
-        await self._wait_idle(plugin)
-        self.assertEqual(ctx.send_calls, 2)
+        self.assertEqual(ctx.send_calls, 1)
 
     # =====================================================================
     # 8. send_message returning False records a failed delivery but never
@@ -717,102 +674,30 @@ class _NotificationIntegrationTestCase(unittest.IsolatedAsyncioTestCase):
         ctx3.gate = open_gate
         await self._run_wb(plugin3, support._make_event("wb signin"), "signin", "")
         self.assertTrue(await self._wait_until(lambda: ctx3.send_calls >= 1))
-        # A second, distinct real trigger: a failing model query (network error).
-        self.up.handlers[("GET", support.MODELS_CATALOG_PATH)] = _status_handler(
-            500, {"code": 9, "msg": "RAW"}
+        # A second, distinct real trigger from a different producer: a chat
+        # failure (category upstream, so the cooldown does not swallow it).
+        await self._use_acp_chat(plugin3, _ProcessFailingClient())
+        self.assertEqual(
+            await self._post_chat(
+                plugin3,
+                {"model": support.MODEL, "messages": [{"role": "user", "content": "hi"}]},
+            ),
+            502,
         )
-        await self._run_wb(plugin3, support._make_event("wb models"), "models", "")
         self.assertTrue(await self._wait_until(lambda: ctx3.send_calls >= 2))
         await self._wait_idle(plugin3)
         self.assertEqual(ctx3.send_calls, 2)
         await plugin3.terminate()
 
     # =====================================================================
-    # 10. the UpstreamClient(..., on_error=cb) observer contract.
-    # =====================================================================
-    async def test_10_upstream_observer_contract(self):
-        session = aiohttp.ClientSession()
-        self._extra_sessions = [session]
-        store = CredentialStore(self._temp_dir(), support.MASTER_KEY)
-        store.save(dict(support.SEED_CREDENTIALS))
-        manager = AuthManager(
-            session, store, chat_base=self.up.base, poll_interval=0.01, login_timeout=1.0
-        )
-
-        def make_client(observer):
-            return UpstreamClient(
-                session,
-                manager,
-                chat_base=self.up.base,
-                billing_base=self.up.base,
-                web_base=self.up.base,
-                on_error=observer,
-            )
-
-        # -- categories are the fixed strings, never a raw body / token. ----
-        events = []
-        client = make_client(events.append)
-        self.up.handlers[("GET", PROTECTED + "/forbidden")] = _status_handler(403)
-        self.up.handlers[("GET", PROTECTED + "/throttled")] = _status_handler(
-            429, {"code": 4290, "msg": "RAW-429"}, {"Retry-After": "7"}
-        )
-        self.up.handlers[("GET", PROTECTED + "/broken")] = _status_handler(
-            500, {"code": 9, "msg": "RAW-500"}
-        )
-        self.up.handlers[("GET", PROTECTED + "/business")] = _status_handler(
-            200, {"code": 123, "msg": "RAW-BUSINESS"}
-        )
-
-        for path, expected in (
-            ("/forbidden", "permission"),
-            ("/throttled", "rate"),
-            ("/broken", "network"),
-            ("/business", "upstream"),
-        ):
-            with self.assertRaises(UpstreamError):
-                await client.request_json("GET", PROTECTED + path)
-            self.assertEqual(events[-1], expected)
-
-        # Every recorded observation is a bare, known category string.
-        self.assertTrue(all(isinstance(item, str) for item in events))
-        self.assertTrue(set(events) <= set(VALID_CATEGORIES))
-        joined = " ".join(events)
-        for raw in ("RAW-429", "RAW-500", "RAW-BUSINESS", "AUTH-RAW-SECRET"):
-            self.assertNotIn(raw, joined)
-
-        # -- a rescued 401 does not call the observer, and refreshes once. ---
-        events_rescued = []
-        rescued = make_client(events_rescued.append)
-        self.up.handlers[("POST", REFRESH_PATH)] = _refresh_success
-        self.up.handlers[("GET", PROTECTED + "/rescued")] = _bearer_401_then_ok
-        self.up.hits[("POST", REFRESH_PATH)] = 0
-        data = await rescued.request_json("GET", PROTECTED + "/rescued")
-        self.assertEqual(data.get("ok"), True)
-        self.assertEqual(events_rescued, [])
-        self.assertEqual(self.up.hits[("POST", REFRESH_PATH)], 1)
-
-        # -- a final 401 fires the observer exactly once as ``auth``. --------
-        events_final = []
-        final = make_client(events_final.append)
-        self.up.handlers[("POST", REFRESH_PATH)] = _refresh_failure
-        self.up.handlers[("GET", PROTECTED + "/final")] = _always_401
-        self.up.hits[("POST", REFRESH_PATH)] = 0
-        with self.assertRaises(UpstreamError) as caught:
-            await final.request_json("GET", PROTECTED + "/final")
-        self.assertEqual(caught.exception.status, 401)
-        self.assertEqual(events_final, ["auth"])
-        self.assertEqual(self.up.hits[("POST", REFRESH_PATH)], 1)
-
-        # -- an observer that raises never changes the original request error.
-        def _raising_observer(_category):
-            raise RuntimeError("OBSERVER-RAW-SECRET")
-
-        raising = make_client(_raising_observer)
-        self.up.handlers[("GET", PROTECTED + "/raise")] = _status_handler(403)
-        with self.assertRaises(UpstreamError) as caught:
-            await raising.request_json("GET", PROTECTED + "/raise")
-        self.assertEqual(caught.exception.status, 403)
-        self.assertNotIn("OBSERVER-RAW-SECRET", repr(caught.exception))
+    # 10. -- 已删除 --
+    #
+    # 这一条曾经用真 ``AuthManager`` 验 ``UpstreamClient(..., on_error=cb)`` 的分类
+    # 契约：403→permission / 429→rate / 500→network / 业务码→upstream，以及「刷
+    # 一次就救回来的 401 不算事故」。那套契约现在由
+    # ``tests/test_http.py::ClientEnvelopeTests`` 用最小凭据来源替身逐条覆盖，断言
+    # 一字不差；``AuthManager`` 本身随私有聊天路径一起删掉了。留一份需要七条 OAuth
+    # 路由才跑得起来的副本，只会让删掉的路由在测试里复活。
 
 
 def tearDownModule():

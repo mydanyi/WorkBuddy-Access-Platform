@@ -28,8 +28,11 @@ Design boundaries (pinned by the task's behavioural tests):
 * The last delivery record (``sent`` / ``failed`` + a fixed reason) is
   persisted to the ``notifications`` section of the real ``StateStore`` so it
   survives a rebuild, and every merged write only touches its own key.
-* A failure of this module's *own* balance read never recurses into an error
-  notification and never hides the successful signin result.
+* The signin summary carries the reward the claim itself returned and nothing
+  else.  It used to append a "current total credits" line read from the billing
+  meter; that read went away with the credit/balance feature, and a line that
+  could only ever say "unknown" is noise, so the line is gone rather than
+  permanently blank.
 """
 
 from __future__ import annotations
@@ -42,7 +45,7 @@ from astrbot.core.message.components import Plain
 from astrbot.core.platform.message_session import MessageSession
 from astrbot.core.platform.message_type import MessageType
 
-from .credits import is_finite_number
+from .numbers import is_finite_number
 
 __all__ = ["AdminNotifier"]
 
@@ -68,7 +71,6 @@ _CATEGORY_TEXTS = {
     "network": "WorkBuddy 通知：网络连接异常。",
     "upstream": "WorkBuddy 通知：上游服务异常。",
     "signin": "WorkBuddy 通知：签到任务异常。",
-    "growth": "WorkBuddy 通知：成长任务异常。",
     "runtime": "WorkBuddy 通知：插件运行时异常。",
 }
 
@@ -76,10 +78,7 @@ _CATEGORY_TEXTS = {
 # table is ignored outright, so no free-form string is ever echoed.
 _SOURCE_TEXTS = {
     "chat": "聊天",
-    "models": "模型列表",
-    "balance": "积分查询",
     "signin": "签到",
-    "growth": "成长任务",
     "api": "接口请求",
 }
 
@@ -89,7 +88,9 @@ _ROUTE_REASON_TEXTS = {
     "rate_limited": "上游限流",
     "upstream": "上游返回错误",
     "stream": "上游流中断",
-    "timeout": "首帧超时",
+    # 同 ``main._ROUTE_REASON_TEXTS``：这个 key 也覆盖"正文吐到一半才超时"，
+    # 写"首帧超时"会指错方向。
+    "timeout": "超时",
     "cooling": "路由冷却中",
     "error": "未知失败",
     "local_limit": "本地请求预算限制",
@@ -126,14 +127,12 @@ class AdminNotifier:
 
     ``settings`` is the already-normalized ``load_settings()['notifications']``
     mapping.  ``clock`` is an injectable zero-argument callable (defaults to
-    ``time.time``) used for the persisted per-category cooldown.  ``client`` is
-    the balance boundary: only its ``balance()`` coroutine is ever touched.
+    ``time.time``) used for the persisted per-category cooldown.
     """
 
-    def __init__(self, context, state, settings, client, clock=None) -> None:
+    def __init__(self, context, state, settings, clock=None) -> None:
         self._context = context
         self._state = state
-        self._client = client
         self._settings = settings if isinstance(settings, dict) else {}
         self._clock = time.time if clock is None else clock
         self._lock = asyncio.Lock()
@@ -200,12 +199,7 @@ class AdminNotifier:
                 return
 
             reward = self._format_reward(reward_value)
-            remaining = await self._balance_text()
-            text = (
-                "WorkBuddy 签到通知：\n"
-                "本次领取积分：{}\n"
-                "当前可用总积分：{}"
-            ).format(reward, remaining)
+            text = "WorkBuddy 签到通知：\n本次领取积分：{}".format(reward)
 
             self._resolved_platform_id = resolved
             await self._deliver(self._build_chain(text), "signin")
@@ -225,12 +219,13 @@ class AdminNotifier:
     async def error(self, category, *, source=None, routing_summary=None) -> None:
         """Notify the admin about a known failure category (cooldown-gated).
 
-        ``source`` is one documented request key (``chat`` / ``models`` /
-        ``balance`` / ``signin`` / ``growth`` / ``api``) and only adds a fixed
-        Chinese "来源" line; ``routing_summary`` carries the safe fields of a
-        finished ordered round (attempt count, fixed reason, cooldown hint) and
-        only adds a fixed "路由" line.  With both omitted the message is exactly
-        the historic one, and the switch / cooldown / delivery logic is unchanged.
+        ``source`` is one of the documented request keys in ``_SOURCE_TEXTS``
+        (``chat`` / ``signin`` / ``api``) and only adds a fixed Chinese "来源"
+        line; a key outside that table adds nothing and is never echoed.
+        ``routing_summary`` carries the safe fields of a finished ordered round
+        (attempt count, fixed reason, cooldown hint) and only adds a fixed "路由"
+        line.  With both omitted the message is exactly the historic one, and the
+        switch / cooldown / delivery logic is unchanged.
         """
         if category not in _CATEGORY_TEXTS:
             return
@@ -433,31 +428,8 @@ class AdminNotifier:
         return MessageChain([Plain(text)])
 
     # ------------------------------------------------------------------ #
-    # balance (this module's own read; never recurses into ``error``)
+    # reward rendering
     # ------------------------------------------------------------------ #
-    async def _balance_text(self) -> str:
-        try:
-            summary = await self._client.balance()
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            return _UNKNOWN
-        return self._format_remaining(summary)
-
-    def _format_remaining(self, summary) -> str:
-        """Return the finite non-negative ``remaining`` or ``未知``.
-
-        Only a known balance whose ``remaining`` is a finite, non-negative
-        number is trusted; the package ``total`` is never used as available.
-        """
-        if not isinstance(summary, dict):
-            return _UNKNOWN
-        if _field(summary, "known") is not True:
-            return _UNKNOWN
-        remaining = _field(summary, "remaining")
-        if not is_finite_number(remaining) or remaining < 0:
-            return _UNKNOWN
-        return _format_amount(remaining)
 
     @staticmethod
     def _format_reward(value) -> str:

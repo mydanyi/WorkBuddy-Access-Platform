@@ -6,18 +6,20 @@ A single :class:`WorkBuddyPlugin` (a real ``astrbot.api.star.Star``) exposes one
 non-admin user never triggers an upstream request and never receives a login
 link.
 
-The plugin owns one shared runtime: a ``aiohttp`` session, the encrypted
-credential store, the OAuth manager, an ``UpstreamClient``, a ``ChatService``,
-a local OpenAI-compatible ``Gateway``, a ``SigninScheduler`` and a
-``GrowthService``.  No AstrBot persona / agent / history / tool behaviour is
-changed here; the gateway only forwards the caller's payload (with ``stream``
-forced) to the upstream.
+The plugin owns one shared runtime: a state store, a signin-only
+``UpstreamClient``, an ``AcpRuntimePool`` that spawns the official CodeBuddy CLI
+over ACP stdio (one process per model), an ``AcpChatBackend`` adapting it to the
+OpenAI shape, a ``ModelCatalog`` reading the model list from the local CLI, a
+local OpenAI-compatible ``Gateway`` and a ``SigninScheduler``.  No AstrBot
+persona / agent / history / tool behaviour is changed here; the gateway only
+forwards the caller's payload to one throwaway ACP session.
 """
 
 from __future__ import annotations
 
 import asyncio
 import contextlib
+import logging
 import os
 
 import aiohttp
@@ -25,26 +27,40 @@ import aiohttp
 from astrbot.api.star import Context, Star, StarTools, register
 from astrbot.api.event import filter, AstrMessageEvent
 
-from .core.auth import AuthManager
-from .core.chat import ChatService
+from .core.acp import (
+    AcpChatBackend,
+    AcpError,
+    AcpRuntime,
+    AcpRuntimePool,
+    AcpTimeoutError,
+    CliCredentials,
+    default_argv,
+    default_env,
+)
 from .core.client import UpstreamClient
 from .core.config import ConfigError, load_settings
-from .core.credits import display_model_id, is_finite_number, upstream_model_id
 from .core.gateway import Gateway
-from .core.growth import GrowthService
+from .core.models import ModelCatalog, strip_model_alias
 from .core.notifications import AdminNotifier
+from .core.numbers import is_finite_number
 from .core.routing import ORDERED_MODEL_ID, ModelRouter
 from .core.scheduler import SigninScheduler
 from .core.signin import SigninService
-from .core.storage import CredentialStore, StateStore
+from .core.storage import StateStore
 
 PLUGIN_NAME = "astrbot_plugin_workbuddy"
 
-# Fixed domestic upstream boundaries.  No raw URL is user-configurable; the
-# tests patch these three module-level constants at the network edge.
-CHAT_BASE = "https://copilot.tencent.com"
+# 命令回复前最多等这么久把登录链接拿到手：拿到就把链接放进回复里；拿不到就先回
+# 一句"稍后查看"，等链接后到时再补一条通知。测试替换这个常量，不睡真 5 秒。
+_LOGIN_LINK_SECONDS = 5.0
+
+# 模块级 logger 只用于"本该有人看见"的意外：用户可见文案是固定中文，不该承载
+# 诊断信息。
+_log = logging.getLogger(PLUGIN_NAME)
+
+# 签到接口的固定边界。没有用户可配置的 URL：测试在本层替换这个常量，再往下都是
+# 写死的路径拼接。
 BILLING_BASE = "https://www.codebuddy.cn"
-WEB_BASE = "https://www.workbuddy.cn"
 
 # Fixed notifier categories the signin summary may carry; anything else is
 # ignored so no arbitrary collaborator field is ever forwarded.
@@ -58,33 +74,28 @@ _ROUTE_REASON_TEXTS = {
     "rate_limited": "上游限流",
     "upstream": "上游返回错误",
     "stream": "上游流中断",
-    "timeout": "首帧超时",
+    # 不叫"首帧超时"：同一个 key 也用在"正文已经吐了一部分、prompt 超时"那一轮上，
+    # 那时候第一帧早发过了，文案会指向一个根本不存在的原因。
+    "timeout": "超时",
     "error": "未知失败",
     "local_limit": "本地请求预算限制",
 }
 
 HELP_TEXT = """WorkBuddy 指令（仅管理员私聊）：
 /wb help                 显示本帮助
-/wb status               查看只读完整总览（就绪/登录/监听/签到/通知/积分/模型/主备/成长/请求体上限）
+/wb status               查看只读完整总览（就绪/登录/CLI 进程/监听/签到/通知/模型/主备/请求体上限）
 /wb login                获取登录链接
 /wb logout               退出登录
-/wb models               列出可用模型（带倍率与促销说明）
-/wb balance              查看账户积分
+/wb models               列出本机 CLI 可用的模型
 /wb signin               手动签到
-/wb signin resume        恢复被暂停的签到
-/wb tasks                只读列出成长任务
-/wb tasks run            后台执行成长任务
-/wb tasks claim          后台领取已完成任务奖励
-/wb tasks status         查看成长任务状态
-/wb tasks cancel         取消成长任务
-/wb tasks resume         恢复被暂停的成长任务"""
+/wb signin resume        恢复被暂停的签到"""
 
 
 @register(
     "astrbot_plugin_workbuddy",
     "mydanyi",
-    "将 WorkBuddy 接入 AstrBot，提供 OpenAI 兼容 API（普通/流式）、自动签到、成长任务一键执行与领奖、积分与模型倍率总览、模型列表定时刷新、主备模型按顺序调用，以及可配置管理员 QQ 的签到与异常通知。",
-    "0.1.3",
+    "将 WorkBuddy 接入 AstrBot：通过官方 CodeBuddy CLI 的 ACP 通道提供 OpenAI 兼容 API（普通/流式）、扫码登录、自动签到、模型列表与主备模型按顺序调用，以及可配置管理员 QQ 的签到与异常通知。",
+    "0.3.0",
 )
 class WorkBuddyPlugin(Star):
     """The single WorkBuddy entry point."""
@@ -97,31 +108,63 @@ class WorkBuddyPlugin(Star):
         self.ready = False
         self.error_reason = ""
         self.data_dir = None
-        self.store = None
         self.state = None
         self.session = None
-        self.auth = None
+        self.account = None
         self.client = None
         self.chat = None
         self.gateway = None
         self.router = None
         self.scheduler = None
-        self.growth = None
         self.notifier = None
+        # ACP：按模型分进程的 CLI 池，懒启动——第一次登录或聊天才拉起子进程。
+        self.acp = None
+        # 本地模型清单：读 CLI 的 --help，不联网、不要登录。
+        self.catalog = None
 
         self._login_task = None
-        # The single periodic model-catalog refresh task (``None`` while the
-        # local policy is switched off or before the runtime is ready).
+        # 登录、登出、拆卸三条路都要「读走—取消—收尸」同一条 ``_login_task``。
+        # 没有这把锁，两条命令交错时谁都能把对方的任务从槽里摘走再各塞一条新的：
+        # 留下的那条没人认领，攥着运行时和 token 一直跑下去，而命令已经回了
+        # "已退出登录"。锁只圈换任务这一小段——``_begin_login`` 等扫码的那几秒
+        # 必须在锁外，不然一条登出能被登录链接堵住。
+        self._login_task_lock = asyncio.Lock()
+        # 收尾的串行闸门：``terminate()`` 的 shield 会把收尾留在后台跑，而下一次
+        # ``initialize()`` 一进门也要收尾。两边同时做，旧的那一轮会在新的运行时
+        # 建好之后再把它清一遍（见 ``_release_runtime``）。
+        self._teardown_lock = asyncio.Lock()
+        # 那把锁只排得清"谁先进去"，排不了"谁还没来排队"：``shield`` 只是把收尾
+        # 包成一条任务，从它被创建到第一次被调度之间，``terminate()`` 完全可能先
+        # 被取消。这段窗口里 ``initialize()`` 能直接拿到锁，把运行时建好，那条任务
+        # 醒来之后再擦一遍——锁一点忙都帮不上。所以任务本身也留一份，
+        # ``initialize()`` 先等它真的结束（见 ``_wait_for_pending_teardown``）。
+        self._teardown_task = None
+        # 每一轮拆卸都让此前开跑的初始化**作废**。``initialize()`` 中间要等清单探针
+        # （读本地 CLI，可能要几秒），这段时间 ``terminate()`` 完全可能整轮跑完：网关、
+        # 调度器、池都清掉；那边醒来照样把 ``ready`` 置 True，插件自称可用，手里却是
+        # 空的。收尾时对一下身份，对不上就把这一轮丢掉。
+        self._lifecycle_epoch = 0
+        # 初始化排队用。只串行 ``initialize()``，不串 ``terminate()``——卸载路径上
+        # 绝不能让一次本地 CLI 探针把它挡住。
+        self._init_lock = asyncio.Lock()
+        # 定时重读模型清单的那条任务；同一时刻只允许存在一条。
         self._model_refresh_task = None
+        # 已经作废、但还有子进程没死的池。``AcpRuntimePool.shutdown()`` 关不掉的
+        # 那条会留在池自己的账上；池要是跟着 ``self.acp`` 一起被丢掉，那笔账也就
+        # 没了——下一轮 initialize 建的是新池，这条 CLI 从此没人认得。所以留在这里，
+        # 每次拆卸都再关一遍，直到它真的空掉。
+        self._retired_pools = []
         self._notify_tasks = set()
         self._notify_umo = None
         self._notify_settings = None
-        # A read-only snapshot of the last successful model catalog read; the
-        # overview reuses it for the route multipliers instead of re-querying.
-        self._model_meta = None
         # No proactive notice may be queued until the runtime is fully built.
         self._notify_stopped = True
         self._logout_in_progress = False
+        # 登出已经开场、还在清场。跟 ``_logout_in_progress`` 不是一回事：那个是告警
+        # 闸门（"这次失败是我自己弄的，别报"），这个是**登录的准入闸门**。
+        # ``_logout`` 摘走并取消的只是"它进锁那一刻槽里的那条"；此后新起的登录它
+        # 管不着——等人家扫完码把凭据写回去，这边刚好清完场，还回一句"已退出登录"。
+        self._logout_pending = False
         self._gateway_bind_failed = False
 
     # ------------------------------------------------------------------ #
@@ -129,8 +172,23 @@ class WorkBuddyPlugin(Star):
     # ------------------------------------------------------------------ #
 
     async def initialize(self) -> None:
-        """Build the runtime; a repeated call releases the previous one first."""
+        """Build the runtime; a repeated call releases the previous one first.
+
+        两轮初始化**排队**，不并着走。它们改的是同一批字段（``acp`` / ``gateway`` /
+        ``scheduler`` / ``catalog``），并着走的话后一轮开场就 ``_release_runtime()``，
+        把前一轮刚建好的那套收掉，而前一轮还卡在等清单上；等它醒来，``ready`` 与手里
+        的运行时对不上。排队还让下面那个"过期"判断变得可信——代号变了只可能是拆卸干
+        的，不会是另一轮初始化，所以过期那一轮自己收自己的收尾不会误伤谁。
+        """
+        async with self._init_lock:
+            await self._initialize_once()
+
+    async def _initialize_once(self) -> None:
+        await self._wait_for_pending_teardown()
         await self._release_runtime()
+        # 这一轮的身份。下面每一个 await 之后，别人都可能把整轮收掉；收掉一次身份
+        # 就变一次，收尾时对不上就说明"我建的这套已经不算数了"。
+        epoch = self._lifecycle_epoch
 
         try:
             settings = load_settings(self._raw_config)
@@ -149,29 +207,31 @@ class WorkBuddyPlugin(Star):
             return
         self.data_dir = data_dir
 
-        env_name = settings["auth"]["master_key_env"]
-        master_key = os.environ.get(env_name)
-        if not master_key:
-            self._fail("未设置主密钥环境变量 {}，请配置后重载插件。".format(env_name))
-            return
-        try:
-            store = CredentialStore(data_dir, master_key)
-        except ValueError:
-            self._fail("主密钥无效：需为标准 base64 且解码后恰好 32 字节。")
-            return
         try:
             state = StateStore(data_dir)
             state.load()  # a corrupted state file disables the plugin, never wiped
         except ValueError:
             self._fail("本地状态文件损坏，请联系维护者后再重载。")
             return
-        try:
-            store.load()  # a corrupted credential file disables the plugin
-        except ValueError:
-            self._fail("本地凭据无法解密，请检查主密钥或重新登录。")
-            return
-        self.store = store
         self.state = state
+
+        # CLI 的两个目录都放在插件数据目录下：配置目录管行为，家目录管凭据（CLI 用
+        # os.homedir() 解析凭据路径，只有改 HOME 才圈得住），容器重建后登录态仍在。
+        acp = settings["acp"]
+        self.acp = AcpRuntimePool(
+            lambda model: self._make_runtime(model),
+            max_processes=acp["max_processes"],
+            primary_model=acp["model"] or None,
+        )
+        # 清单探针必须与聊天进程跑在同一套环境里：``codebuddy --help`` 会带上配置
+        # 目录里的自定义模型（``custom-local:``），探针若继承宿主 env，就会和聊天进程
+        # 报出两份不一样的清单。``config_path`` 同理——不给路径，``models.json`` 那条
+        # 回退永远是死代码：``_from_config`` 见到空路径直接返回空。
+        self.catalog = ModelCatalog(
+            acp["cli_path"],
+            config_path=self._models_path(),
+            env=default_env(config_dir=self._config_dir(), home_dir=self._home_dir()),
+        )
 
         # The ordered primary / standby route is a purely local decision layer
         # over the validated settings and the shared state store.  It is built
@@ -190,26 +250,24 @@ class WorkBuddyPlugin(Star):
                 settings["routing"], state, on_result=self._on_routing_result
             )
             self.session = aiohttp.ClientSession(timeout=timeout)
-            self.auth = AuthManager(
-                self.session,
-                store,
-                chat_base=CHAT_BASE,
-                poll_interval=settings["auth"]["poll_interval"],
-                login_timeout=settings["auth"]["login_timeout"],
-            )
+            # 凭据只有一个来源：CLI 自己落盘的那份。插件不再跑 OAuth —— 两个
+            # 刷新者迟早互相把对方的 token 作废。
+            #
+            # 拿到的是**池里那条主运行时**（不是临时造一条）：它由池持有，登录成功
+            # 后的重启、退出登录时的回收都还管得到它。自己造一条就成了一条谁也不
+            # 认领的进程。
+            self.account = CliCredentials(self.acp.primary)
             self.client = UpstreamClient(
                 self.session,
-                self.auth,
-                chat_base=CHAT_BASE,
+                self.account,
                 billing_base=BILLING_BASE,
-                web_base=WEB_BASE,
                 on_error=self._on_upstream_error,
-                on_models=self._on_models,
             )
             self.notifier = AdminNotifier(
-                self.context, state, settings["notifications"], self.client
+                self.context, state, settings["notifications"]
             )
-            self.chat = ChatService(self.client)
+            # 聊天后端在 _build_gateway 里按需装配，这里不先建一份：网关与后端
+            # 必须成对出现，否则登录成功重建网关时会留下一个没人持有的旧后端。
             await self._build_gateway()
 
             signin = settings["signin"]
@@ -222,38 +280,31 @@ class WorkBuddyPlugin(Star):
                 jitter=signin["jitter"],
                 max_attempts=signin["max_attempts"],
                 enabled=signin["enabled"],
-                on_success=self._on_signin_success,
                 on_result=self._on_signin_result,
             )
-
-            growth = settings["growth"]
-            self.growth = GrowthService(
-                self.client,
-                self.chat,
-                state,
-                task_interval=growth["task_interval"],
-                poll_interval=growth["poll_interval"],
-                progress_timeout=growth["progress_timeout"],
-                max_retries=growth["max_retries"],
-                max_chat_requests=growth["max_chat_requests"],
-                auto_claim=growth["auto_claim"],
-                allowed_tasks=growth["allowed_tasks"],
-                allow_telemetry=growth["allow_telemetry"],
-                allow_theme_change=growth["allow_theme_change"],
-                allow_adoption=growth["allow_adoption"],
-                on_result=self._on_growth_result,
-            )
         except Exception:
+            # 这条 except 把任何构造期异常都压成一句"初始化失败"。不打日志，日志里
+            # 就真的只剩这一句——真实踩过：网关端口被占和字段读错长得一模一样。
+            _log.exception("workbuddy: runtime construction failed")
             await self._release_runtime()
             self._fail("插件初始化失败，请查看日志后重载。")
             return
 
-        # The native model picker is filled from the account's real catalog.
-        # This read is deliberately outside the runtime try above and outside
-        # the notice gate below: a 429 / network / business failure only leaves
-        # the picker on the saved choices, and can never disable the gateway,
-        # the scheduler or the login flow, and never queues a notice.
+        # The native model picker is filled from the local catalog.  This read is
+        # deliberately outside the runtime try above and outside the notice gate
+        # below: a missing CLI only leaves the picker on the saved choices, and
+        # can never disable the gateway, the scheduler or the login flow.
         await self._prime_model_options()
+
+        if epoch != self._lifecycle_epoch:
+            # 等清单的这几秒里，``terminate()`` 把整轮收完了：网关、调度器、池、清单
+            # 全没了。再往下就是 ``ready = True``（插件自称可用、手里是空的）外加一句
+            # ``self.scheduler.start()``。把这一轮迟到建出来的东西收掉，当作没发生过。
+            # 这一步收的是共享字段，所以上面必须排队：并着走的另一轮初始化此刻可能正
+            # 握着这些字段，收下去就是把别人的运行时拆了。
+            _log.info("workbuddy: initialization dropped, a teardown overtook it")
+            await self._release_runtime()
+            return
 
         self.ready = True
         self.error_reason = ""
@@ -269,35 +320,93 @@ class WorkBuddyPlugin(Star):
             )
 
         # Only an existing, decrypted account may start the automatic loop.
-        if settings["signin"]["enabled"] and self.auth.credentials:
+        if settings["signin"]["enabled"] and self.account.credentials:
             try:
                 self.scheduler.start()
             except Exception:
                 pass
 
-        # The periodic catalog refresh is started only now: the runtime is
-        # ready and the initial prime already ran, so this holds one sleeping
-        # timer and never issues an immediate second read.  It is not tied to
-        # the login state, so a plugin without credentials still keeps one
-        # sleeping timer; the shared refresh helper stays silent until a login.
+        # 定时重读模型清单。它只碰本机 CLI，与账号、网关都无关，所以不看签到那份
+        # 前提；起不来也只是静默跳过，绝不影响已经可用的运行时。
         self._start_model_refresh()
 
     async def terminate(self) -> None:
         """Release every owned resource; safe to call more than once."""
-        await self._release_runtime()
+        # 整段收尾都要罩住，不只是关进程那一步：挂账发生在它之前，而取消落在更早的
+        # 等待点（停监听、收登录任务）上时，池连账都没上，罩住后半段也白搭——那正是
+        # "没人认得的 CLI"在同一个函数的更早窗口重开。``shield`` 让外层取消照样立刻
+        # 抛出，收尾在后台跑完（事件循环整个退出就真没辙了，那属于进程级收尾，接受）。
+        #
+        # 任务先落地再 shield：只有从 ``_teardown_task`` 上看得见，下一次
+        # ``initialize()`` 才等得到它。已经在后台跑的那条直接复用，不另起一条。
+        task = self._teardown_task
+        if task is None or task.done():
+            task = asyncio.ensure_future(self._release_runtime())
+            self._teardown_task = task
+        await asyncio.shield(task)
 
     # ------------------------------------------------------------------ #
     # runtime construction / teardown
     # ------------------------------------------------------------------ #
 
+    def _make_runtime(self, model) -> AcpRuntime:
+        """给池造一条运行时；``model`` 为 ``None`` 时用 CLI 自己的默认模型。"""
+        acp = self._settings["acp"] if self._settings else {}
+        data_dir = self.data_dir
+        return AcpRuntime(
+            argv=default_argv(
+                acp.get("cli_path") or "codebuddy",
+                tools=acp.get("tools", ""),
+                model=model,
+            ),
+            cwd=data_dir,
+            model=model,
+            config_dir=self._config_dir(),
+            home_dir=self._home_dir(),
+            # 等扫码完成的上限。不接进来的话管理员改了没反应，实际永远走运行时里
+            # 300 秒的默认值。
+            login_timeout=float(acp.get("login_timeout") or 120),
+        )
+
+    def _config_dir(self):
+        if not self.data_dir:
+            return None
+        return os.path.join(self.data_dir, "codebuddy")
+
+    def _home_dir(self):
+        if not self.data_dir:
+            return None
+        return os.path.join(self.data_dir, "cli-home")
+
+    def _models_path(self):
+        """CLI 自己的模型清单文件（``--help`` 读不到时的回退来源）。
+
+        CLI 读的是 ``<配置目录>/models.json``（CLI 2.182.0 的产物里就是这个相对路径）。
+        配置目录由插件指定，所以这里能算准；算不出来时返回 ``None``，回退分支就按
+        "没这个文件"处理，而不是去读一个猜出来的路径。
+        """
+        config_dir = self._config_dir()
+        return None if config_dir is None else os.path.join(config_dir, "models.json")
+
     async def _build_gateway(self) -> None:
         s = self._settings["gateway"]
         self._gateway_bind_failed = False
         if self.chat is None:
-            self.chat = ChatService(self.client)
+            # 聊天直接走 ACP：把进程池交给后端，由它按请求里的模型挑一条进程、
+            # 懒启动 CLI，并把 401 与正常收尾回灌到那条运行时的登录态（否则
+            # /wb status 会一直显示"已登录"）。
+            # 并发门不在这里设：网关会按自己的配置写到 chat.limits 上。
+            self.chat = AcpChatBackend(
+                None,
+                pool=self.acp,
+                model=self._settings["acp"]["model"] or None,
+                # 聊天失败曾经由 UpstreamClient 的观察者顺手报给管理员；改走
+                # ACP 之后那条链路不在了，这里补回来，否则群里开始报错而
+                # 管理员一句提醒都收不到。
+                on_error=self._on_chat_error,
+            )
         self.gateway = Gateway(
             self.chat,
-            self.client,
             api_key=s["api_key"],
             host=s["host"],
             port=s["port"],
@@ -306,6 +415,7 @@ class WorkBuddyPlugin(Star):
             queue_size=s["queue_size"],
             queue_timeout=s["queue_timeout"],
             router=self.router,
+            catalog=self.catalog,
             max_request_body_mb=s["max_request_body_mb"],
         )
         if s["enabled"] and s["api_key"]:
@@ -321,41 +431,97 @@ class WorkBuddyPlugin(Star):
                     self._error_notify_on(), lambda: self.notifier.error("runtime")
                 )
 
+    async def _wait_for_pending_teardown(self) -> None:
+        """等上一轮被取消后留在后台的收尾真的结束。
+
+        ``_teardown_lock`` 挡不住"还没来排队"的那一轮：``shield`` 只是把收尾包成
+        一条任务，从 ``ensure_future`` 到它第一次被调度之间，``terminate()`` 可以
+        先被取消。这段时间进 ``initialize()`` 会拿到一把没人排队的锁、把运行时建
+        好，而那条任务醒来之后再清一遍——监听还在、``ready`` 还是 True，路由和通知
+        却没了。任务本身留了一份在这里，就先等它，再谈锁。
+        """
+        task = self._teardown_task
+        if task is None or task.done():
+            return
+        # 连这一等也要 shield。``gather`` 是**我们**等别人的一条等待，外层一旦取消
+        # 这一轮初始化，取消会顺着 gather 传到那条收尾任务上——``return_exceptions``
+        # 只收结果、不挡取消。而收尾可能在 ``gateway.stop()`` 里等 handler，被砍在
+        # 那儿就跳过 runner 清理；偏偏 ``self.gateway`` 已经置空了，后面没人再关得掉
+        # 那个监听，下一次初始化绑定同一个端口就失败。任务留着，再来一次还是等它。
+        await asyncio.shield(asyncio.gather(task, return_exceptions=True))
+
     async def _release_runtime(self) -> None:
+        """收尾；并发调用排队，后来的那一轮等前一轮真的收完再动手。
+
+        ``terminate()`` 用 shield 把收尾挪到后台：外层取消之后它还在跑。下一次
+        ``initialize()`` 的第一件事也是收尾——不排队的话，它会在旧那一轮还卡在
+        某个等待点上时就把运行时重建好；旧收尾随后醒过来，继续把 ``router`` /
+        ``notifier`` / ``catalog`` / ``_notify_umo`` 清一遍。监听还在、``ready``
+        还是 True，路由和通知却没了，而且要等到下一次重载才看得出来。
+        """
+        async with self._teardown_lock:
+            await self._release_runtime_once()
+
+    async def _release_runtime_once(self) -> None:
+        # 先把这一轮的身份推进一格：从这里开始，任何还在半路上的 ``initialize()``
+        # 都算过期——它建的东西正被下面逐项拆掉。
+        self._lifecycle_epoch += 1
         self.ready = False
         # Block new notifications before any producer is stopped.
         self._notify_stopped = True
 
-        login_task = self._login_task
-        self._login_task = None
-        if login_task is not None and not login_task.done():
-            login_task.cancel()
-            with contextlib.suppress(BaseException):
-                await login_task
+        # 拆卸也要走同一把锁：一条登录命令正卡在换任务那一步时，这里读到的
+        # ``None`` 只是"它还没塞进去"，不是"没有登录在跑"。摘空了就等于把一条
+        # 攥着运行时和 token 的协程留在拆卸之后。
+        async with self._login_task_lock:
+            await self._cancel_login_task()
 
-        # Stop the periodic catalog refresh *before* the shared client and HTTP
-        # session are released below, so a blocked refresh is cancelled (its
-        # request too) and no fetch can outlive the teardown.  Safe to repeat.
+        # 定时重读必须停在 ``self.catalog`` 被丢掉之前：它每轮最后一步是发布候选，
+        # 而 ``catalog`` 已置空时发布等于把候选刷成只剩已保存的那几项。cancel 只是
+        # 投递，``await`` 才是真的停住，所以两步都要做。
         refresh_task = self._model_refresh_task
         self._model_refresh_task = None
         if refresh_task is not None and not refresh_task.done():
             refresh_task.cancel()
-            with contextlib.suppress(BaseException):
-                await refresh_task
+            await asyncio.gather(refresh_task, return_exceptions=True)
 
-        # Stop the scheduler / growth producers *before* cancelling the notice
-        # tasks, so nothing new is queued while the pending notices are drained.
+        # 先停网关再收 CLI。反过来（先 shutdown 进程池、后停监听）中间隔着调度器
+        # 和提醒队列两个 await，那段时间端口还开着，任何进来的聊天都会走完整路由
+        # 撞上"运行时已关闭"拿到 502；而 _notify_stopped 在函数开头就置位了，连一条
+        # 提醒都不会有——纯静默失败。
+        gateway = self.gateway
+        self.gateway = None
+        if gateway is not None:
+            with contextlib.suppress(Exception):
+                await gateway.stop()
+
+        # 后端必须跟运行时一起丢。它持着下面这个池，而 shutdown 之后 get() 会永久
+        # 抛 AcpError；留下的旧后端会让下一次 initialize 因为 `self.chat is not None`
+        # 复用它，聊天从此恒 502。
+        self.chat = None
+
+        # Stop the scheduler *before* the runtime and before cancelling the notice
+        # tasks. Before the runtime: an in-flight signin would hit the pool while it
+        # is being shut down, 401 out of `CliCredentials.refresh()`, and persist
+        # `paused=True` — so a reload leaves signin paused until an admin resumes it.
+        # Before the notices: nothing new is queued while the pending ones drain.
         scheduler = self.scheduler
         self.scheduler = None
         if scheduler is not None:
             with contextlib.suppress(Exception):
                 await scheduler.stop()
 
-        growth = self.growth
-        self.growth = None
-        if growth is not None:
-            with contextlib.suppress(Exception):
-                await growth.cancel()
+        # ACP 的 CLI 子进程必须在这里收掉：登录任务已经取消，再没人用它。
+        acp = self.acp
+        self.acp = None
+        if acp is not None and acp not in self._retired_pools:
+            # 先挂账再关：``shutdown()`` 里有等待点，被取消时下面的出账一行都执行
+            # 不到，而那一刻恰恰最需要这片地方记着"它还没关干净"。
+            self._retired_pools.append(acp)
+        await self._drain_retired_pools()
+
+        # 本地清单只是个内存快照，跟着运行时一起丢，下次重读。
+        self.catalog = None
 
         notify_tasks = [t for t in self._notify_tasks if not t.done()]
         self._notify_tasks.clear()
@@ -364,16 +530,9 @@ class WorkBuddyPlugin(Star):
         if notify_tasks:
             await asyncio.gather(*notify_tasks, return_exceptions=True)
 
-        gateway = self.gateway
-        self.gateway = None
-        if gateway is not None:
-            with contextlib.suppress(Exception):
-                await gateway.stop()
-
         # The route is only consumed by the stopped gateway; drop the reference
-        # (and its read-only multiplier snapshot) after the listener is gone.
+        # after the listener is gone.
         self.router = None
-        self._model_meta = None
 
         session = self.session
         self.session = None
@@ -385,6 +544,26 @@ class WorkBuddyPlugin(Star):
         self.notifier = None
         self._notify_umo = None
 
+    async def _drain_retired_pools(self) -> None:
+        """把账上的池逐个关掉，关干净了才出账。
+
+        用 ``shutdown`` 而不是 ``close_all``：池已经作废，旧引用不能再把 CLI 拉起来。
+        **每个池每次都关**，不看 ``has_live_children`` 再决定——那是"关完之后"的判据，
+        拿它当前置条件会漏掉一个刚挂上来、还什么都没关过的池（它的映射里全是进程，账上
+        却还是空的）。``shutdown()`` 幂等，重复调只多一次关闭超时。
+
+        关不掉的留在账上：它每多活一轮，就多一条"没人认得"的 CLI 的窗口，所以下一次
+        拆卸还要再来一遍；关干净了立刻出账，免得这串东西越攒越长。
+
+        只碰账上那几条，一次空循环就过去了，所以放在拆卸路径上不心疼。
+        """
+        for pool in list(self._retired_pools):
+            with contextlib.suppress(Exception):
+                await pool.shutdown()
+            if not pool.has_live_children:
+                with contextlib.suppress(ValueError):
+                    self._retired_pools.remove(pool)
+
     def _fail(self, reason: str) -> None:
         self.ready = False
         self.error_reason = reason
@@ -392,129 +571,136 @@ class WorkBuddyPlugin(Star):
     # ------------------------------------------------------------------ #
     # native model picker (``routing.models`` options / labels)
     #
-    # The operator picks from the account's real WorkBuddy catalog instead of
-    # typing model ids.  Only the *delivered schema* is rewritten in memory: the
+    # The operator picks from the ids this machine's CLI actually accepts instead
+    # of typing them.  Only the *delivered schema* is rewritten in memory: the
     # saved values, the validated settings, the router's order and every file on
-    # disk stay exactly as the operator wrote them.  The option values are pure
-    # upstream ids (plus any legacy alias the operator already saved), and the
-    # parallel labels are the existing ``display_model_id`` metadata.
+    # disk stay exactly as the operator wrote them.  Options and labels are both
+    # plain ids -- the multiplier suffix this plugin used to append is gone.
     # ------------------------------------------------------------------ #
 
     async def _prime_model_options(self) -> None:
-        """Publish the saved choices, then attempt exactly one catalog read."""
-        self._publish_model_options(None)
-        await self._refresh_model_options()
+        """Publish the saved choices, read the catalog once, publish again."""
+        self._publish_model_options()
+        await self._refresh_catalog()
+        self._publish_model_options()
 
-    async def _refresh_model_options(self) -> None:
-        """One noncritical catalog read; a failure keeps the last options.
+    async def _refresh_catalog(self) -> list:
+        """Re-read the local model list; a failure keeps the last good one.
 
-        Only an authenticated account is read.  The successful list is published
-        by the client's own ``on_models`` observer (``_on_models``), so no
-        second read is ever issued and a failed read changes nothing.
+        **只在同一个 ``ModelCatalog`` 实例上重读，绝不替换 ``self.catalog``。** 定时
+        循环每轮记下这个对象、读完比对还是不是它，用来判断"这一轮读的世界还算不算
+        数"；重读若把实例换掉，那一轮会被判成"世界变了"而跳过，而且每轮都这样，
+        定时从此只读不发。``ModelCatalog.refresh()`` 原地更新，这里也只做转发。
         """
-        client = self.client
-        if client is None or not client.credentials.get("accessToken"):
-            return
+        catalog = self.catalog
+        if catalog is None:
+            return []
         try:
-            await client.model_details()
+            return await catalog.refresh()
         except asyncio.CancelledError:
             raise
         except Exception:  # noqa: BLE001 - a picker read never fails the runtime
-            return
+            return catalog.models
 
     def _start_model_refresh(self) -> None:
-        """Start the single periodic catalog task; never fetches here.
+        """Start the single periodic re-read; never reads here.
 
-        The switch and the interval come from the validated settings, so a
-        disabled group leaves ``_model_refresh_task`` at ``None``.  A live task
-        is never replaced, so a repeated start cannot stack a second timer.
+        这里只起任务、不读清单：启动首读已经由 ``_prime_model_options()`` 做过一
+        次，紧接着再 spawn 一个 ``--help`` 只会把启动拖慢一倍。所以第一轮要等满一
+        个间隔——顺带也让"刚启动就被重载"不会变成连续两次进程启动。
         """
         settings = self._settings
-        refresh = settings.get("model_refresh") if isinstance(settings, dict) else None
+        refresh = (
+            settings.get("model_refresh") if isinstance(settings, dict) else None
+        )
         if not isinstance(refresh, dict) or refresh.get("enabled") is not True:
             return
         existing = self._model_refresh_task
         if existing is not None and not existing.done():
+            # 幂等：这个方法只管"确保有一条在跑"，不管重启。换配置走一次
+            # ``initialize()``——它开头就会 ``_release_runtime()``，旧任务在那里
+            # 被收掉。生命周期交叠时也可能撞见一条上家的任务：留着它，让循环自己
+            # 按当轮的清单重新取，而不是这里再起一条。
             return
-        minutes = refresh.get("interval_minutes")
-        if isinstance(minutes, bool) or not isinstance(minutes, int) or minutes < 1:
+        seconds = _refresh_interval_seconds(refresh.get("interval_minutes"))
+        if seconds is None:
             return
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
             return
-        try:
-            task = loop.create_task(
-                self._model_refresh_loop(minutes * 60), name="wb-model-refresh"
-            )
-        except Exception:  # noqa: BLE001 - a timer is never worth a failure
-            return
+        task = loop.create_task(
+            self._model_refresh_loop(seconds), name="wb-model-refresh"
+        )
         task.add_done_callback(self._consume_task)
         self._model_refresh_task = task
 
-    async def _model_refresh_loop(self, interval_seconds) -> None:
-        """Refresh the catalog once per interval, sequentially, forever.
+    async def _model_refresh_loop(self, interval_seconds: int) -> None:
+        """Re-read the catalog once per interval, sequentially, until cancelled.
 
-        The first read waits one whole interval, so the startup prime stays the
-        only immediate read.  ``_refresh_model_options`` already checks the
-        credentials and swallows ordinary fetch failures, so a failed interval
-        keeps the last good options and simply waits for the next one; no tight
-        retry.  One serial loop can never overlap two timer reads.
+        每轮都走 :meth:`_refresh_catalog`：读失败时它保留上一次成功的清单、并把
+        下一次尝试推后，所以这里不需要自己的重试与退避。发布是幂等的，重复发同
+        一份候选不会产生副作用。
+
+        **每轮开头先确认这一轮还该不该由我来跑。** 生命周期是"先拆后建"，两次调用
+        交叠时，拆的那一次可能已经读过 ``_model_refresh_task`` 之后才被建的任务追上
+        来：任务还在跑，但已经没人持有它。让它继续跑只有一个结果——按一份过期的
+        （甚至空的）清单把配置页候选重发一遍，每个间隔一遍，而且永不退场。所以要
+        查两条：**我还是不是插件握着的那一条**（换了新任务说明这次交接不是我的），
+        以及**还有没有清单可发**。
+
+        **发之前还要再判一次，判据是"我读的那份还在不在"。** 读清单那一步会 spawn
+        一个 ``--help``，是真的让出点；运行时正好能在这段时间里被拆掉，`self.catalog`
+        就在这个 await 里变成 ``None``。只在轮首判一次的话，回来照样按空清单发布，
+        而且发布之后没有任何东西会把它纠正回来。检查与发布之间不许有 await，这个
+        窗口才关得死。
+
+        **换了一份（不是拆掉）只跳过这一轮，不退出。** 交叠的 ``initialize()`` 会
+        重建清单，而它收尾的 ``_start_model_refresh()`` 看到这条任务还活着就不再起新
+        的——这时候退出去，定时就永远停在那儿，配置页还显示"已启用"。跳过这一轮，
+        下一轮轮首重新取当前那份，自己就接上了。
         """
         while True:
             await asyncio.sleep(interval_seconds)
-            await self._refresh_model_options()
+            if asyncio.current_task() is not self._model_refresh_task:
+                return
+            catalog = self.catalog
+            if catalog is None:
+                return
+            await self._refresh_catalog()
+            if self.catalog is not catalog:
+                # 拆了就是拆了（None，下一轮轮首收尾）；换了一份就重来一轮。
+                continue
+            self._publish_model_options()
 
-    def _on_models(self, details) -> None:
-        """UpstreamClient ``on_models`` observer: sync, returns no awaitable."""
-        self._publish_model_options(details)
-
-    def _publish_model_options(self, details) -> None:
+    def _publish_model_options(self) -> None:
         """Rebuild the delivered ``routing.models`` options/labels in place.
 
-        ``details`` is the last successful ``model_details`` snapshot, or
-        ``None`` to publish only the operator's already saved values (startup /
-        reset).  A value the live catalog no longer contains is kept and marked
+        A saved value the local catalog no longer contains is kept and marked
         unconfirmed, never dropped and never shown as verified availability.
         """
-        meta = {}
-        catalog = []
-        if isinstance(details, list):
-            for detail in details:
-                if not isinstance(detail, dict):
-                    continue
-                model_id = detail.get("id")
-                if not isinstance(model_id, str) or not model_id:
-                    continue
-                if model_id in meta:
-                    continue
-                meta[model_id] = dict(detail)
-                catalog.append(model_id)
-        self._model_meta = meta or None
-        has_catalog = bool(catalog)
+        catalog = self.catalog
+        models = catalog.models if catalog is not None else []
+        known = set(models)
 
         values = []
         labels = []
-        seen = set()
         for saved in self._saved_model_values():
-            pure = upstream_model_id(saved)
-            pure = pure.strip() if isinstance(pure, str) else ""
-            if not pure or pure == ORDERED_MODEL_ID or saved in seen:
+            pure = strip_model_alias(saved).strip()
+            if not pure or pure == ORDERED_MODEL_ID or pure in values:
                 continue
-            seen.add(saved)
-            values.append(saved)
-            labels.append(
-                self._model_option_label(saved, pure, meta.get(pure), has_catalog)
-            )
-        for model_id in catalog:
-            if model_id in seen or model_id == ORDERED_MODEL_ID:
+            values.append(pure)
+            if models and pure not in known:
+                labels.append("{}（当前目录无此模型）".format(pure))
+            else:
+                labels.append(pure)
+        for model in models:
+            if model in values or model == ORDERED_MODEL_ID:
                 continue
-            seen.add(model_id)
-            values.append(model_id)
-            labels.append(display_model_id(meta[model_id]))
+            values.append(model)
+            labels.append(model)
 
-        # A plain dict config has no schema to extend: the metadata snapshot
-        # above is still published for the ``/wb status`` route view.
+        # A plain dict config has no schema to extend.
         schema = getattr(self._raw_config, "schema", None)
         section = schema.get("routing") if isinstance(schema, dict) else None
         items = section.get("items") if isinstance(section, dict) else None
@@ -550,32 +736,6 @@ class WorkBuddyPlugin(Star):
             ]
         return []
 
-    @staticmethod
-    def _model_option_label(value, model_id, detail, has_catalog) -> str:
-        """The display label of one picker option (never a fabricated zero)."""
-        if isinstance(detail, dict):
-            label = display_model_id(detail)
-            if value == model_id:
-                return label
-            # A saved legacy alias keeps its exact stored value as the option,
-            # so the live metadata is only appended as an unconfirmed note.
-            return "{}（旧倍率别名；当前目录为 {}）".format(value, label)
-        if value != model_id:
-            return "{}（旧倍率别名，未确认）".format(value)
-        if has_catalog:
-            return "{} [未确认：当前目录无此模型]".format(value)
-        return display_model_id({"id": model_id})
-
-    def _on_signin_success(self) -> None:
-        """SigninScheduler callback: only the background growth run is started."""
-        if self.growth is None or self._settings is None:
-            return
-        if self._settings["growth"]["auto_after_signin"]:
-            try:
-                self.growth.start()
-            except Exception:
-                pass
-
     # ------------------------------------------------------------------ #
     # proactive admin notifications
     #
@@ -583,8 +743,7 @@ class WorkBuddyPlugin(Star):
     # return an awaitable: the upstream client and the signin scheduler ``await``
     # a hook's return value, so an ``async`` hook (or a returned ``Task``) would
     # block the real request.  Instead a hook queues the notifier coroutine as a
-    # controlled background task, and only when the matching switch is on, so a
-    # disabled notice can never trigger an extra balance read.
+    # controlled background task, and only when the matching switch is on.
     # ------------------------------------------------------------------ #
 
     def _signin_notify_on(self) -> bool:
@@ -671,32 +830,6 @@ class WorkBuddyPlugin(Star):
                 lambda: self.notifier.error(category, source="signin"),
             )
 
-    @staticmethod
-    def _growth_error_category(summary: dict):
-        """Map a growth summary to a fixed notifier category, or ``None``."""
-        code = summary.get("code")
-        if code == "rate":
-            return "rate"
-        if code == "network":
-            return "network"
-        if code == "auth":
-            # 401/403 is already reported -- and distinguished -- by the final
-            # upstream-error observer, so never send a second auth notice.
-            return None
-        return "growth"
-
-    def _on_growth_result(self, summary) -> None:
-        """GrowthService ``on_result`` hook: sync, never returns an awaitable."""
-        if not isinstance(summary, dict) or not summary.get("needs_attention"):
-            return
-        category = self._growth_error_category(summary)
-        if category is None:
-            return
-        self._queue_notice(
-            self._error_notify_on(),
-            lambda: self.notifier.error(category, source="growth"),
-        )
-
     def _on_upstream_error(self, category) -> None:
         """UpstreamClient ``on_error`` observer: sync, never returns an awaitable."""
         if self.client is None or self.notifier is None:
@@ -708,8 +841,8 @@ class WorkBuddyPlugin(Star):
         # a login completes again.
         if self._logout_in_progress:
             return
-        # Never recurse: an alert's own balance read failing must not spawn a
-        # second alert.  Keyed by the running task, so genuine business failures
+        # Never recurse: an alert's own request failing must not spawn a second
+        # alert.  Keyed by the running task, so genuine business failures
         # (running under normal tasks) are still reported.
         current = asyncio.current_task()
         if current is not None and current in self._notify_tasks:
@@ -720,6 +853,28 @@ class WorkBuddyPlugin(Star):
         self._queue_notice(
             self._error_notify_on(),
             lambda: self.notifier.error(category, source=source),
+        )
+
+    def _on_chat_error(self, category) -> None:
+        """AcpChatBackend ``on_error`` observer: sync, never returns an awaitable.
+
+        与 :meth:`_on_upstream_error` 同一套闸门：未登录时聊天失败是预期的，
+        不去打扰管理员；退出登录进行中同理；提醒自身引发的失败也不再提醒。
+        """
+        if self.notifier is None:
+            return
+        # 写成正向条件，才与 _on_upstream_error 同形：没有凭据来源、或凭据里
+        # 没有 accessToken，都说明"还没登录"，此时聊天失败是预期的。
+        if self.account is None or not self.account.credentials.get("accessToken"):
+            return
+        if self._logout_in_progress:
+            return
+        current = asyncio.current_task()
+        if current is not None and current in self._notify_tasks:
+            return
+        self._queue_notice(
+            self._error_notify_on(),
+            lambda: self.notifier.error(category, source="chat"),
         )
 
     @staticmethod
@@ -776,7 +931,7 @@ class WorkBuddyPlugin(Star):
             return
         if self._logout_in_progress:
             return
-        # Never recurse from inside a notifier run (its own balance read).
+        # Never recurse from inside a notifier run.
         current = asyncio.current_task()
         if current is not None and current in self._notify_tasks:
             return
@@ -825,12 +980,11 @@ class WorkBuddyPlugin(Star):
             return
 
         if not self.ready:
-            # 显示已存储的固定安全原因（配置错误 / 文件损坏 / 缺 key 处理不同），
-            # 不把任何用户原始配置或 secret 回显给用户。
-            reason = self.error_reason or (
-                "请设置环境变量 {} 后重载插件。".format(self._master_key_env_name())
+            # 显示已存储的固定安全原因（配置错误 / 文件损坏），不把任何用户原始
+            # 配置或 secret 回显给用户。
+            yield event.plain_result(
+                "插件尚未就绪：" + (self.error_reason or "请重载插件后再试。")
             )
-            yield event.plain_result("插件尚未就绪：" + reason)
             return
 
         if action == "status":
@@ -843,78 +997,155 @@ class WorkBuddyPlugin(Star):
             yield event.plain_result(await self._logout())
             return
         if action == "models":
-            yield event.plain_result(await self._models_text())
-            return
-        if action == "balance":
-            yield event.plain_result(await self._balance_text())
+            yield event.plain_result(await self._models_text(refresh=True))
             return
         if action == "signin":
             yield event.plain_result(await self._signin_text(rest))
             return
-        if action == "tasks":
-            yield event.plain_result(await self._tasks_text(rest))
-            return
-        if action.startswith("tasks "):
-            yield event.plain_result(await self._tasks_text(action.split(" ", 1)[1]))
-            return
 
         yield event.plain_result(HELP_TEXT)
-
-    def _master_key_env_name(self) -> str:
-        if self._settings is not None:
-            return self._settings["auth"]["master_key_env"]
-        section = self._raw_config.get("auth") if hasattr(self._raw_config, "get") else None
-        if isinstance(section, dict) and isinstance(section.get("master_key_env"), str):
-            return section["master_key_env"]
-        return "WORKBUDDY_MASTER_KEY"
 
     # ------------------------------------------------------------------ #
     # login / logout
     # ------------------------------------------------------------------ #
 
-    async def _begin_login(self, event: AstrMessageEvent) -> str:
+    async def _cancel_login_task(self) -> None:
+        """把在跑的登录协程摘下来、取消、收尸。
+
+        调用方必须持有 ``self._login_task_lock``。「读走—取消—收尸」三件事拆开做，
+        两条命令交错时都能读到 ``None``，各自再塞一条新任务进去：后塞的那条没人
+        取消，攥着运行时和 token 活到下次登录。
+        """
         existing = self._login_task
         self._login_task = None
-        if existing is not None and not existing.done():
-            existing.cancel()
-            with contextlib.suppress(BaseException):
-                await existing
-        # A new login supersedes any previous pending state / in-flight poll.
-        self.auth.cancel_login()
-        try:
-            info = await self.auth.begin_login()
-        except Exception:
-            return "登录请求失败，请稍后重试。"
-        url = info.get("authUrl") if isinstance(info, dict) else None
-        state = info.get("state") if isinstance(info, dict) else None
-        if not url:
-            return "登录请求失败，请稍后重试。"
-        self._notify_umo = event.unified_msg_origin
-        self._login_task = asyncio.create_task(
-            self._poll_login(state), name="wb-login-poll"
-        )
-        self._login_task.add_done_callback(self._consume_task)
-        return "请使用手机或浏览器打开以下链接完成登录：\n" + url
+        if existing is None or existing.done():
+            return
+        existing.cancel()
+        # 收尸不用 ``suppress(BaseException)``：它分不清"我们自己取消的那条"与
+        # "外层取消了这个协程"——两者抛的都是 ``CancelledError``，一 suppress 就
+        # 把重载/卸载时的取消一起咽了，函数接着往下走（登录处会去发起新的登录，
+        # 退出登录处会边被取消边删凭据）。``gather`` 把前者的 ``CancelledError``
+        # 收成返回值，后者照常往外抛。
+        await asyncio.gather(existing, return_exceptions=True)
 
-    async def _poll_login(self, state) -> None:
+    async def _begin_login(self, event: AstrMessageEvent) -> str:
+        pool = self.acp
+        if pool is None:
+            return "ACP 运行时尚未初始化，请重载插件后再试。"
+        runtime = pool.primary
+        captured = {"url": None}
+        ready = asyncio.Event()
+        # 这条命令的回复一旦交出去，再推一次链接就是第二份。只有"回复里没有链接"的
+        # 那种情况才需要补发，见下面 ``_on_auth_url``。
+        answered = {"done": False}
+        # 回调有没有真把这条链接推出去过。取消除草时靠它判断"手上这条还需不需要补发"。
+        pushed = {"sent": False}
+
+        def _on_auth_url(url: str) -> None:
+            captured["url"] = url
+            ready.set()
+            # 链接赶在回复之前到：回复里会带它，这里再推一遍，同一个会话就收到两条
+            # 一模一样的链接（真机上就是这么弹了两个）。回复已经交出去了才要补一条：
+            # 那种情况下用户手里只有"稍后查看"，不补就永远等不到。
+            if answered["done"]:
+                pushed["sent"] = True
+                task = asyncio.create_task(self._notify("登录链接：\n" + url))
+                task.add_done_callback(self._consume_task)
+
+        # 换任务这一段要在锁里：否则正在跑的登出会把"槽里是 None"当成"没有登录在
+        # 跑"，取消落空之后再让它把这条新任务塞进去。
+        async with self._login_task_lock:
+            if not self.ready or self.acp is not pool:
+                # 拆卸已经开跑了。``_release_runtime`` 在锁里摘走登录任务之后，还要
+                # 去关网关、关池——这期间等在锁上的登录拿到的还是进门时抓的那条
+                # 运行时。它要是登录成功，``_on_login_success`` 会去重建拆卸刚清掉
+                # 的网关和调度器，人却以为插件正在卸载。
+                return "插件状态已变化，请重新执行 /wb login。"
+            if self._logout_pending:
+                # 登出还在清场。这条窗口里起来的登录没人会取消它：等它扫完码把凭据
+                # 写回去，那边刚好清完场，回复还是"已退出登录"。在锁里看，跟登出
+                # 置位是同一把锁，不会看漏。
+                return "正在退出登录，请稍后再试。"
+            await self._cancel_login_task()
+            self._notify_umo = event.unified_msg_origin
+            task = asyncio.create_task(
+                self._run_acp_login(runtime, _on_auth_url), name="wb-acp-login"
+            )
+            self._login_task = task
+            task.add_done_callback(self._consume_task)
+
+        # 链接通常几百毫秒内到达；最多等几秒，拿到就回复，拿不到也先把登录任务
+        # 留着等扫码，不重复发起第二次 authenticate。
+        waiter = asyncio.create_task(ready.wait())
         try:
-            await self.auth.complete_login(state)
+            with contextlib.suppress(Exception):
+                await asyncio.wait(
+                    {waiter, task},
+                    timeout=_LOGIN_LINK_SECONDS,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+            if not waiter.done():
+                waiter.cancel()
+            # 同上：``suppress`` 分不清"我们取消的 waiter"与"外层取消了这个协程"。
+            await asyncio.gather(waiter, return_exceptions=True)
+        except BaseException:
+            # 取消路径上没有"回复"这回事——命令已经结束了。但登录协程还留着等扫码，
+            # 这时不把通道切到通知，后到的链接会以为"回复里带了"，一条也不发，用户
+            # 只能干等到超时。已经到手、回调却还没推过的那条（那一刻门还是 False）
+            # 同样要在这里补一次：它本来要跟着回复一起交出去的，回复没了它也就没了。
+            answered["done"] = True
+            if captured["url"] and not pushed["sent"]:
+                late = asyncio.create_task(self._notify("登录链接：\n" + captured["url"]))
+                late.add_done_callback(self._consume_task)
+            waiter.cancel()
+            raise
+
+        # 从这行起，链接再到达就只能走通知。到读 captured 之间没有 await，回调插不进来。
+        answered["done"] = True
+        if self.acp is not pool:
+            # 池子已经换了，这条登录多半跟着作废；但链接是此刻唯一还能给出去的东西，
+            # 别在这儿把它吞掉——扫得动算捡到，扫不动至少知道自己拿到过什么。
+            if captured["url"]:
+                return (
+                    "插件状态已变化，请重新执行 /wb login。\n"
+                    "本次已生成的链接（可能已失效）：\n" + captured["url"]
+                )
+            return "插件状态已变化，请重新执行 /wb login。"
+        if captured["url"]:
+            return "请使用手机或浏览器打开以下链接完成登录：\n" + captured["url"]
+        if task.done() and not task.cancelled():
+            # 登录协程把失败都收成了固定文案，靠返回值判断，不看异常。
+            if task.result():
+                return "已完成登录。"
+            return "登录失败：CLI 没有给出登录链接，请检查 ACP 配置后重试。"
+        return "登录已发起，但暂时没拿到链接，请稍后用 /wb status 查看。"
+
+    async def _run_acp_login(self, runtime, on_auth_url) -> bool:
+        try:
+            await runtime.login(on_auth_url=on_auth_url)
         except asyncio.CancelledError:
             raise
+        except AcpTimeoutError:
+            await self._notify("登录未完成：等待扫码超时，请重新执行 /wb login。")
+            return False
         except Exception:
-            # A poll failure never reverts credentials; report nothing sensitive.
-            return
-        # Login succeeded: a fresh credential must not stay behind a permanently
-        # paused scheduler / growth service.  Alerts resume from here on.  Cancel
-        # the in-flight growth run, rebuild the shared gateway (an old, closed
-        # gate is unusable), then lift the 401/403 pause in both services.  A
-        # server-forced 429 cooldown (if any) is always preserved by both
-        # resume() calls.
+            # 失败原文里可能有上游报文，绝不外传；只报固定文案。
+            await self._notify("登录失败：无法完成 ACP 登录，请检查 CLI 后重试。")
+            return False
+        await self._on_login_success()
+        return True
+
+    async def _on_login_success(self) -> None:
+        """登录成功后的共同善后：重启全部 CLI、解除暂停、恢复告警与签到。
+
+        登录只发生在一条进程上，其它模型的进程是登录前起的，手里还记着"未登录"。
+        这里统一重启整池，否则那些模型会一直 401，而用户明明已经登上了。
+        """
         self._logout_in_progress = False
-        growth = self.growth
-        if growth is not None:
+        pool = self.acp
+        if pool is not None:
             with contextlib.suppress(Exception):
-                await growth.cancel()
+                await pool.close_all()
         try:
             old_gateway = self.gateway
             if old_gateway is not None:
@@ -926,43 +1157,113 @@ class WorkBuddyPlugin(Star):
         if self.scheduler is not None:
             with contextlib.suppress(Exception):
                 self.scheduler.resume()
-        if self.growth is not None:
-            with contextlib.suppress(Exception):
-                self.growth.resume()
         if self._settings is not None and self._settings["signin"]["enabled"]:
-            try:
+            with contextlib.suppress(Exception):
                 self.scheduler.start()
-            except Exception:
-                pass
-        # A fresh credential may also unlock the model catalog: exactly one
-        # refresh, after the auth semantics above, so a catalog failure can
-        # never turn a successful login into a failure or a second notice.
-        await self._refresh_model_options()
+        # 清单只取决于本地安装，跟登录无关；顺手重读一次，让配置页的候选是新的。
+        with contextlib.suppress(Exception):
+            await self._refresh_catalog()
+            self._publish_model_options()
         await self._notify("登录成功，服务已恢复。")
 
+    def _purge_legacy_credential_file(self) -> bool:
+        """删掉 v0.1.3 留下的 ``credentials.enc``；删不掉就返回 ``False``。
+
+        那条路径早就没人读了——登录凭据改由 CLI 自己落盘——但**文件还在原地**，
+        里面是加密过的 access / refresh token。不删就是一句谎话：命令回复"已退出
+        登录"，而谁拿到这个文件、再加上当初那把 master key，谁还能把令牌解出来。
+        删不掉要如实报告，理由同 ``AcpRuntime._purge_credential_dir``。
+        """
+        if not self.data_dir:
+            return True
+        path = os.path.join(str(self.data_dir), "credentials.enc")
+        try:
+            os.remove(path)
+        except FileNotFoundError:
+            return True
+        except OSError:
+            _log.warning("legacy credential file could not be removed")
+            return False
+        return True
+
     async def _logout(self) -> str:
-        # Mark the intentional logout first: credentials are cleared on purpose,
-        # so even a failure mid-logout must never raise a spurious error notice.
+        # 开场分两段，为的是**早退不碰闸门**：并行的第二条登出必须被挡回去，而不是
+        # 也去清场——它先收工的话，``finally`` 会把第一条还握着的闸门打开，这中间
+        # 放进来的登录没人取消，凭据照样被写回去。
+        async with self._login_task_lock:
+            if self._logout_pending:
+                return "正在退出登录，请稍后再试。"
+            self._logout_pending = True
+        # 从这里往下都在 ``try`` 里，包括取消登录那一步：取消正好落在
+        # ``_cancel_login_task()`` 的收尸上时，清场根本没开始，标志却已经立起来了。
+        # 漏在 ``True`` 上就等于此后每一条 ``/wb login`` 都被挡在"正在退出登录"，
+        # 只能重载插件——而这正是本条要防的那种"关不掉的门"。
+        try:
+            async with self._login_task_lock:
+                await self._cancel_login_task()
+            return await self._finish_logout()
+        finally:
+            # 失败、取消都开闸：卡在 True 上等于从此不许登录。
+            self._logout_pending = False
+
+    async def _finish_logout(self) -> str:
+        """登出已经定了，剩下的是清场；``_logout_pending`` 由调用方开合。"""
+        # 标记"这次登出是有意的"：凭据是被主动清掉的，中途出岔子也不该弹一条假的
+        # 告警。**置在这里而不是函数开头**——上面那步被取消时进程没关、凭据也没删，
+        # 什么都不该留下；而这个标志是告警的闸门，漏在 True 上就等于从此不再报任何
+        # 失败，直到下一次登录成功才被 ``_on_login_success`` 解开。
         self._logout_in_progress = True
-        existing = self._login_task
-        self._login_task = None
-        if existing is not None and not existing.done():
-            existing.cancel()
-            with contextlib.suppress(BaseException):
-                await existing
-        if self.growth is not None:
+        # **先把自己开场时手里这套抓住，后面一律用这几个局部变量。** 这中间有
+        # ``_drain_retired_pools()`` 与 ``pool.logout()`` 两处长等待，等它们回来时
+        # ``self.acp`` / ``self.scheduler`` / ``self.gateway`` 可能已经换成重载后的
+        # 那一套了；照着 ``self.*`` 收，收的就是别人的监听与定时器——插件还是
+        # ``ready``，端口却已经关了。登出只收拾它开场时那套，后来者不归它管。
+        pool = self.acp
+        scheduler = self.scheduler
+        gateway = self.gateway
+        account = self.account
+        # 退出登录要删两处：CLI 配置目录，以及真正的凭据目录（在 ~/.local/share
+        # 下，只有改了 HOME 才圈得住）。只删配置等于没退。
+        purge_failed = False
+        # 作废池里的子进程同样攥着 token，而 ``pool.logout()`` 只看活着的那个池。
+        # 先再关一遍（关不掉的那条会留在账上），再判能不能删：删了它会把凭据原样
+        # 写回去，而命令已经回复"已退出登录"——池子那边写死的规矩，这里也一样。
+        await self._drain_retired_pools()
+        if any(item.has_live_children for item in self._retired_pools):
+            _log.warning(
+                "logout refused: %d retired acp pool(s) still have live children",
+                len(self._retired_pools),
+            )
+            purge_failed = True
+        if pool is not None and not purge_failed:
+            try:
+                # 池自己先关掉**全部**进程再删：留着的那条握着 token，会把凭据
+                # 原样写回去，而命令已经回复"已退出登录"。
+                await pool.logout(purge_config=True)
+            except AcpError:
+                # 预期内的失败：进程没死透、目录删不掉、home_dir 没配。命令层回
+                # 固定文案就够，用户能照着去查。
+                purge_failed = True
+            except Exception:
+                # 非 AcpError 是代码缺陷，不能混进"请检查权限"里静默掉。
+                _log.exception("acp logout failed unexpectedly")
+                purge_failed = True
+        if scheduler is not None:
             with contextlib.suppress(Exception):
-                await self.growth.cancel()
-        if self.scheduler is not None:
-            with contextlib.suppress(Exception):
-                await self.scheduler.stop()
+                await scheduler.stop()
         # Stop the listener first so no in-flight chat can refresh + re-store a
         # credential after the logout has cleared it.
-        if self.gateway is not None:
+        if gateway is not None:
             with contextlib.suppress(Exception):
-                await self.gateway.stop()
-        with contextlib.suppress(Exception):
-            await self.auth.logout()
+                await gateway.stop()
+        if account is not None:
+            with contextlib.suppress(Exception):
+                await account.logout()
+        # 旧版那份额外凭据不归池管，得单独删；删不掉也算"没清干净"。
+        if not self._purge_legacy_credential_file():
+            purge_failed = True
+        if purge_failed:
+            return "已断开连接，但登录凭据未能清除，请检查插件数据目录权限或查看日志。"
         return "已退出登录，本地网关已停止监听。"
 
     # ------------------------------------------------------------------ #
@@ -971,13 +1272,33 @@ class WorkBuddyPlugin(Star):
 
     async def _status_text(self) -> str:
         lines = ["WorkBuddy 插件状态：", "就绪：是"]
-        creds = self.auth.credentials if self.auth is not None else {}
-        logged_in = bool(creds.get("accessToken"))
-        lines.append("登录：{}".format("已登录" if logged_in else "未登录"))
+        creds = self.account.credentials if self.account is not None else {}
+        acp_state = self.acp.auth_state if self.acp is not None else None
+        if acp_state is True:
+            lines.append("登录：已登录（CLI）")
+        elif acp_state is False:
+            lines.append("登录：未登录（CLI）")
+        elif creds.get("accessToken"):
+            # 凭据文件在，但本次运行还没真跑过一轮；不冒充"已验证"。
+            lines.append("登录：已登录（凭据在，尚未实测）")
+        else:
+            lines.append("登录：未登录")
+        if self.acp is not None:
+            st = self.acp.status()
+            running = st.get("running") or []
+            lines.append(
+                "ACP：{} 条 CLI 进程在跑（上限 {}）".format(
+                    len(running), st.get("max_processes")
+                )
+            )
+            if running:
+                lines.append("ACP 模型：" + "、".join(_model_label(m) for m in running))
         if self.gateway is not None and getattr(self.gateway, "bound_port", None):
             lines.append("网关：监听中（端口 {}）".format(self.gateway.bound_port))
         else:
             lines.append("网关：未监听")
+
+        lines.extend(self._format_model_refresh_status())
 
         if self.scheduler is not None:
             st = self.scheduler.status()
@@ -1005,8 +1326,7 @@ class WorkBuddyPlugin(Star):
                 lines.append("签到最近结果：" + str(st["last_outcome"]))
 
         # The notification overview is rendered purely from the notifier's own
-        # read-only status: it never issues a balance request of its own, so a
-        # status view cannot trigger an extra upstream read.
+        # read-only status: it never issues a request of its own.
         if self.notifier is not None:
             ns = self.notifier.status()
             lines.append("通知：{}".format("已启用" if ns.get("enabled") else "未启用"))
@@ -1024,37 +1344,17 @@ class WorkBuddyPlugin(Star):
                 "通知最近发送：" + self._format_notify_delivery(ns.get("last_delivery"))
             )
 
-        if self.growth is not None:
-            lines.append(self._format_growth_status(self.growth.status()))
-
-        # A logged-in overview reads each source at most once, and the three
-        # renderers are already safe on their own; gather them so one slow query
-        # never serializes the whole status and one failure never hides another.
-        balance_text, models_text, tasks_text = await asyncio.gather(
-            self._balance_text(),
-            self._models_text(),
-            self._tasks_text(""),
-            return_exceptions=True,
-        )
-        if isinstance(balance_text, BaseException):
-            balance_text = "查询余额失败，请稍后重试。"
-        if isinstance(models_text, BaseException):
-            models_text = "获取模型列表失败，请稍后重试。"
-        if isinstance(tasks_text, BaseException):
-            tasks_text = "获取任务列表失败，请稍后重试。"
-        lines.append(balance_text)
-        lines.append(models_text)
-        lines.append(tasks_text)
+        # 模型清单是纯本地的内存快照：读它不发任何请求，所以状态页可以放心带上。
+        lines.append(await self._models_text(refresh=False))
 
         # Fixed local overview lines: the gateway request-body limit and the
-        # route view.  Nothing here queries the upstream.
+        # route view.  Nothing here queries anything.
         max_mb = None
         if self._settings is not None:
             gateway_cfg = self._settings.get("gateway")
             if isinstance(gateway_cfg, dict):
                 max_mb = gateway_cfg.get("max_request_body_mb")
         lines.append("请求体上限：{} MiB".format(self._format_amount(max_mb)))
-        lines.extend(self._format_model_refresh_status())
         if self.router is not None:
             lines.extend(self._format_routing_status(self.router.status()))
         return "\n".join(lines)
@@ -1083,19 +1383,12 @@ class WorkBuddyPlugin(Star):
         )
         cooldowns = status.get("cooldowns")
         cooldowns = cooldowns if isinstance(cooldowns, dict) else {}
-        meta = self._model_meta if isinstance(self._model_meta, dict) else {}
         if models:
             lines.append("主备顺序（共 {} 个）：".format(len(models)))
             for index, model in enumerate(models, 1):
-                detail = meta.get(model)
-                label = (
-                    display_model_id(detail)
-                    if isinstance(detail, dict)
-                    else "{} [倍率未知]".format(model)
-                )
                 remaining = self._format_cooldown(cooldowns.get(model))
                 suffix = "" if remaining == "无" else "（冷却剩余 {}）".format(remaining)
-                lines.append("- 第{}：{}{}".format(index, label, suffix))
+                lines.append("- 第{}：{}{}".format(index, model, suffix))
         else:
             lines.append("主备顺序：未配置")
         lines.append(
@@ -1109,28 +1402,6 @@ class WorkBuddyPlugin(Star):
         )
         lines.append(self._format_route_result(status.get("last_result")))
         return lines
-
-    def _format_model_refresh_status(self) -> list:
-        """Two purely local overview lines: switch and interval, no request.
-
-        The values are read from the validated settings only, so this view can
-        never trigger an extra catalog read or invent a last-refresh time.
-        """
-        refresh = None
-        if self._settings is not None:
-            value = self._settings.get("model_refresh")
-            refresh = value if isinstance(value, dict) else None
-        enabled = isinstance(refresh, dict) and refresh.get("enabled") is True
-        interval = refresh.get("interval_minutes") if isinstance(refresh, dict) else None
-        if isinstance(interval, bool) or not isinstance(interval, int):
-            interval = None
-        return [
-            "模型自动刷新：{}（间隔 {} 分钟，仅本地轮询策略）".format(
-                "已启用" if enabled else "未启用",
-                interval if interval is not None else "未知",
-            ),
-            "刷新范围：仅定时拉取候选与倍率；初始、登录与手动获取不受此开关影响",
-        ]
 
     @staticmethod
     def _format_cooldown(value) -> str:
@@ -1169,7 +1440,7 @@ class WorkBuddyPlugin(Star):
         if rest == "resume":
             self.scheduler.resume()
             return "已恢复签到。"
-        creds = self.auth.credentials if self.auth is not None else {}
+        creds = self.account.credentials if self.account is not None else {}
         if not creds.get("accessToken"):
             return "尚未登录，无法签到。"
         result = await self.scheduler.run_once(manual=True)
@@ -1188,133 +1459,87 @@ class WorkBuddyPlugin(Star):
             return "当前不可签到（{}）。".format(result.get("reason", "已阻止"))
         return "签到未完成，请稍后重试。"
 
-    async def _models_text(self) -> str:
-        creds = self.auth.credentials if self.auth is not None else {}
-        if not creds.get("accessToken"):
-            return "尚未登录，无法获取模型列表。"
-        try:
-            details = await self.client.model_details()
-        except Exception:
-            return "获取模型列表失败，请稍后重试。"
-        catalog = (
-            [detail for detail in details if isinstance(detail, dict)]
-            if isinstance(details, list)
-            else []
-        )
-        # The read-only catalog snapshot behind the ``/wb status`` route view is
-        # published by the client's own success observer (``_on_models``), so
-        # this renderer never duplicates it and never issues another read.
-        lines = ["可用模型："]
-        for detail in catalog:
-            alias = display_model_id(detail)
-            note = detail.get("promo_note")
-            if isinstance(note, str) and note.strip():
-                lines.append("- {}（{}）".format(alias, note.strip()))
-            else:
-                lines.append("- " + alias)
-        if self._routing_enabled():
-            # The virtual entry has no fixed price: the real model decides.
-            lines.append(
-                "- {}（倍率随实际模型变化）".format(ORDERED_MODEL_ID)
-            )
-        if len(lines) == 1:
-            return "当前没有可用模型。"
-        lines.append("提示：倍率为查询快照，实际扣费以官方结算为准。")
-        return "\n".join(lines)
+    def _format_model_refresh_status(self) -> list:
+        """Two purely local overview lines: switch and interval, no read.
 
-    async def _balance_text(self) -> str:
-        creds = self.auth.credentials if self.auth is not None else {}
-        if not creds.get("accessToken"):
-            return "尚未登录，无法查询余额。"
-        try:
-            summary = await self.client.balance()
-        except Exception:
-            return "查询余额失败，请稍后重试。"
-        if not isinstance(summary, dict) or not summary.get("known"):
-            return "积分信息：未知（上游数据不完整）"
-        return (
-            "账户积分：\n"
-            "剩余积分：{}\n"
-            "已用积分：{}\n"
-            "总额度：{}\n"
-            "积分包：{}\n"
-            "（本次返回积分包合计，非月度额度）"
-        ).format(
-            self._format_amount(summary.get("remaining")),
-            self._format_amount(summary.get("used")),
-            self._format_amount(summary.get("total")),
-            self._format_amount(summary.get("package_count")),
-        )
+        只读已校验的设置，所以这个视图既不会额外 spawn 一次 ``--help``，也不会
+        编一个"上次刷新时间"出来——清单的年龄由 ``/wb models`` 那个视图负责。
+        """
+        refresh = None
+        if self._settings is not None:
+            value = self._settings.get("model_refresh")
+            refresh = value if isinstance(value, dict) else None
+        enabled = isinstance(refresh, dict) and refresh.get("enabled") is True
+        interval = refresh.get("interval_minutes") if isinstance(refresh, dict) else None
+        if isinstance(interval, bool) or not isinstance(interval, int):
+            interval = None
+        lines = [
+            "模型自动刷新：{}（间隔 {} 分钟，仅重读本机 CLI 清单）".format(
+                "已启用" if enabled else "未启用",
+                interval if interval is not None else "未知",
+            )
+        ]
+        if enabled:
+            lines.append(
+                "刷新范围：仅定时更新模型顺序列表的候选；"
+                "启动首读、登录后读取与 /wb models 不受此开关影响"
+            )
+        return lines
+
+    async def _models_text(self, *, refresh: bool) -> str:
+        """List the ids this machine's CLI accepts; no network, no login needed."""
+        if refresh:
+            await self._refresh_catalog()
+            # 清单刚被重读过，配置页那份候选也要跟着换：否则命令说"现在有 A、B、
+            # D"，运维回到配置页看到的还是旧的三项，两边对不上。发布是幂等的。
+            self._publish_model_options()
+        catalog = self.catalog
+        models = catalog.models if catalog is not None else []
+        if not models:
+            return (
+                "当前没有可用模型：本机没读到 CLI 的模型清单。\n"
+                "请确认 acp.cli_path 指向已安装的 CodeBuddy CLI，"
+                "或直接运行一次 codebuddy --help 看是否有 --model 那一行。"
+            )
+        lines = ["可用模型（来源：{}）：".format(_source_label(catalog.source))]
+        for model in models:
+            lines.append("- " + model)
+        if self._routing_enabled():
+            lines.append(
+                "- {}（按顺序调用，不是真实模型）".format(ORDERED_MODEL_ID)
+            )
+        # 来源只说明"上次读成功是从哪读的"，不说明"多久以前"。读失败时清单会被
+        # 原样保留（这是刻意的，见 core/models.py），所以这一行必须把年龄说出来：
+        # 少了它，命令会在清单早已过期时仍然宣称"来源：CLI 帮助文本"，等于替一份
+        # 可能已经不对的数据背书。
+        age = catalog.age
+        if age is not None:
+            lines.append("读取于：{}".format(_age_label(age)))
+        if catalog.stale:
+            lines.append(
+                "注意：这份清单已过了保鲜期，可能与本机 CLI 的现状不符；"
+                "用 /wb models 重读一次。"
+            )
+        if not getattr(catalog, "authoritative", True):
+            # 只读到 ``models.json`` 那份子集时，聊天入口不拿它当允许列表（见
+            # ``core/gateway.py`` 的 ``_known_model``）。这件事必须说出来：否则运维
+            # 看到"来源：models.json + 三个网关"，会以为这台机器只认这三个，而真相是
+            # "CLI 的清单没读到，校验暂时关了"。
+            lines.append(
+                "注意：只读到 models.json 里的自定义网关，CLI 的完整清单没读到；"
+                "此时聊天入口不校验模型名，打错的 id 会由 CLI 自己报错。"
+            )
+        lines.append("说明：清单来自本机 CLI，与账号登录状态无关。")
+        return "\n".join(lines)
 
     @staticmethod
     def _format_amount(value) -> str:
-        """Render a credit amount as a plain number (no trailing ``.0``)."""
+        """Render a number as a plain value (no trailing ``.0``)."""
         if isinstance(value, bool) or value is None:
             return "未知"
         if isinstance(value, float) and value.is_integer():
             return str(int(value))
         return str(value)
-
-    async def _tasks_text(self, rest: str) -> str:
-        creds = self.auth.credentials if self.auth is not None else {}
-        if not creds.get("accessToken"):
-            return "尚未登录，无法执行任务。"
-        if rest == "":
-            try:
-                data = await self.growth.list_tasks()
-            except Exception:
-                return "获取任务列表失败，请稍后重试。"
-            return self._format_task_list(data.get("tasks", []))
-        if rest == "run":
-            started = self.growth.start()
-            return (
-                "已开始后台执行成长任务。"
-                if started.get("started")
-                else "成长任务已在执行中。"
-            )
-        if rest == "claim":
-            started = self.growth.start(claim_only=True)
-            return (
-                "已开始后台领取已完成任务的奖励。"
-                if started.get("started")
-                else "成长任务已在执行中。"
-            )
-        if rest == "cancel":
-            await self.growth.cancel()
-            return "已取消成长任务。"
-        if rest == "resume":
-            self.growth.resume()
-            return "已恢复成长任务。"
-        if rest == "status":
-            return self._format_growth_status(self.growth.status())
-        return HELP_TEXT
-
-    @staticmethod
-    def _format_task_list(tasks) -> str:
-        lines = ["成长任务列表："]
-        for task in tasks:
-            if not isinstance(task, dict):
-                continue
-            progress = task.get("progress") or {}
-            # 先判定 claimed 再判定 complete：已领取的任务不能误报成仅「已完成」。
-            if task.get("accept_status") == "claimed":
-                state = "已领取"
-            elif task.get("complete"):
-                state = "已完成"
-            else:
-                state = "进行中"
-            lines.append(
-                "- {}：{}（{}/{}, {}）".format(
-                    task.get("task_code"),
-                    task.get("title") or "",
-                    progress.get("current", 0),
-                    progress.get("target", 0),
-                    state,
-                )
-            )
-        if len(lines) == 1:
-            lines.append("暂无任务。")
-        return "\n".join(lines)
 
     @staticmethod
     def _format_notify_platform(status) -> str:
@@ -1339,66 +1564,6 @@ class WorkBuddyPlugin(Star):
         if outcome == "failed":
             return "failed（{}，{}）".format(category, delivery.get("reason"))
         return "暂无记录"
-
-    @staticmethod
-    def _format_growth_status(status) -> str:
-        parts = ["成长任务状态："]
-        parts.append("运行中" if status.get("running") else "空闲")
-        parts.append(
-            "今日聊天 {}/{}".format(
-                status.get("chat_requests_today", 0),
-                status.get("max_chat_requests", 0),
-            )
-        )
-        if status.get("paused"):
-            parts.append("已暂停")
-        if status.get("retry_after"):
-            parts.append("冷却剩余 {} 秒".format(int(status["retry_after"])))
-        last = status.get("last_result")
-        if isinstance(last, dict):
-            # 动作 / 服务端进度 / 确认奖励分开展示，绝不伪造进度或奖励值。
-            for item in last.get("actions") or []:
-                if isinstance(item, dict):
-                    parts.append(
-                        "动作：{} {}（{}）".format(
-                            item.get("task_code"),
-                            item.get("action"),
-                            item.get("outcome"),
-                        )
-                    )
-            progress = last.get("progress")
-            if isinstance(progress, dict):
-                for code, value in progress.items():
-                    if isinstance(value, dict):
-                        parts.append(
-                            "进度：{} {}/{}".format(
-                                code,
-                                value.get("current", 0),
-                                value.get("target", 0),
-                            )
-                        )
-            for reward in last.get("rewards") or []:
-                if isinstance(reward, dict):
-                    credit = reward.get("credit")
-                    energy = reward.get("energy")
-                    if credit is None and energy is None:
-                        detail = "已确认领取，数值未知"
-                    else:
-                        detail = "credit={} energy={}".format(credit, energy)
-                    parts.append(
-                        "奖励：{} {}".format(reward.get("task_code"), detail)
-                    )
-            for item in last.get("pending") or []:
-                if isinstance(item, dict):
-                    parts.append(
-                        "待处理：{}（{}）".format(
-                            item.get("task_code"), item.get("reason")
-                        )
-                    )
-            unconfirmed = last.get("unconfirmed") or []
-            if unconfirmed:
-                parts.append("未确认：" + "、".join(str(c) for c in unconfirmed))
-        return "\n".join(parts)
 
     # ------------------------------------------------------------------ #
     # notifications / task hygiene
@@ -1433,3 +1598,39 @@ class WorkBuddyPlugin(Star):
         """Consume a background task's result so no exception is left unretrieved."""
         with contextlib.suppress(BaseException):
             task.exception()
+
+
+def _refresh_interval_seconds(minutes):
+    """把配置里的分钟换成秒；不是正整数就返回 ``None``（= 别起任务）。
+
+    单独拿出来是因为这是整个定时链上唯一一处单位换算：写成 ``* 3600`` 或者干脆
+    把分钟当秒睡，跑起来一切正常，只是频率差 60 倍，等到发现时早就上线了。
+    """
+    if isinstance(minutes, bool) or not isinstance(minutes, int) or minutes < 1:
+        return None
+    return minutes * 60
+
+
+def _model_label(model) -> str:
+    """状态页里显示一个模型 ID；``None`` 是"CLI 自己的默认模型"。"""
+    return model if isinstance(model, str) and model else "默认模型"
+
+
+def _source_label(source) -> str:
+    """模型清单的来源标签（固定文案，不回显任何原始字符串）。"""
+    if source == "help":
+        return "CLI 帮助文本"
+    if source == "config":
+        return "本地 models.json"
+    return "未知"
+
+
+def _age_label(seconds) -> str:
+    """把"多少秒之前"写成一句人话；只用于本地清单的年龄。"""
+    if not isinstance(seconds, (int, float)) or seconds < 0:
+        return "未知"
+    if seconds < 90:
+        return "{} 秒前".format(int(seconds))
+    if seconds < 5400:
+        return "{} 分钟前".format(int(seconds // 60))
+    return "{} 小时前".format(int(seconds // 3600))

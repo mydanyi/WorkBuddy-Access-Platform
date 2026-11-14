@@ -1,13 +1,12 @@
-"""Boundary regressions for the ordered model route (T1-boundaries-red).
+"""Boundary regressions for the ordered model route.
 
-Five behaviours the current ``core.routing.ModelRouter`` gets wrong, pinned as
-failing tests before the fix.  Nothing of ours is doubled: every test drives the
-real ``ModelRouter`` over the real ``core.storage.StateStore``; only the upstream
-``send`` boundary and the clock are small fakes, taken from
-``tests.test_routing`` (imported as ``support`` -- its ``TestCase`` is *not*
-inherited and no router is faked here).
+五条曾经被 ``core.routing.ModelRouter`` 搞错的边界行为，现在钉在这里防回潮。
+没有业务层被替换：每条用例驱动真实的 ``ModelRouter`` 与真实的
+``core.storage.StateStore``；只有上游 ``send`` 边界和时钟是小的替身，从
+``tests.test_routing`` 借来（以 ``support`` 导入——它的 ``TestCase`` 不被继承，
+这里也不替换路由器）。
 
-What is pinned:
+被钉住的行为：
 
 1. two 429s with different ``Retry-After`` on one round: the round stops instead
    of walking on, and the surfaced hint is the round-wide (longest) cooldown, not
@@ -30,8 +29,7 @@ payloads the real router handed to the external boundary.
 Scratch data lives in the task's NAS directory (``WORKBUDDY_TEST_TMP``, else the
 route tests' own root); the system temp dir is never used.
 
-Remote verification (manager): ``python -B -m unittest
-tests.test_routing_boundaries -v``.  Local: NOT RUN.
+Run from anywhere: ``python -m unittest tests.test_routing_boundaries``.
 """
 
 from __future__ import annotations
@@ -46,11 +44,19 @@ import unittest
 from pathlib import Path
 
 _PLUGIN_ROOT = Path(__file__).resolve().parents[1]
-if str(_PLUGIN_ROOT) not in sys.path:
-    sys.path.insert(0, str(_PLUGIN_ROOT))
+_SOURCE_ROOT = _PLUGIN_ROOT.parent
+for _path in (str(_PLUGIN_ROOT), str(_SOURCE_ROOT)):
+    if _path not in sys.path:
+        sys.path.insert(0, _path)
 
-from core.errors import ChatStreamError, UpstreamError  # noqa: E402
-from core.storage import StateStore  # noqa: E402
+# 一律走包内绝对导入。顶层 ``core.*`` 会造出第二份模块实例，于是
+# ``core.errors.ChatStreamError`` 与路由器真正抛的那个不是同一个类，
+# ``assertIsInstance`` 会莫名其妙地失败（这正是它曾经失败的原因）。
+from astrbot_plugin_workbuddy.core.errors import (  # noqa: E402
+    ChatStreamError,
+    UpstreamError,
+)
+from astrbot_plugin_workbuddy.core.storage import StateStore  # noqa: E402
 
 try:  # package discovery: ``python -m unittest tests.test_routing_boundaries``
     from tests import test_routing as support  # noqa: E402

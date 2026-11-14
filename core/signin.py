@@ -36,7 +36,7 @@ import asyncio
 
 import aiohttp
 
-from .credits import is_finite_number
+from .numbers import is_finite_number
 from .errors import UpstreamError
 
 CHECKIN_STATUS_PATH = "/v2/billing/meter/checkin-activity-status"

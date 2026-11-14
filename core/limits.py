@@ -2,8 +2,8 @@
 
 One gate enforces both an in-flight concurrency cap (plus a bounded wait queue)
 and an optional per-minute request budget.  The gateway holds a single
-``ConcurrencyGate`` so the real bot chat and any future growth chat share the
-same budget instead of each opening its own door.
+``ConcurrencyGate`` so every chat backend behind it spends the same budget
+instead of each opening its own door.
 
 Contract:
 
