@@ -508,6 +508,29 @@ class CatalogProcessTests(unittest.IsolatedAsyncioTestCase):
         process.gate.set()
         self.assertTrue(await asyncio.wait_for(task, 5.0), "得把'被取消过'报上来")
 
+    async def test_a_probe_that_exits_nonzero_does_not_replace_the_catalog(self):
+        # 打出清单再崩（退出码非零）：那串只可能是半截的。照收下去就会把手上完整的
+        # 那份顶掉，本来能用的模型从候选里消失，聊天直接 400。
+        tmp = _case_dir(self)
+        clock = [0.0]
+        cli = _write_cli(tmp, [ALPHA, BETA], name="codebuddy-crashes-late")
+        catalog = ModelCatalog(str(cli), timeout=15, clock=lambda: clock[0])
+        self.assertEqual(await catalog.refresh(), [ALPHA, BETA])
+        self.assertEqual(catalog.source, "help")
+
+        line = "  --model <model>  Currently supported: ({})\n".format(ALPHA)
+        cli.write_text(
+            "#!/usr/bin/env python3\n"
+            "import sys\n"
+            "sys.stdout.write(" + repr(line) + ")\n"
+            "sys.exit(3)\n",
+            encoding="utf-8",
+        )
+        cli.chmod(0o755)
+        clock[0] = 300.0  # 过保鲜期，逼它重读
+        self.assertEqual(await catalog.refresh(), [ALPHA, BETA], "半截清单不许顶掉完整的")
+        self.assertEqual(catalog.source, "help", "读失败也不改来源")
+
     async def test_a_probe_that_never_exits_closes_its_pipes_and_leaves_no_waiter(self):
         # ``communicate()`` 被取消之后，stdout 的读传输可能停在"暂停"上：没人再读，
         # EOF 到不了，而 ``Process.wait()`` 等的是子进程传输——管道不关它就永远不醒。

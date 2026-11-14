@@ -134,6 +134,10 @@ class MapCredentialsTests(unittest.TestCase):
             float("nan"),
             float("inf"),
             float("-inf"),
+            # json 里 `10**400` 是合法整数，类型检查过得去，而 `math.isfinite` 要把它
+            # 转成 double，当场抛 OverflowError——一个可选字段坏掉不该让整份凭据读不到。
+            10**400,
+            -(10**400),
         )
         for value in junk:
             with self.subTest(value=value):

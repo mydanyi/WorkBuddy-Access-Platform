@@ -1222,6 +1222,40 @@ class _PluginIntegrationTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(plugin.ready, "轮到它时自己把这套建起来了")
         self.assertIsNotNone(plugin.gateway, "它的网关不许被前一轮的收尾顺手拆掉")
 
+    async def test_a_logout_in_flight_does_not_stop_the_next_runtime(self):
+        # 登出中间有两处长等待（清作废池、关池删凭据）。等它们回来时，插件可能已经被
+        # 重载过一轮：照着 ``self.gateway`` / ``self.scheduler`` 收，收的是重载后的
+        # 那一套——插件还是 ``ready``，端口却已经关了，定时签到也停了。
+        plugin = await self._make_plugin(**self._make_ready_plugin_config())
+        old_pool = _StubAcpPool()
+        plugin.acp = old_pool
+
+        entered = asyncio.Event()
+        release = asyncio.Event()
+
+        async def _slow_logout(purge_config=False):
+            entered.set()
+            await release.wait()
+
+        with mock.patch.object(old_pool, "logout", _slow_logout):
+            logout = asyncio.create_task(plugin._logout())
+            await asyncio.wait_for(entered.wait(), 5.0)
+
+            # 登出还卡在清池上，插件被重载了一次。
+            await plugin.initialize()
+            self.assertTrue(plugin.ready)
+            port = plugin.gateway.bound_port
+            self.assertTrue(port)
+
+            release.set()
+            text = await asyncio.wait_for(logout, 5.0)
+
+        self.assertIn("已退出登录", text)
+        self.assertTrue(plugin.ready, "重载之后还是就绪的")
+        async with aiohttp.ClientSession() as session:
+            async with session.get(f"http://127.0.0.1:{port}/health") as resp:
+                self.assertEqual(resp.status, 200, "重载后的监听不许被那次登出停掉")
+
     # -- 3b. empty api_key never opens the listener -----------------------
     async def test_valid_settings_bind_health_and_empty_api_key_disables_listener(self):
         os.environ["WORKBUDDY_MASTER_KEY"] = MASTER_KEY

@@ -27,11 +27,11 @@ from __future__ import annotations
 
 import asyncio
 import json
-import math
 import os
 import time
 
 from ..errors import UpstreamError
+from ..numbers import is_finite_number
 
 # 等 CLI 把新 token 写回来的窗口。刷新不是插件能直接触发的事，只能等；等不到
 # 就如实报未登录，不猜也不伪造。
@@ -47,10 +47,11 @@ _MS_THRESHOLD = 1e11
 
 def _expiry_seconds(value):
     """把 ``expiresAt`` 归一到秒级时间戳；认不出来就返回 ``None``。"""
-    if not isinstance(value, (int, float)) or isinstance(value, bool):
-        return None
-    if not math.isfinite(value) or value <= 0:
-        # json.load 默认接受 NaN / Infinity 字面量，放进去会让比较全部失真。
+    # 用 ``is_finite_number`` 而不是 ``math.isfinite``：JSON 里 ``10**400`` 是合法整数，
+    # 类型检查过得去，而 ``math.isfinite`` 要把它转成 double，当场抛 ``OverflowError``。
+    # 这个异常会一路冒到 ``credentials`` 外面，让一个**可选字段**坏掉变成"整份凭据读不到"。
+    if not is_finite_number(value) or value <= 0:
+        # 顺带挡掉 json.load 默认接受的 NaN / Infinity 字面量：放进去会让比较全部失真。
         return None
     return float(value) / 1000.0 if value > _MS_THRESHOLD else float(value)
 

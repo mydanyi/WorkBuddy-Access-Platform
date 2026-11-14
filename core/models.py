@@ -460,6 +460,11 @@ class ModelCatalog:
             # 取消也必须收尸：卡住的 CLI 若留在那儿，管道与 pid 都算泄漏。
             await _reap(process)
             raise
+        if process.returncode not in (0, None):
+            # 退出码非零却打出了能解析的清单：只可能是探针跑到一半炸了，那份清单是半截
+            # 的。照收下去就会把手上完整的那份顶掉，本来能用的模型从候选里消失，聊天
+            # 直接 400。当成"读不到"——回退配置、保留上一份，都还在。
+            return []
         return parse_help_models(stdout.decode("utf-8", "replace"))
 
     def _from_config(self):

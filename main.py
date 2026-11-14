@@ -1213,6 +1213,15 @@ class WorkBuddyPlugin(Star):
         # 什么都不该留下；而这个标志是告警的闸门，漏在 True 上就等于从此不再报任何
         # 失败，直到下一次登录成功才被 ``_on_login_success`` 解开。
         self._logout_in_progress = True
+        # **先把自己开场时手里这套抓住，后面一律用这几个局部变量。** 这中间有
+        # ``_drain_retired_pools()`` 与 ``pool.logout()`` 两处长等待，等它们回来时
+        # ``self.acp`` / ``self.scheduler`` / ``self.gateway`` 可能已经换成重载后的
+        # 那一套了；照着 ``self.*`` 收，收的就是别人的监听与定时器——插件还是
+        # ``ready``，端口却已经关了。登出只收拾它开场时那套，后来者不归它管。
+        pool = self.acp
+        scheduler = self.scheduler
+        gateway = self.gateway
+        account = self.account
         # 退出登录要删两处：CLI 配置目录，以及真正的凭据目录（在 ~/.local/share
         # 下，只有改了 HOME 才圈得住）。只删配置等于没退。
         purge_failed = False
@@ -1226,7 +1235,6 @@ class WorkBuddyPlugin(Star):
                 len(self._retired_pools),
             )
             purge_failed = True
-        pool = self.acp
         if pool is not None and not purge_failed:
             try:
                 # 池自己先关掉**全部**进程再删：留着的那条握着 token，会把凭据
@@ -1240,16 +1248,17 @@ class WorkBuddyPlugin(Star):
                 # 非 AcpError 是代码缺陷，不能混进"请检查权限"里静默掉。
                 _log.exception("acp logout failed unexpectedly")
                 purge_failed = True
-        if self.scheduler is not None:
+        if scheduler is not None:
             with contextlib.suppress(Exception):
-                await self.scheduler.stop()
+                await scheduler.stop()
         # Stop the listener first so no in-flight chat can refresh + re-store a
         # credential after the logout has cleared it.
-        if self.gateway is not None:
+        if gateway is not None:
             with contextlib.suppress(Exception):
-                await self.gateway.stop()
-        with contextlib.suppress(Exception):
-            await self.account.logout()
+                await gateway.stop()
+        if account is not None:
+            with contextlib.suppress(Exception):
+                await account.logout()
         # 旧版那份额外凭据不归池管，得单独删；删不掉也算"没清干净"。
         if not self._purge_legacy_credential_file():
             purge_failed = True
