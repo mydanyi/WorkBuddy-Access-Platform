@@ -39,10 +39,12 @@ from .core.acp import (
 )
 from .core.client import UpstreamClient
 from .core.config import ConfigError, load_settings
+from .core.credits import display_model_id
 from .core.gateway import Gateway
 from .core.models import ModelCatalog, strip_model_alias
 from .core.notifications import AdminNotifier
 from .core.numbers import is_finite_number
+from .core.pricing import ModelPricing
 from .core.routing import ORDERED_MODEL_ID, ModelRouter
 from .core.scheduler import SigninScheduler
 from .core.signin import SigninService
@@ -95,7 +97,7 @@ HELP_TEXT = """WorkBuddy 指令（仅管理员私聊）：
     "astrbot_plugin_workbuddy",
     "mydanyi",
     "将 WorkBuddy 接入 AstrBot：通过官方 CodeBuddy CLI 的 ACP 通道提供 OpenAI 兼容 API（普通/流式）、扫码登录、自动签到、模型列表与主备模型按顺序调用，以及可配置管理员 QQ 的签到与异常通知。",
-    "0.4.0",
+    "0.4.1",
 )
 class WorkBuddyPlugin(Star):
     """The single WorkBuddy entry point."""
@@ -121,6 +123,9 @@ class WorkBuddyPlugin(Star):
         self.acp = None
         # 本地模型清单：读 CLI 的 --help，不联网、不要登录。
         self.catalog = None
+        # 模型积分倍率：另外问平台一次，只用于在模型名后面显示 ``[0.79x]``。
+        # 读不到就是没有后缀，不影响清单也不影响聊天。
+        self.pricing = None
 
         self._login_task = None
         # 登录、登出、拆卸三条路都要「读走—取消—收尸」同一条 ``_login_task``。
@@ -263,6 +268,10 @@ class WorkBuddyPlugin(Star):
                 billing_base=BILLING_BASE,
                 on_error=self._on_upstream_error,
             )
+            # 倍率表跟着那个客户端走：鉴权、401 刷新、超时都是同一套。它只读两个
+            # 接口，读失败就退回"模型名没有后缀"，所以放在构造期的 try 里也不怕
+            # 它连累初始化——构造本身不联网。
+            self.pricing = ModelPricing(self.client)
             self.notifier = AdminNotifier(
                 self.context, state, settings["notifications"]
             )
@@ -416,6 +425,7 @@ class WorkBuddyPlugin(Star):
             queue_timeout=s["queue_timeout"],
             router=self.router,
             catalog=self.catalog,
+            pricing=self.pricing,
             max_request_body_mb=s["max_request_body_mb"],
         )
         if s["enabled"] and s["api_key"]:
@@ -522,6 +532,8 @@ class WorkBuddyPlugin(Star):
 
         # 本地清单只是个内存快照，跟着运行时一起丢，下次重读。
         self.catalog = None
+        # 倍率表挂在刚拆掉的那个客户端上，留着它等于留着一份指向死会话的引用。
+        self.pricing = None
 
         notify_tasks = [t for t in self._notify_tasks if not t.done()]
         self._notify_tasks.clear()
@@ -698,7 +710,11 @@ class WorkBuddyPlugin(Star):
             if model in values or model == ORDERED_MODEL_ID:
                 continue
             values.append(model)
-            labels.append(model)
+            # 值必须是纯 ID（路由会原样下发给 CLI），标签才是给人看的；倍率已经读到
+            # 就顺手带上，没读到就是裸 ID。这里不 await：配置页刷新是同步路径，
+            # 为了一行字去等一次网络不值得。
+            detail = self.pricing.detail_for(model) if self.pricing is not None else None
+            labels.append(display_model_id(detail) if isinstance(detail, dict) else model)
 
         # A plain dict config has no schema to extend.
         schema = getattr(self._raw_config, "schema", None)
@@ -1487,12 +1503,20 @@ class WorkBuddyPlugin(Star):
         return lines
 
     async def _models_text(self, *, refresh: bool) -> str:
-        """List the ids this machine's CLI accepts; no network, no login needed."""
+        """List the ids this machine's CLI accepts, with the credit multiplier."""
         if refresh:
             await self._refresh_catalog()
             # 清单刚被重读过，配置页那份候选也要跟着换：否则命令说"现在有 A、B、
             # D"，运维回到配置页看到的还是旧的三项，两边对不上。发布是幂等的。
             self._publish_model_options()
+            if self.pricing is not None:
+                # 顺手把倍率也重读一次：改价之后想立刻看到，不该等缓存过期。
+                try:
+                    await self.pricing.refresh()
+                except asyncio.CancelledError:
+                    raise
+                except Exception:  # noqa: BLE001 - 显示层的数据，读不到就不显示
+                    pass
         catalog = self.catalog
         models = catalog.models if catalog is not None else []
         if not models:
@@ -1501,12 +1525,33 @@ class WorkBuddyPlugin(Star):
                 "请确认 acp.cli_path 指向已安装的 CodeBuddy CLI，"
                 "或直接运行一次 codebuddy --help 看是否有 --model 那一行。"
             )
+        pricing = self.pricing
+        if pricing is not None:
+            try:
+                await pricing.ensure()
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001
+                pass
         lines = ["可用模型（来源：{}）：".format(_source_label(catalog.source))]
         for model in models:
-            lines.append("- " + model)
+            detail = pricing.detail_for(model) if pricing is not None else None
+            if isinstance(detail, dict):
+                # 与 /v1/models 同一套拼法：``glm-5.2 [0.79x]``。请求回来时会被
+                # 剥回纯 ID，所以这里显示什么都不会影响能不能用。
+                lines.append("- " + display_model_id(detail))
+            else:
+                lines.append("- " + model)
+        # 虚拟入口始终列出来，能不能用由开关决定（关着时选了它是一条明确报错）。
         if self._routing_enabled():
             lines.append(
                 "- {}（按顺序调用，不是真实模型）".format(ORDERED_MODEL_ID)
+            )
+        else:
+            lines.append(
+                "- {}（按顺序调用，未启用：打开 routing.enabled 后可用）".format(
+                    ORDERED_MODEL_ID
+                )
             )
         # 来源只说明"上次读成功是从哪读的"，不说明"多久以前"。读失败时清单会被
         # 原样保留（这是刻意的，见 core/models.py），所以这一行必须把年龄说出来：

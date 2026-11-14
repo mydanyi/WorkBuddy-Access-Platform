@@ -1895,9 +1895,11 @@ class _PluginIntegrationTestCase(unittest.IsolatedAsyncioTestCase):
     async def test_real_provider_lists_the_local_catalog_and_forwards_the_pure_id(self):
         """``/v1/models`` 的内容来自本机清单，网关交给进程的是同一个 id。
 
-        迁移前这一条验的是"显示别名 → 上游 id"的翻译；别名随倍率一起下线了，
-        现在模型 ID 本身就是进程的 ``--model`` 参数，中间不该再有任何改写。
+        虚拟入口始终在列表末尾（能不能用由 routing.enabled 决定），真实模型一条
+        不少。这里没配倍率，所以模型名就是裸 ID：中间不该有任何改写。
         """
+        from astrbot_plugin_workbuddy.core.routing import ORDERED_MODEL_ID
+
         plugin = await self._make_acp_plugin(
             "happy", wrap=_RecordingBackend, catalog=support.StubCatalog([MODEL])
         )
@@ -1918,7 +1920,7 @@ class _PluginIntegrationTestCase(unittest.IsolatedAsyncioTestCase):
         self._providers.append(provider)
 
         models = await provider.get_models()
-        self.assertEqual(models, [MODEL])
+        self.assertEqual(models, [MODEL, ORDERED_MODEL_ID])
 
         response = await provider.text_chat(
             prompt="hi",

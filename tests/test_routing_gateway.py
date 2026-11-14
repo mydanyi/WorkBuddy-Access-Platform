@@ -158,7 +158,9 @@ class _GatewayCase(unittest.IsolatedAsyncioTestCase):
     def _observe(self, category) -> None:
         self.observed.append(category)
 
-    async def start_gateway(self, *, router=_UNSET, catalog=_UNSET, **overrides) -> None:
+    async def start_gateway(
+        self, *, router=_UNSET, catalog=_UNSET, pricing=_UNSET, **overrides
+    ) -> None:
         params = {
             "api_key": support.API_KEY,
             "host": "127.0.0.1",
@@ -173,7 +175,11 @@ class _GatewayCase(unittest.IsolatedAsyncioTestCase):
             router = self.router
         if catalog is _UNSET:
             catalog = self.catalog
-        self.gateway = Gateway(self.chat, router=router, catalog=catalog, **params)
+        if pricing is _UNSET:
+            pricing = getattr(self, "pricing", None)
+        self.gateway = Gateway(
+            self.chat, router=router, catalog=catalog, pricing=pricing, **params
+        )
         await self.gateway.start()
         self.base_url = "http://127.0.0.1:{}".format(self.gateway.bound_port)
 
@@ -251,7 +257,10 @@ class RoutingThroughGatewayTests(_GatewayCase):
         body = await self.get_models()
         ids = [item.get("id") for item in body.get("data") or []]
         self.assertEqual(
-            ids, list(MODELS), "a disabled route must not advertise the virtual model"
+            ids,
+            list(MODELS) + [ORDERED_MODEL_ID],
+            "关掉路由只是让虚拟入口不能用，不该让它从列表里消失——"
+            "消失了没人看得出原因，只会以为功能被删了",
         )
 
     async def test_an_empty_catalog_serves_no_real_model_and_still_hides_no_request(self):
@@ -259,6 +268,43 @@ class RoutingThroughGatewayTests(_GatewayCase):
         body = await self.get_models()
         ids = [item.get("id") for item in body.get("data") or []]
         self.assertEqual(ids, [ORDERED_MODEL_ID])
+
+    async def test_a_priced_model_carries_its_multiplier_and_stays_sendable(self):
+        detail = {
+            "id": MODELS[0],
+            "credits": 0.79,
+            "effective_credits": "0.79x",
+            "promo_label": "",
+            "promo_note": "",
+        }
+        priced = MODELS[0] + " [0.79x]"
+        await self.restart_gateway(pricing=support.StubPricing({MODELS[0]: detail}))
+        body = await self.get_models()
+        data = body.get("data") or []
+        self.assertEqual(
+            [item.get("id") for item in data],
+            [priced, MODELS[1], MODELS[2], ORDERED_MODEL_ID],
+            "有价的拼后缀，没价的保持裸 ID——两边都不能写成'倍率未知'",
+        )
+        first = data[0]
+        self.assertEqual(first.get("effective_credits"), "0.79x")
+        self.assertEqual(first.get("credits"), 0.79)
+        # 带后缀的 ID 回到网关时必须被剥成纯 ID 再交给后端：AstrBot 存的就是这个
+        # 显示名，剥不掉就等于"列表里能选、发出去必 400"。
+        self.chat.queue_text(MODELS[0], "priced answer")
+        resp = await self.post_chat(self.chat_payload(model=priced))
+        self.assertEqual(resp.status, 200)
+        await resp.json()
+        self.assertEqual(self.chat.sent_models, [MODELS[0]])
+
+    async def test_a_failed_price_read_only_costs_the_suffix(self):
+        await self.restart_gateway(pricing=support.StubPricing(fail=True))
+        # ``get_models`` 自己就把 200 断言掉了：读不到倍率不许变成 5xx。
+        body = await self.get_models()
+        self.assertEqual(
+            [item.get("id") for item in body.get("data") or []],
+            list(MODELS) + [ORDERED_MODEL_ID],
+        )
 
     # -- failover --------------------------------------------------------
 

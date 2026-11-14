@@ -156,7 +156,9 @@ class UpstreamClient:
             headers.update(extra)
         return headers
 
-    async def request_json(self, method, path, *, base=None, json=None, headers=None, auth=True):
+    async def request_json(
+        self, method, path, *, base=None, json=None, headers=None, auth=True, observe=True
+    ):
         """Public wrapper: observe the final failure of an authenticated call.
 
         The request contract is entirely owned by :meth:`_request_json`; this
@@ -164,8 +166,12 @@ class UpstreamClient:
         carried a login ``accessToken`` and ultimately failed.  A successful
         refresh never reports, and an unauthenticated call never reports.  The
         fixed source key is derived from the pinned path constant only.
+
+        ``observe=False`` keeps a call out of that report entirely.  It exists for
+        reads whose only consequence is a display detail (model credit
+        multipliers): losing one is not a fault worth waking an administrator for.
         """
-        observed = bool(auth and self.credentials.get("accessToken"))
+        observed = bool(observe and auth and self.credentials.get("accessToken"))
         try:
             return await self._request_json(
                 method, path, base=base, json=json, headers=headers, auth=auth
@@ -173,9 +179,10 @@ class UpstreamClient:
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001 - re-raised unchanged after observing
-            await self._notify_error(
-                exc, observed=observed, source=_source_for_path(path)
-            )
+            if observed:
+                await self._notify_error(
+                    exc, observed=observed, source=_source_for_path(path)
+                )
             raise
 
     async def _request_json(self, method, path, *, base=None, json=None, headers=None, auth=True):
