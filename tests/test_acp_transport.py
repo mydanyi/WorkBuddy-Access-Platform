@@ -343,11 +343,12 @@ class BlockedSendTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.gather(killer, return_exceptions=True)
         self.assertLess(loop.time() - started, 1.0, "读循环已经判死了，不该等到超时")
 
-    async def test_a_cancelled_caller_is_not_turned_into_a_success(self):
-        # 响应先到、发送还挂在 ``drain()`` 上（对端已经把整帧读完，只是缓冲区没排空）。
-        # 这时候调用方被取消，取消必须真的抛出去：吞掉它等于把一次取消变成一次"成功
-        # 返回"，请求方还以为下游收到了。写端真出错照样吞——响应都到手了，这次往返
-        # 本身是成功的。
+    async def test_a_completed_response_does_not_wait_for_the_send_to_drain(self):
+        # 响应先到、发送还挂在 ``drain()`` 上。``drain`` 等的是**整条管道**的流控，
+        # 不是这一帧的字节：同一条进程上另一个 prompt 把管道顶住时，这条早就完成的
+        # 往返会陪着一起等，直到自己撞上 600 秒的 prompt 超时——用户看到的是"回答
+        # 完了却卡住"。取消只掐这个等待者，缓冲区里的字节不会被撤回（对端读不到就
+        # 回不了包，说明它早就读完了）。
         transport = AcpTransport(_argv("happy"), request_timeout=600.0)
         transport._proc = _SilentProcess()
 
@@ -361,14 +362,31 @@ class BlockedSendTests(unittest.IsolatedAsyncioTestCase):
                 await asyncio.sleep(0.01)
             self.assertTrue(transport._pending, "请求没注册上，这条用例没验到东西")
             for request_id, future in list(transport._pending.items()):
-                future.set_result(
-                    {"jsonrpc": "2.0", "id": request_id, "result": {}}
-                )
-            for _ in range(50):  # 让它真的走到"响应到手、接着等发送"那一步
-                if task.done():
+                future.set_result({"jsonrpc": "2.0", "id": request_id, "result": {}})
+            # 没修之前它会一直挂在 ``await sending`` 上，只能等 600 秒的超时来收。
+            message = await asyncio.wait_for(task, 2.0)
+            self.assertEqual(message["result"], {})
+        finally:
+            if not task.done():
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+
+    async def test_a_cancelled_caller_still_propagates_before_the_response(self):
+        # 响应还没到、发送卡在 drain 上：调用方的取消必须原样抛出去。改成"响应一到
+        # 就取消发送"之后，这条边界不能跟着丢——取消变成成功返回，请求方会以为
+        # 下游收到了那一轮。
+        transport = AcpTransport(_argv("happy"), request_timeout=600.0)
+        transport._proc = _SilentProcess()
+
+        task = asyncio.ensure_future(
+            transport.request("session/prompt", {}, timeout=600.0)
+        )
+        try:
+            for _ in range(200):
+                if transport._pending:
                     break
                 await asyncio.sleep(0.01)
-            self.assertFalse(task.done(), "它该还卡在发送上，否则没验到那个窗口")
+            self.assertTrue(transport._pending, "请求没注册上，这条用例没验到东西")
             task.cancel()
             with self.assertRaises(asyncio.CancelledError):
                 await asyncio.wait_for(task, 2.0)

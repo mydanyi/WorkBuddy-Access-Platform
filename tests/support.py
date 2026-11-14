@@ -35,12 +35,27 @@ from astrbot_plugin_workbuddy.core.errors import (  # noqa: E402
 def _resolve_base_tmp() -> Path:
     """临时根目录：环境变量优先，否则用任务目录下的 ``tmp``。
 
-    刻意不回落到系统临时目录：构建机上的测试目录要能被人找到、清掉。
+    刻意优先落在任务目录：构建机上的测试目录要能被人找到、清掉。但
+    ``_HERE.parents[3]`` 只在"仓库就在任务目录里"这一种布局下可写——裸 clone 到
+    ``/home/alice/...`` 时它算出来是 ``/home/tmp``，普通用户建不了，而这里是
+    **导入期**，一抛就把整个测试套在收集阶段打死。所以先试着建；建不出来再退到
+    系统临时目录下的固定子目录，宁可换个位置，也不让收集阶段失败。
     """
     env = os.environ.get("WORKBUDDY_TEST_TMP")
     if env:
         return Path(env)
-    return _HERE.parents[3] / "tmp"
+    preferred = _HERE.parents[3] / "tmp"
+    try:
+        preferred.mkdir(parents=True, exist_ok=True)
+        # 目录已存在但不可写时 mkdir 不会报错，所以真写一个探针文件再删掉。
+        probe = preferred / ".write-probe"
+        probe.write_text("", encoding="utf-8")
+        probe.unlink()
+    except OSError:
+        fallback = Path(tempfile.gettempdir()) / "astrbot_plugin_workbuddy-tmp"
+        fallback.mkdir(parents=True, exist_ok=True)
+        return fallback
+    return preferred
 
 
 BASE_TMP = _resolve_base_tmp()

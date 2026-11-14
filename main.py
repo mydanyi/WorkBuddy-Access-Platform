@@ -74,7 +74,9 @@ _ROUTE_REASON_TEXTS = {
     "rate_limited": "上游限流",
     "upstream": "上游返回错误",
     "stream": "上游流中断",
-    "timeout": "首帧超时",
+    # 不叫"首帧超时"：同一个 key 也用在"正文已经吐了一部分、prompt 超时"那一轮上，
+    # 那时候第一帧早发过了，文案会指向一个根本不存在的原因。
+    "timeout": "超时",
     "error": "未知失败",
     "local_limit": "本地请求预算限制",
 }
@@ -127,6 +129,10 @@ class WorkBuddyPlugin(Star):
         # "已退出登录"。锁只圈换任务这一小段——``_begin_login`` 等扫码的那几秒
         # 必须在锁外，不然一条登出能被登录链接堵住。
         self._login_task_lock = asyncio.Lock()
+        # 收尾的串行闸门：``terminate()`` 的 shield 会把收尾留在后台跑，而下一次
+        # ``initialize()`` 一进门也要收尾。两边同时做，旧的那一轮会在新的运行时
+        # 建好之后再把它清一遍（见 ``_release_runtime``）。
+        self._teardown_lock = asyncio.Lock()
         # 定时重读模型清单的那条任务；同一时刻只允许存在一条。
         self._model_refresh_task = None
         # 已经作废、但还有子进程没死的池。``AcpRuntimePool.shutdown()`` 关不掉的
@@ -375,6 +381,18 @@ class WorkBuddyPlugin(Star):
                 )
 
     async def _release_runtime(self) -> None:
+        """收尾；并发调用排队，后来的那一轮等前一轮真的收完再动手。
+
+        ``terminate()`` 用 shield 把收尾挪到后台：外层取消之后它还在跑。下一次
+        ``initialize()`` 的第一件事也是收尾——不排队的话，它会在旧那一轮还卡在
+        某个等待点上时就把运行时重建好；旧收尾随后醒过来，继续把 ``router`` /
+        ``notifier`` / ``catalog`` / ``_notify_umo`` 清一遍。监听还在、``ready``
+        还是 True，路由和通知却没了，而且要等到下一次重载才看得出来。
+        """
+        async with self._teardown_lock:
+            await self._release_runtime_once()
+
+    async def _release_runtime_once(self) -> None:
         self.ready = False
         # Block new notifications before any producer is stopped.
         self._notify_stopped = True

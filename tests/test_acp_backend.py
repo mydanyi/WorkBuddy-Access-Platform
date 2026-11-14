@@ -161,6 +161,21 @@ class BuildPromptTests(unittest.TestCase):
         )
         self.assertEqual(text, "真正的问题")
 
+    def test_a_blank_system_message_does_not_hide_the_next_one(self):
+        # 空串等于没写。按"第一条非 None"取的话，第一条空指令会把位置占住，
+        # 后面那条真指令被跳过，组装时又把空串丢掉——结果一条 system 都没带上，
+        # 模型的输出格式悄悄变了，而且没有任何地方报错。
+        text = build_prompt(
+            {
+                "messages": [
+                    {"role": "system", "content": "   "},
+                    {"role": "system", "content": "Return JSON only."},
+                    {"role": "user", "content": "hi"},
+                ]
+            }
+        )
+        self.assertIn("Return JSON only.", text)
+
     def test_history_separators_cannot_be_forged_by_message_content(self):
         # 分隔语是模型判断"本轮提问在哪"的依据。群里任何人打出来就能伪造边界，
         # 所以正文里出现的分隔语必须先被中和。

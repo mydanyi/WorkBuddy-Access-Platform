@@ -29,6 +29,7 @@ import asyncio
 import json
 import math
 import os
+import time
 
 from ..errors import UpstreamError
 
@@ -116,6 +117,11 @@ class CliCredentials:
         # 上次成功解析时文件的 (mtime_ns, size)。命中就不重复解析。
         self._stamp = None
         self._refresh_lock = asyncio.Lock()
+        # 上一次"等文件"失败时的基线 token 与时刻。同一份 token 刚刷失败过，
+        # 排在后头的调用方等到的必然还是同一个结论——失败也要共享，不然 4 个并发
+        # 401 会排成 5 / 10 / 15 / 20 秒四段，把同一个窗口重复等四遍。
+        self._failed_token = None
+        self._failed_at = 0.0
 
     # -- 只读视图 -----------------------------------------------------------
 
@@ -180,10 +186,20 @@ class CliCredentials:
                 # 别人已经换过了，别再折腾 CLI。这里必须要求 token_now 为真：
                 # 文件被删掉时 None != stale_token 也成立，那会把"没凭据"当成
                 # "已经换好了"直接返回空字典。
+                self._failed_token = None
                 return current
             # 基线是"调用方用失败的那个 token"，不是"我这次读到了什么"。读失败
             # 时后者是 None，于是第一轮读到任何 token 都会被判成"变了"。
             before = stale_token if stale_token is not None else token_now
+
+            # 同一份 token 刚在这一个窗口里失败过：直接给同一个结论。等下去只会
+            # 再等满一个注定失败的窗口，而结论不会变。
+            if (
+                before is not None
+                and before == self._failed_token
+                and time.monotonic() - self._failed_at < self._refresh_wait
+            ):
+                raise UpstreamError(401, None)
 
             # 把刷新这件事的负责人叫起来。CLI 起不来就没得刷，直接认输，不要
             # 干等满一个窗口。
@@ -202,9 +218,12 @@ class CliCredentials:
                 latest = self._poll_read()
                 token = latest.get("accessToken")
                 if token and token != before:
+                    self._failed_token = None
                     return latest
                 if loop.time() >= deadline:
                     break
+            self._failed_token = before
+            self._failed_at = time.monotonic()
             raise UpstreamError(401, None)
 
     async def logout(self) -> None:

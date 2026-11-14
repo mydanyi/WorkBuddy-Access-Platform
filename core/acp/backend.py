@@ -148,7 +148,7 @@ def build_prompt(payload):
     返回 ``str``；没有可发的用户消息时返回 ``None``（调用方转成 400）。
 
     规则：
-    * ``system`` / ``developer`` 只认第一条；
+    * ``system`` / ``developer`` 只认第一条**非空白**的（空串等于没写，不许占位）；
     * 只保留 ``user`` / ``assistant``，``tool`` 等一律丢弃——CLI 侧工具已被
       ``--tools ""`` 关掉，历史里的工具痕迹对它没有意义，反而占预算；
     * **最后一条必须是 user 且非空白**，否则视为没有可回答的问题。末条 user
@@ -167,7 +167,11 @@ def build_prompt(payload):
         role = message.get("role")
         text = _content_text(message.get("content"))
         if role in ("system", "developer"):
-            if system_text is None and text is not None:
+            # 只认第一条**有内容**的：空串等于没写。按"第一条非 None"取的话，
+            # ``[system(""), system("Return JSON"), user("Hi")]`` 会被第一条空指令
+            # 占住位置、后面那条真指令被跳过，组装时又把空串丢掉——结果一条 system
+            # 都没带上，模型的输出格式悄悄变了。
+            if system_text is None and text is not None and text.strip():
                 system_text = text
             continue
         if text is None:

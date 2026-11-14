@@ -88,7 +88,9 @@ _ROUTE_REASON_TEXTS = {
     "rate_limited": "上游限流",
     "upstream": "上游返回错误",
     "stream": "上游流中断",
-    "timeout": "首帧超时",
+    # 同 ``main._ROUTE_REASON_TEXTS``：这个 key 也覆盖"正文吐到一半才超时"，
+    # 写"首帧超时"会指错方向。
+    "timeout": "超时",
     "cooling": "路由冷却中",
     "error": "未知失败",
     "local_limit": "本地请求预算限制",

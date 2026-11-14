@@ -123,7 +123,7 @@ prompt 交给 CLI，AstrBot 的 Provider 体系还是你在用的那一套，不
 | `acp.max_processes` | `2` | 同时常驻的 CLI 进程数上限 |
 | `gateway.api_key` | 空 | 网关密钥，**必须填**，否则监听不会开 |
 | `routing.enabled` | `false` | 开启后模型列表出现「按顺序调用」 |
-| `routing.first_frame_timeout` | `90` | 备用候选等首帧的上限（秒） |
+| `routing.first_frame_timeout` | `90` | 整轮等待首帧的总期限（秒）；超时不再切换备用 |
 | `signin.enabled` | `true` | 每日自动签到 |
 | `notifications.enabled` | `false` | 管理员 QQ 通知总开关 |
 | `gateway.max_request_body_mb` | `16` | 请求体上限，超出直接返回 `413` |

@@ -323,17 +323,18 @@ class AcpTransport:
                         with contextlib.suppress(BaseException):
                             await sending
                         return future.result()
-                    # 反过来，响应正常到手时不许掐：对端已经把整帧读完了（不然回不了
-                    # 包），那一帧确实写出去了，只是 ``drain()`` 还在等缓冲区排空。
-                    # 让它自然收尾，别把一个成功的发送记成"被取消"。
+                    # 响应正常到手：对端已经把整帧读完了（不然回不了包），这一帧确实
+                    # 写出去了，剩下的只有 ``drain()`` 在等缓冲区排空。而 ``drain``
+                    # 等的是**整条管道**的流控，不是这一帧的字节：同一个进程上另一个
+                    # 请求把管道顶住时，这条早就完成的往返会陪着一起等，直到自己超时。
+                    # 取消只掐这个等待者——已经写进缓冲区的字节不会被撤回。
                     #
-                    # 只 suppress ``Exception``，**不 suppress 取消**：这里 await 的
-                    # 是一条健康的发送，它不会自己抛 ``CancelledError``；这时候冒出来
-                    # 的那个只可能是"调用方被取消了"。吞掉它等于把一次取消变成一次成功
-                    # 返回，请求方还以为下游收到了。写端真出错（管道断了）照样吞掉：
-                    # 响应已经到手，这次往返是成功的。
-                    with contextlib.suppress(Exception):
-                        await sending
+                    # 用 ``wait`` 而不是 ``await sending``：``await`` 一条被取消的
+                    # 任务会把它的 ``CancelledError`` 传染给我们，跟"调用方取消了这
+                    # 一次往返"分不开；``wait`` 只等它结束、不传染，调用方的取消照旧
+                    # 从这一行抛出去。
+                    sending.cancel()
+                    await asyncio.wait({sending})
                     return future.result()
                 await sending
                 return await future

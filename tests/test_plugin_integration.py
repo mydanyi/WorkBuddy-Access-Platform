@@ -915,6 +915,32 @@ class _PluginIntegrationTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(plugin._retired_pools, [], "取消之后也得关干净")
         self.assertFalse(pool.has_live_children)
 
+    async def test_initialize_waits_for_a_teardown_that_outlived_its_canceller(self):
+        # ``terminate()`` 被取消后，收尾还在 shield 出来的那条任务里跑。``initialize()``
+        # 一进门看到的也是"什么都没了"，于是立刻重建；旧收尾随后醒过来，把刚建好的
+        # ``router`` / ``notifier`` / ``catalog`` 再清一遍——监听还在、``ready`` 还是
+        # True，路由和通知却没了，要等下一次重载才看得出来。两边必须排队。
+        plugin = await self._make_plugin(**self._make_ready_plugin_config())
+        pool = _PoolThatClosesSlowly()
+        plugin.acp = pool
+
+        task = asyncio.create_task(plugin.terminate())
+        await asyncio.wait_for(pool.entered.wait(), 5.0)
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+
+        rebuilt = asyncio.create_task(plugin.initialize())
+        # 旧收尾卡在关池子上时，``initialize()`` 不该抢在它前面把运行时建好。
+        # 这里不断言"还没完成"——它自身的耗时不由这条用例控制，拿睡眠赌顺序只会
+        # 造出一条时红时绿的用例；真正的判据是下面两条：新建的东西还在不在。
+        await asyncio.sleep(0.05)
+        pool.gate.set()
+        await asyncio.wait_for(rebuilt, timeout=10.0)
+        self.assertTrue(plugin.ready)
+        self.assertIsNotNone(plugin.router, "旧收尾把新建的路由擦掉了")
+        self.assertIsNotNone(plugin.notifier, "旧收尾把新建的提醒器擦掉了")
+
     async def test_logout_refuses_to_purge_while_a_retired_pool_lives(self):
         # 作废池里的子进程同样攥着 token，而 ``pool.logout()`` 只看活着的那个池。
         # 照删就会让一条没人认得的 CLI 把凭据原样写回去，而命令已经说"已退出登录"。
@@ -1515,6 +1541,15 @@ class _PluginIntegrationTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(plugin.account.credentials)
 
     # -- 11. status overview is local-only -------------------------------
+    def test_a_timeout_is_not_labelled_as_a_first_frame_timeout(self):
+        # 同一个 "timeout" key 也覆盖"正文吐到一半、prompt 超时"那一轮，那时候第一
+        # 帧早发过了。文案写"首帧超时"会把人往一个根本不存在的方向上引，而这条
+        # 线索正是管理员判断"该查上游还是查自己配置"的唯一依据。
+        from astrbot_plugin_workbuddy.core import notifications as notifications_module
+
+        self.assertEqual(wb_main._ROUTE_REASON_TEXTS["timeout"], "超时")
+        self.assertEqual(notifications_module._ROUTE_REASON_TEXTS["timeout"], "超时")
+
     async def test_status_reports_the_acp_runtime_without_reading_any_upstream(self):
         """``/wb status`` 现在是纯本地总览：一条 HTTP 都不该发出去。
 

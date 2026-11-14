@@ -286,6 +286,26 @@ class RefreshTests(unittest.IsolatedAsyncioTestCase):
         # 原始异常仍挂在因果链上：别把"没装 CLI"表现成"请重新登录"。
         self.assertIsInstance(ctx.exception.__cause__, RuntimeError)
 
+    async def test_a_failed_refresh_is_shared_with_the_callers_behind_it(self):
+        # 四个并发 401 排在同一把锁上：第一个等满一整个窗口、失败；后面三个如果
+        # 各自再等一遍，就是 5 / 10 / 15 / 20 秒——同一个结论被重复等了四遍。
+        # 失败也要共享：同一份 token 刚刷失败过，等下去也等不出新东西来。
+        source = CliCredentials(self.runtime, refresh_wait=0.4, poll_interval=0.02)
+        _write(self.runtime.credential_path, _record("tok-old"))
+        loop = asyncio.get_running_loop()
+        started = loop.time()
+        results = await asyncio.gather(
+            *(source.refresh(stale_token="tok-old") for _ in range(4)),
+            return_exceptions=True,
+        )
+        elapsed = loop.time() - started
+        self.assertTrue(
+            all(isinstance(item, UpstreamError) for item in results),
+            "四个人等到的都该是同一个 401",
+        )
+        # 一个窗口 + 三次秒回；没修之前是四个窗口，约 1.6 秒。
+        self.assertLess(elapsed, 1.0, "同一个 token 的失败被重复等了好几遍")
+
     async def test_concurrent_refreshes_start_the_cli_once(self):
         _write(self.runtime.credential_path, _record("tok-old"))
 
