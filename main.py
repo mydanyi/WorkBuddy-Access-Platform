@@ -21,6 +21,7 @@ import asyncio
 import contextlib
 import logging
 import os
+import time
 
 import aiohttp
 
@@ -97,7 +98,7 @@ HELP_TEXT = """WorkBuddy 指令（仅管理员私聊）：
     "astrbot_plugin_workbuddy",
     "mydanyi",
     "将 WorkBuddy 接入 AstrBot：通过官方 CodeBuddy CLI 的 ACP 通道提供 OpenAI 兼容 API（普通/流式）、扫码登录、自动签到、模型列表与主备模型按顺序调用，以及可配置管理员 QQ 的签到与异常通知。",
-    "0.4.1",
+    "0.4.2",
 )
 class WorkBuddyPlugin(Star):
     """The single WorkBuddy entry point."""
@@ -154,6 +155,12 @@ class WorkBuddyPlugin(Star):
         self._init_lock = asyncio.Lock()
         # 定时重读模型清单的那条任务；同一时刻只允许存在一条。
         self._model_refresh_task = None
+        # 定时刷新的自述账本，只为"它到底有没有在自己跑"留证据：配置页写着"已启用"
+        # 而任务其实没起来，从外面完全看不出来。三个字段都由循环自己更新，status
+        # 直接读，不额外 spawn 一次 ``--help``。
+        self._model_refresh_last_at = None
+        self._model_refresh_next_at = None
+        self._model_refresh_rounds = 0
         # 已经作废、但还有子进程没死的池。``AcpRuntimePool.shutdown()`` 关不掉的
         # 那条会留在池自己的账上；池要是跟着 ``self.acp`` 一起被丢掉，那笔账也就
         # 没了——下一轮 initialize 建的是新池，这条 CLI 从此没人认得。所以留在这里，
@@ -646,6 +653,16 @@ class WorkBuddyPlugin(Star):
         )
         task.add_done_callback(self._consume_task)
         self._model_refresh_task = task
+        # 账本跟着任务一起开记：配置页只会说"已启用"，而"下一条新模型什么时候能
+        # 自己出现在候选里"要靠这两个时间点回答。
+        self._model_refresh_rounds = 0
+        self._model_refresh_last_at = None
+        self._model_refresh_next_at = time.time() + seconds
+        _log.info(
+            "workbuddy: model auto-refresh armed, every %d min, first round in %d min",
+            seconds // 60,
+            seconds // 60,
+        )
 
     async def _model_refresh_loop(self, interval_seconds: int) -> None:
         """Re-read the catalog once per interval, sequentially, until cancelled.
@@ -683,7 +700,31 @@ class WorkBuddyPlugin(Star):
             if self.catalog is not catalog:
                 # 拆了就是拆了（None，下一轮轮首收尾）；换了一份就重来一轮。
                 continue
-            self._publish_model_options()
+            # 发布失败不该让定时永久停摆：配置页还写着"已启用"，任务却没了，外面
+            # 一点都看不出来。记一条日志，这一轮算过去，下一轮照常。
+            try:
+                self._publish_model_options()
+            except Exception:  # noqa: BLE001 - a broken publish is not a reason to stop
+                _log.exception("workbuddy: model option publish failed")
+            self._note_model_refresh(catalog, interval_seconds)
+
+    def _note_model_refresh(self, catalog, interval_seconds: int) -> None:
+        """Record one finished automatic round and say so in the log.
+
+        这是"定时刷新确实在自己跑"的唯一证据来源：``/wb status`` 读这三个字段，
+        日志里每轮留一行。以前这里既不打日志也不记时间，任务到底起没起，除了等
+        新模型上线去数候选，没有第二种验法。
+        """
+        self._model_refresh_last_at = time.time()
+        self._model_refresh_next_at = self._model_refresh_last_at + interval_seconds
+        self._model_refresh_rounds += 1
+        models = catalog.models if catalog is not None else []
+        _log.info(
+            "workbuddy: model catalog auto-refreshed (round %d, %d models, next in %d min)",
+            self._model_refresh_rounds,
+            len(models),
+            interval_seconds // 60,
+        )
 
     def _publish_model_options(self) -> None:
         """Rebuild the delivered ``routing.models`` options/labels in place.
@@ -1476,10 +1517,11 @@ class WorkBuddyPlugin(Star):
         return "签到未完成，请稍后重试。"
 
     def _format_model_refresh_status(self) -> list:
-        """Two purely local overview lines: switch and interval, no read.
+        """Switch, interval, and whether the timer is actually alive.
 
-        只读已校验的设置，所以这个视图既不会额外 spawn 一次 ``--help``，也不会
-        编一个"上次刷新时间"出来——清单的年龄由 ``/wb models`` 那个视图负责。
+        只读已经记下的账本，所以这个视图既不会额外 spawn 一次 ``--help``，也不会
+        编一个时间出来——时间点全是循环自己跑完一轮写进去的。没有这两行的时候，
+        "配置页写着已启用、任务其实没起来"从外面完全看不出来。
         """
         refresh = None
         if self._settings is not None:
@@ -1500,7 +1542,28 @@ class WorkBuddyPlugin(Star):
                 "刷新范围：仅定时更新模型顺序列表的候选；"
                 "启动首读、登录后读取与 /wb models 不受此开关影响"
             )
+            lines.append(self._format_refresh_task_line())
         return lines
+
+    def _format_refresh_task_line(self) -> str:
+        """One line answering "is it really refreshing on its own, and when next".
+
+        文案刻意把"几次"写成"已自动刷新"。运维看到的是配置页里的候选在变，却分不
+        清那是定时刷的还是自己发命令刷的；这一行把两者的区别摆明。
+        """
+        task = self._model_refresh_task
+        if task is None or task.done():
+            return "刷新任务：未在运行（开关是开的，任务却没起来，重载插件即可重试）"
+        parts = ["运行中"]
+        last = self._model_refresh_last_at
+        if self._model_refresh_rounds and last is not None:
+            parts.append("上次 {}（{}）".format(_format_moment(last), _format_ago(last)))
+            parts.append("已自动刷新 {} 次".format(self._model_refresh_rounds))
+        else:
+            parts.append("尚未跑完第一轮")
+        if self._model_refresh_next_at is not None:
+            parts.append("下次约 {}".format(_format_moment(self._model_refresh_next_at)))
+        return "刷新任务：" + " · ".join(parts)
 
     async def _models_text(self, *, refresh: bool) -> str:
         """List the ids this machine's CLI accepts, with the credit multiplier."""
@@ -1659,6 +1722,43 @@ def _refresh_interval_seconds(minutes):
 def _model_label(model) -> str:
     """状态页里显示一个模型 ID；``None`` 是"CLI 自己的默认模型"。"""
     return model if isinstance(model, str) and model else "默认模型"
+
+
+def _format_moment(ts) -> str:
+    """把墙钟时间点写成中文状态页能用的样子：今天只给 ``12:21``，跨天带日期。
+
+    跨天不写日期会出人命：昨晚 23:10 那次刷新，第二天早上看还是"23:10"，谁也
+    分不清是昨天的还是刚才的。
+    """
+    if isinstance(ts, bool) or not isinstance(ts, (int, float)):
+        return ""
+    try:
+        moment = time.localtime(float(ts))
+    except (OverflowError, OSError, ValueError):
+        return ""
+    now = time.localtime()
+    if (moment.tm_year, moment.tm_yday) == (now.tm_year, now.tm_yday):
+        return time.strftime("%H:%M", moment)
+    return time.strftime("%m-%d %H:%M", moment)
+
+
+def _format_ago(ts) -> str:
+    """"多久以前"的粗粒度说法：只到分钟，超过一天就退回具体时间点。"""
+    if isinstance(ts, bool) or not isinstance(ts, (int, float)):
+        return ""
+    seconds = time.time() - float(ts)
+    if seconds < 0:
+        # 系统时钟被往回拨过。相对时间会变成负数，说出来只会让人以为插件坏了。
+        return _format_moment(ts)
+    minutes = int(seconds // 60)
+    if minutes < 1:
+        return "刚刚"
+    if minutes < 60:
+        return "{} 分钟前".format(minutes)
+    hours = minutes // 60
+    if hours < 24:
+        return "{} 小时前".format(hours)
+    return _format_moment(ts)
 
 
 def _source_label(source) -> str:

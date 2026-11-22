@@ -994,6 +994,141 @@ class _ModelPickerTestCase(unittest.IsolatedAsyncioTestCase):
         plugin._start_model_refresh()
         self.assertIsNone(plugin._model_refresh_task)
 
+    async def test_a_finished_round_lands_in_the_overview(self):
+        """跑完一轮之后，概览上要看得出"是它自己刷的、刷了几次、下次什么时候"。
+
+        以前这里只有一行"已启用"。运维看着候选没变，分不清是定时没跑、还是跑了
+        而机器上真没有新模型 —— "每次都得自己发命令"就是这么来的。
+        """
+        plugin, _config, _ = await self._make_plugin(
+            **self._picker_config(
+                model_refresh={"enabled": True, "interval_minutes": 60}
+            )
+        )
+        self.assertTrue(plugin.ready, plugin.error_reason)
+
+        own = plugin._model_refresh_task
+        own.cancel()
+        await asyncio.gather(own, return_exceptions=True)
+        plugin.catalog = fixtures.StubCatalog([ALPHA])
+        task = asyncio.create_task(
+            plugin._model_refresh_loop(0.01), name="wb-model-refresh"
+        )
+        plugin._model_refresh_task = task
+        try:
+            self.assertTrue(
+                await _wait_for(lambda: plugin._model_refresh_rounds >= 1),
+                "那一轮跑完了却没记账",
+            )
+            status = support._text_of(
+                await support._invoke(
+                    plugin.wb, support._make_event("wb status"), "status", ""
+                )
+            )
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+            plugin._model_refresh_task = None
+
+        # 采集那一刻任务还活着，所以是"运行中"；次数用正则，别跟下一拍抢时间。
+        self.assertIn("刷新任务：运行中", status)
+        self.assertRegex(status, r"已自动刷新 \d+ 次")
+        self.assertIn("下次约", status)
+        # 时间点必须是真实时刻（``12:21`` 或跨天的 ``11-21 12:21``），不是占位符。
+        self.assertRegex(status, r"上次 (?:\d{2}:\d{2}|\d{2}-\d{2} \d{2}:\d{2})")
+
+    async def test_the_overview_admits_a_timer_that_died(self):
+        """任务没了但开关还开着：概览必须说"未在运行"。
+
+        只报"已启用"的话，插件看起来一切正常，实际上一条新模型都不会自己出现。
+        """
+        plugin, _config, _ = await self._make_plugin(
+            **self._picker_config(
+                model_refresh={"enabled": True, "interval_minutes": 60}
+            )
+        )
+        self.assertTrue(plugin.ready, plugin.error_reason)
+        own = plugin._model_refresh_task
+        own.cancel()
+        await asyncio.gather(own, return_exceptions=True)
+
+        status = support._text_of(
+            await support._invoke(
+                plugin.wb, support._make_event("wb status"), "status", ""
+            )
+        )
+        self.assertIn("模型自动刷新：已启用", status)
+        self.assertIn("刷新任务：未在运行", status)
+
+    async def test_a_broken_publish_does_not_stop_the_timer(self):
+        """发布炸一次，定时不许跟着死。
+
+        死掉之后配置页还写着"已启用"，外面一点迹象都没有 —— 那正是这个开关最坏的
+        失效方式。所以发布包在 try 里，这一轮算过去，下一轮照常。
+        """
+        plugin, config, _ = await self._make_plugin(
+            **self._picker_config(
+                model_refresh={"enabled": True, "interval_minutes": 60}
+            )
+        )
+        self.assertTrue(plugin.ready, plugin.error_reason)
+        own = plugin._model_refresh_task
+        own.cancel()
+        await asyncio.gather(own, return_exceptions=True)
+
+        original = plugin._publish_model_options
+        calls = []
+
+        def flaky():
+            calls.append(1)
+            if len(calls) == 1:
+                raise RuntimeError("boom")
+            original()
+
+        plugin._publish_model_options = flaky
+        plugin.catalog = fixtures.StubCatalog([ALPHA, DELTA])
+        task = asyncio.create_task(
+            plugin._model_refresh_loop(0.01), name="wb-model-refresh"
+        )
+        plugin._model_refresh_task = task
+        try:
+            self.assertTrue(
+                await _wait_for(lambda: plugin._model_refresh_rounds >= 2),
+                "第一次发布炸了之后定时就停了",
+            )
+            self.assertFalse(task.done(), "定时任务已经退出")
+            self.assertIn(DELTA, self._options(config), "第二轮该发的那份没发出去")
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+            plugin._model_refresh_task = None
+
+    async def test_a_reload_does_not_carry_the_old_ledger_over(self):
+        """重载之后账本归零：新任务刚睡第一个间隔，不许显示上一轮的"刷了 7 次"。"""
+        plugin, _config, _ = await self._make_plugin(
+            **self._picker_config(
+                model_refresh={"enabled": True, "interval_minutes": 60}
+            )
+        )
+        self.assertTrue(plugin.ready, plugin.error_reason)
+        plugin._model_refresh_last_at = time.time() - 600
+        plugin._model_refresh_next_at = time.time()
+        plugin._model_refresh_rounds = 7
+
+        await plugin.initialize()
+        self.assertEqual(plugin._model_refresh_rounds, 0)
+        self.assertIsNone(plugin._model_refresh_last_at)
+        # 下一次是"从现在起一个间隔"，不是接上那条旧账。
+        self.assertGreater(plugin._model_refresh_next_at, time.time())
+
+        status = support._text_of(
+            await support._invoke(
+                plugin.wb, support._make_event("wb status"), "status", ""
+            )
+        )
+        self.assertIn("尚未跑完第一轮", status)
+        self.assertNotIn("已自动刷新 7 次", status)
+
 
 class _BlockingCatalog:
     """读不完的清单；被取消后还要等用例放行，才真的退场。
@@ -1154,6 +1289,36 @@ class ModelRefreshConfigTests(unittest.TestCase):
         # 与校验层同一套边界：不是正整数就不该有秒数出来。
         for bad in (0, -3, True, 2.5, "60", None):
             self.assertIsNone(wb_main._refresh_interval_seconds(bad))
+
+
+class RefreshLedgerTextTests(unittest.TestCase):
+    """概览里那两个时间说法：今天只给时刻，跨天带日期；"多久以前"只到分钟。"""
+
+    def test_today_is_a_bare_time_and_another_day_carries_the_date(self):
+        now = time.time()
+        self.assertRegex(wb_main._format_moment(now), r"^\d{2}:\d{2}$")
+        # 跨天必须带日期：昨晚 23:10 那次刷新，第二天早上还显示 "23:10" 就没人分得清。
+        self.assertRegex(
+            wb_main._format_moment(now - 3 * 86400),
+            r"^\d{2}-\d{2} \d{2}:\d{2}$",
+        )
+        # 没账本就是空串，让调用方决定显示什么，不许编个时间出来。
+        for bad in (None, True, "12:00", [], {}):
+            self.assertEqual(wb_main._format_moment(bad), "")
+
+    def test_ago_stops_at_minutes_and_never_goes_negative(self):
+        now = time.time()
+        self.assertEqual(wb_main._format_ago(now), "刚刚")
+        self.assertEqual(wb_main._format_ago(now - 90), "1 分钟前")
+        self.assertEqual(wb_main._format_ago(now - 3 * 3600), "3 小时前")
+        # 超过一天退回具体时刻，不说"27 小时前"。
+        self.assertRegex(wb_main._format_ago(now - 2 * 86400), r"^\d{2}-\d{2} ")
+        # 系统时钟往回拨过：差值变成负数，退回时刻，不许显示"-1 分钟前"。
+        self.assertEqual(
+            wb_main._format_ago(now + 600), wb_main._format_moment(now + 600)
+        )
+        for bad in (None, True, "now"):
+            self.assertEqual(wb_main._format_ago(bad), "")
 
 
 def tearDownModule() -> None:

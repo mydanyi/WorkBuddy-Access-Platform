@@ -8,7 +8,7 @@
 
 聊天、签到、管理员通知，在 AstrBot 里一起打理。
 
-[![版本](https://img.shields.io/badge/WorkBuddy-0.4.1-6d7fe8)](https://github.com/mydanyi/WorkBuddy-Access-Platform/releases)
+[![版本](https://img.shields.io/badge/WorkBuddy-0.4.2-6d7fe8)](https://github.com/mydanyi/WorkBuddy-Access-Platform/releases)
 [![AstrBot](https://img.shields.io/badge/AstrBot-%3E%3D4.27.4%2C%3C5-52b9b2)](https://github.com/AstrBotDevs/AstrBot)
 [![许可](https://img.shields.io/badge/License-MIT-f0bc68)](LICENSE)
 
@@ -79,6 +79,9 @@ prompt 交给 CLI，AstrBot 的 Provider 体系还是你在用的那一套，不
 在管理员私聊里执行 `/wb status`，可以一次看到就绪状态、登录态、CLI 进程、监听端口、
 签到调度、通知开关、模型清单和主备顺序。它本身不发起聊天、不签到、不领奖；某个查询
 失败只会单独提示，其它部分照常显示。
+
+开了模型自动刷新，这里还多一行「刷新任务」：上次是几点跑的、已经自动刷过几次、下次
+大约几点。任务没在跑会直接写「未在运行」，不会只报一句「已启用」就完事。
 
 ### 把结果告诉管理员
 
