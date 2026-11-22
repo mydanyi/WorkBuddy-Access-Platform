@@ -1129,6 +1129,93 @@ class _ModelPickerTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertIn("尚未跑完第一轮", status)
         self.assertNotIn("已自动刷新 7 次", status)
 
+    # =====================================================================
+    # 10. 倍率：保存过的模型也要带；命令刷新后立刻发布；总览不联网取价。
+    # =====================================================================
+
+    async def test_a_saved_model_keeps_its_multiplier(self):
+        """保存过的模型同样要带倍率。
+
+        候选里那段是"清单里的模型"，这段是"你选过、已经存进 ``routing.models``
+        的"。少了后者，运维一保存、一重载，标签就退回裸 ID——看着像倍率没了。
+        """
+        plugin, config, _ = await self._make_plugin(**self._picker_config())
+        plugin.pricing = fixtures.StubPricing({ALPHA: _priced(ALPHA)})
+        plugin._publish_model_options()
+
+        self.assertIn(ALPHA, self._options(config))
+        self.assertEqual(self._options_map(config)[ALPHA], "{} [0.5x]".format(ALPHA))
+
+    async def test_the_models_command_publishes_the_prices_it_just_fetched(self):
+        """``/wb models`` 先刷价再发布：反过来的话配置页拿到的永远是上一份。"""
+        plugin, config, _ = await self._make_plugin(**self._picker_config())
+        late = _LatePricing(ALPHA)
+        plugin.pricing = late
+
+        reply = support._text_of(
+            await support._invoke(
+                plugin.wb, support._make_event("wb models"), "models", ""
+            )
+        )
+        self.assertIn("[0.5x]", reply, "命令自己没显示倍率")
+        self.assertIn(
+            "[0.5x]", self._options_map(config)[ALPHA], "配置页没跟上刚取到的价"
+        )
+        self.assertEqual(late.refreshes, 1)
+
+    async def test_the_overview_never_asks_for_prices(self):
+        """``/wb status`` 是纯本地总览：缓存过期也不许它去联网取价。
+
+        一个"看看状态"的命令不该被计费接口拖到超时。
+        """
+        plugin, _config, _ = await self._make_plugin(**self._picker_config())
+        stub = fixtures.StubPricing({ALPHA: _priced(ALPHA)})
+        plugin.pricing = stub
+
+        status = support._text_of(
+            await support._invoke(
+                plugin.wb, support._make_event("wb status"), "status", ""
+            )
+        )
+        self.assertEqual(stub.calls, 0, "总览把自己联网去取价了")
+        self.assertIn("[0.5x]", status)
+        self.assertNotIn("倍率：未加载", status)
+
+    async def test_the_overview_says_when_no_price_table_was_ever_read(self):
+        """一次都没读到倍率时要说一句，否则全是裸 ID，看着像功能坏了。"""
+        plugin, _config, _ = await self._make_plugin(**self._picker_config())
+        plugin.pricing = fixtures.StubPricing({})
+
+        status = support._text_of(
+            await support._invoke(
+                plugin.wb, support._make_event("wb status"), "status", ""
+            )
+        )
+        self.assertIn("倍率：未加载", status)
+
+
+def _priced(model_id, effective="0.5x", credits=0.5):
+    """一条 ``ModelPricing.detail_for()`` 形状的倍率记录（虚构固定值）。"""
+    return {
+        "id": model_id,
+        "credits": credits,
+        "effective_credits": effective,
+        "promo_label": "",
+        "promo_note": "",
+    }
+
+
+class _LatePricing(fixtures.StubPricing):
+    """第一次读是空表；``refresh()`` 之后才有价——模拟命令触发的那次刷新。"""
+
+    def __init__(self, model_id):
+        super().__init__({})
+        self._model_id = model_id
+
+    async def refresh(self):
+        self._details = {self._model_id: _priced(self._model_id)}
+        return await super().refresh()
+
 
 class _BlockingCatalog:
     """读不完的清单；被取消后还要等用例放行，才真的退场。

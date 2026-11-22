@@ -134,13 +134,31 @@ class ModelPricing:
         )
 
     async def _fetch(self, now) -> dict:
-        enterprise = _entries(await self._read(ENTERPRISE_MODELS_PATH))
+        """读两份文档合成倍率表；两个源都失败才算这一轮失败。
+
+        一个源挂了不能带走另一个：企业文档是主力，``/v3/config`` 补空缺还带促销，
+        只因为主力接口抖一下就整轮放弃，等于把能显示的倍率也一起扔掉。
+        """
+        failures = 0
+        try:
+            enterprise = _entries(await self._read(ENTERPRISE_MODELS_PATH))
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - 一个源挂了还有另一个
+            enterprise = []
+            failures += 1
         try:
             v3 = await self._read(V3_CONFIG_PATH, IDE_HEADERS)
         except asyncio.CancelledError:
             raise
         except Exception:  # noqa: BLE001 - 促销读不到不影响基础倍率
             v3 = {}
+            failures += 1
+        if failures == 2:
+            # 两个都读不到：抛出去让 ``ensure()`` 走退避。若把"空表"当成"读到了空表"
+            # 缓存一个 ttl，上游恢复之后还得干等五分钟才补上倍率。
+            raise RuntimeError("both pricing sources failed")
+
         price = build_price_map(enterprise, _entries(v3))
         promotions = v3.get("modelPromotions") if isinstance(v3, dict) else None
         # ``data`` 也可能直接是那个 IDE 形状的字典
@@ -152,32 +170,32 @@ class ModelPricing:
         moment = datetime.now(timezone.utc)
         details = {}
         for model_id, base in price.items():
-            if base is None:
-                continue
-            effective = format_credits(base)
-            if effective is None:
-                continue
-            label = ""
-            note = ""
             promo = select_promotion(promotions, model_id, moment)
-            if promo is not None:
-                label = promotion_label(promo)
-                note = promotion_note(promo)
-                discounted = promotion_discount(promo, base)
-                if discounted is not None:
-                    effective = format_credits(discounted) or effective
+            # 先算促销再判空：``factor=0`` 的限时免费本来就不需要已知原价，先按
+            # ``base is None`` 跳过的话，这条 ``0x`` 就永远显示不出来。
+            discounted = promotion_discount(promo, base) if promo is not None else None
+            effective = format_credits(base) if base is not None else None
+            if discounted is not None:
+                effective = format_credits(discounted) or effective
+            if effective is None:
+                # 既没有原价也没有促销价：这条没有可显示的东西。
+                continue
             details[model_id] = {
                 "id": model_id,
                 "credits": base,
                 "effective_credits": effective,
-                "promo_label": label,
-                "promo_note": note,
+                "promo_label": promotion_label(promo) if promo is not None else "",
+                "promo_note": promotion_note(promo) if promo is not None else "",
             }
         return details
 
     def _backoff(self) -> None:
         self._failures += 1
-        delay = DEFAULT_RETRY_AFTER * (2 ** (self._failures - 1))
+        # 指数封顶。不封的话 ``2 ** 1025`` 会抛 OverflowError，而它正好发生在写
+        # ``_next_try`` 之前——退避一次没退成，异常反倒从 ``ensure()`` 里逃出去，
+        # 下一次请求立刻又打一遍。2**10 已经远超上限，再大也没意义。
+        exponent = min(self._failures - 1, 10)
+        delay = DEFAULT_RETRY_AFTER * (2 ** exponent)
         self._next_try = self._clock() + min(delay, MAX_RETRY_AFTER)
 
     # -- 对外 -------------------------------------------------------------
@@ -196,11 +214,19 @@ class ModelPricing:
             try:
                 details = await self._fetch(now)
             except asyncio.CancelledError:
+                # 客户端断开（网关开了 ``handler_cancellation``）会把这次读取消掉。
+                # 不记这一笔，下一次 ``/v1/models`` 立刻又打一遍上游——一串短命请求
+                # 就能把整套退避绕过去。取消照样往上抛，只是先记进退避状态。
+                self._backoff()
                 raise
             except Exception:  # noqa: BLE001 - 显示层的数据，坏了就退回裸 ID
                 self._backoff()
                 return self._details
-            self._details = details
+            # 有源成功、却一条价都没算出来，而手里还留着上一份：留着。计费接口抖
+            # 一下就把模型名上的倍率整片擦掉，看着像功能坏了；留着最多是旧价，
+            # 而旧价至少在列表上还能对上号。
+            if details or not self._details:
+                self._details = details
             self._fetched_at = now
             self._failures = 0
             self._next_try = 0.0
@@ -215,3 +241,12 @@ class ModelPricing:
 
     def detail_for(self, model_id):
         return self._details.get(model_id)
+
+    @property
+    def loaded(self) -> bool:
+        """有没有成功读到过一份倍率表（哪怕现在已经过期）。
+
+        显示层要靠它区分"这个模型本来就没有倍率"和"表一次都没读进来"——后者的
+        表现是所有名字全裸，看着像倍率功能坏了。
+        """
+        return bool(self._details)

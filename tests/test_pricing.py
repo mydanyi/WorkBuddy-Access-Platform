@@ -188,8 +188,13 @@ class ModelPricingTests(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_a_failure_backs_off_instead_of_hammering(self):
+        # 退避是"两个源都读不到"之后的动作：只挂一个还能靠另一个出数据，不该
+        # 因此把重试窗口拉长（见下面那条单源失败的用例）。
         client, pricing = self._pricing(
-            {ENTERPRISE_MODELS_PATH: RuntimeError("boom")}
+            {
+                ENTERPRISE_MODELS_PATH: RuntimeError("boom"),
+                V3_CONFIG_PATH: RuntimeError("boom"),
+            }
         )
         await pricing.ensure()
         self.assertEqual(client.paths().count(ENTERPRISE_MODELS_PATH), 1)
@@ -245,6 +250,75 @@ class ModelPricingTests(unittest.IsolatedAsyncioTestCase):
         )
         with self.assertRaises(asyncio.CancelledError):
             await pricing.ensure()
+
+    async def test_one_broken_source_does_not_fail_the_whole_read(self):
+        """企业接口挂了，v3 上的价照旧能用——这不叫失败，不该退避。"""
+        client, pricing = self._pricing(
+            {
+                ENTERPRISE_MODELS_PATH: RuntimeError("boom"),
+                V3_CONFIG_PATH: _v3({"id": "m", "credits": "x0.19"}),
+            }
+        )
+        details = await pricing.ensure()
+        self.assertEqual(details["m"]["effective_credits"], "0.19x")
+        # 没退避：保鲜期内第二次一次都不打，过了 ttl 才打。
+        self.now += 299.0
+        await pricing.ensure()
+        self.assertEqual(client.paths().count(V3_CONFIG_PATH), 1)
+
+    async def test_a_free_promotion_prices_a_model_without_a_base_rate(self):
+        """``factor=0`` 的限时免费不需要已知原价，这条 ``0x`` 也得显示出来。"""
+        promo = {
+            "enabled": True,
+            "modelIds": ["m"],
+            "priority": 1,
+            "badge": {"label": "限时免费"},
+            "discount": {"factor": 0},
+        }
+        client, pricing = self._pricing(
+            {
+                ENTERPRISE_MODELS_PATH: _enterprise({"id": "m"}),
+                V3_CONFIG_PATH: _v3(promotions=[promo]),
+            }
+        )
+        details = await pricing.ensure()
+        self.assertEqual(details["m"]["effective_credits"], "0x")
+        self.assertEqual(details["m"]["promo_label"], "限时免费")
+        self.assertIsNone(details["m"]["credits"], "没有原价就是没有，不许编一个")
+
+    async def test_a_cancelled_read_still_counts_against_the_backoff(self):
+        """客户端断开把这一轮取消掉，也要记进退避——否则短命请求能把它绕过去。"""
+        gate = asyncio.Event()
+
+        class _Slow(_FakeClient):
+            async def request_json(self, method, path, **kwargs):
+                self.calls.append(
+                    {"method": method, "path": path, "headers": {}, "observe": False}
+                )
+                await gate.wait()
+                return {}
+
+        self.now = 1000.0
+        pricing = ModelPricing(_Slow(), ttl=300.0, clock=lambda: self.now)
+        task = asyncio.create_task(pricing.ensure())
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+        # 取消照样往上抛，但这一笔已经记进退避：紧接着的 ensure 不该再打上游。
+        details = await pricing.ensure()
+        self.assertEqual(details, {})
+        self.assertEqual(len(pricing._client.calls), 1, "取消之后又打了一次上游")
+        self.assertGreater(pricing._next_try, self.now)
+
+    async def test_a_thousand_failures_do_not_break_the_retry_window(self):
+        """``2 ** 1025`` 会抛 OverflowError，而它正好在写 ``_next_try`` 之前。"""
+        client, pricing = self._pricing({})
+        pricing._failures = 2000
+        pricing._backoff()
+        self.assertLessEqual(pricing._next_try - self.now, 900.0)
+        self.assertGreater(pricing._next_try, self.now)
 
 
 if __name__ == "__main__":

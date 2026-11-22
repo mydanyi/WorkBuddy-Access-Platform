@@ -743,8 +743,14 @@ class WorkBuddyPlugin(Star):
             if not pure or pure == ORDERED_MODEL_ID or pure in values:
                 continue
             values.append(pure)
+            detail = self.pricing.detail_for(pure) if self.pricing is not None else None
             if models and pure not in known:
+                # 清单里没有它：先说"读不到"，不要拿一个过期倍率给它背书。
                 labels.append("{}（当前目录无此模型）".format(pure))
+            elif isinstance(detail, dict):
+                # 已经保存过的模型同样要带倍率。少了这一支，运维一保存、一重载，
+                # 标签就退回裸 ID——看着像"倍率没了"。
+                labels.append(display_model_id(detail))
             else:
                 labels.append(pure)
         for model in models:
@@ -1569,17 +1575,18 @@ class WorkBuddyPlugin(Star):
         """List the ids this machine's CLI accepts, with the credit multiplier."""
         if refresh:
             await self._refresh_catalog()
-            # 清单刚被重读过，配置页那份候选也要跟着换：否则命令说"现在有 A、B、
-            # D"，运维回到配置页看到的还是旧的三项，两边对不上。发布是幂等的。
-            self._publish_model_options()
             if self.pricing is not None:
-                # 顺手把倍率也重读一次：改价之后想立刻看到，不该等缓存过期。
+                # 先把倍率重读一次，再发布候选。发布只会读缓存里的 detail，顺序反过来
+                # 的话配置页拿到的永远是上一份（首次是空表），要等下一次发布才补上。
                 try:
                     await self.pricing.refresh()
                 except asyncio.CancelledError:
                     raise
                 except Exception:  # noqa: BLE001 - 显示层的数据，读不到就不显示
                     pass
+            # 清单和倍率都换过了，配置页那份候选也要跟着换：否则命令说"现在有 A、B、
+            # D"，运维回到配置页看到的还是旧的三项，两边对不上。发布是幂等的。
+            self._publish_model_options()
         catalog = self.catalog
         models = catalog.models if catalog is not None else []
         if not models:
@@ -1589,13 +1596,9 @@ class WorkBuddyPlugin(Star):
                 "或直接运行一次 codebuddy --help 看是否有 --model 那一行。"
             )
         pricing = self.pricing
-        if pricing is not None:
-            try:
-                await pricing.ensure()
-            except asyncio.CancelledError:
-                raise
-            except Exception:  # noqa: BLE001
-                pass
+        # ``refresh=False`` 是 ``/wb status`` 那条纯本地总览：它的文档承诺"不发一个
+        # 请求"，而 ``ensure()`` 在缓存过期时会真的去打计费接口——计费挂掉还能把整页
+        # 总览一起拖到超时。所以这里只读缓存，要不要拉新价由上面那条 refresh 分支决定。
         lines = ["可用模型（来源：{}）：".format(_source_label(catalog.source))]
         for model in models:
             detail = pricing.detail_for(model) if pricing is not None else None
@@ -1637,6 +1640,10 @@ class WorkBuddyPlugin(Star):
                 "注意：只读到 models.json 里的自定义网关，CLI 的完整清单没读到；"
                 "此时聊天入口不校验模型名，打错的 id 会由 CLI 自己报错。"
             )
+        # 倍率是另一次读回来的，可能一次都没读过（没登录、刚重载、上游挂了）。
+        # 这时上面的名字全是裸 ID——不说一句，运维会以为倍率功能坏了。
+        if pricing is None or not pricing.loaded:
+            lines.append("倍率：未加载（发 /wb models 拉一次）")
         lines.append("说明：清单来自本机 CLI，与账号登录状态无关。")
         return "\n".join(lines)
 

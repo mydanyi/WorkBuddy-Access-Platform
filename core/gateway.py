@@ -69,6 +69,11 @@ _MIB = 1024 * 1024
 # Approved default body cap; ``0`` never means "unlimited".
 _DEFAULT_MAX_REQUEST_BODY_MB = 16
 
+# 倍率是两次串行的上游请求。它只影响显示，却挂在 ``/v1/models`` 的应答路径上：
+# 计费接口一卡，客户端会先于网关超时，连一行模型 ID 都拿不到。所以只给它这点
+# 时间，到点就交裸 ID；到点即取消，顺带让 ``ModelPricing`` 记一笔退避。
+PRICING_WAIT_SECONDS = 5.0
+
 # The router's own fixed code for "no candidate may be asked this round": that
 # refusal is a *local* 429 rate limit, never a plain upstream failure.
 _ROUTING_COOLING_CODE = "routing_cooling"
@@ -430,13 +435,17 @@ class Gateway:
         """倍率表；读不到就当空表。
 
         与 :meth:`_catalog_models` 同一个道理：这是显示层的数据，缺了只会让模型名
-        退回裸 ID，绝不该让 ``/v1/models`` 变成 5xx。
+        退回裸 ID，绝不该让 ``/v1/models`` 变成 5xx。也绝不该让客户端干等——倍率
+        要串行读两个接口，计费一慢，默认的 HTTP 超时比客户端自己的耐心长得多。
+        所以这里给一个短上限，到点交裸 ID，重读留给下一次。
         """
         pricing = self._pricing
         if pricing is None:
             return {}
         try:
-            details = await pricing.ensure()
+            details = await asyncio.wait_for(
+                pricing.ensure(), timeout=PRICING_WAIT_SECONDS
+            )
         except asyncio.CancelledError:
             raise
         except Exception:  # noqa: BLE001 - 没有倍率不是网关故障

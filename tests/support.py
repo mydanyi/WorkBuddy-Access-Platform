@@ -361,6 +361,11 @@ class StubPricing:
     def detail_for(self, model_id):
         return self._details.get(model_id)
 
+    @property
+    def loaded(self) -> bool:
+        """与真身同一个语义：有没有一份能用的倍率表。"""
+        return bool(self._details)
+
 
 class StubCatalog:
     """只回答"清单是什么"的模型目录，用于网关的 ``/v1/models`` 与校验。
