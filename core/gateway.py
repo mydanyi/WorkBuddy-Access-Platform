@@ -15,10 +15,15 @@ Behaviour pinned by the contract tests:
 * admission is counted precisely against ``concurrency + queue_size``, a full
   queue or an expired queue wait answers 429 with ``Retry-After``, and the RPM
   budget is judged before enqueueing but spent per *real* ACP prompt;
-* the virtual ordered model (``core.routing.ORDERED_MODEL_ID``) is only
-  advertised/served while the route is enabled; its candidates are walked by
-  the real :class:`core.routing.ModelRouter`, and the virtual Chinese id is
-  never forwarded to a CLI process;
+* the virtual ordered model (``core.routing.ORDERED_MODEL_ID``) is always
+  advertised, but only *served* while the route is enabled -- a disabled route
+  answers a fixed local 400 instead of vanishing from the list; its candidates
+  are walked by the real :class:`core.routing.ModelRouter`, and the virtual
+  Chinese id is never forwarded to a CLI process;
+* credit multipliers are display-only: a priced model is listed as
+  ``<id> [0.79x]`` (or ``<id> [0.395x · 错峰使用]`` under an active promotion)
+  and the suffix is stripped again before the id reaches the CLI; an unpriced
+  model stays a bare id, and a failed price read only costs the suffix;
 * a model id that the local catalog does not contain is a fixed local 400 (never
   a spawned process that would fail later with a 502); when the catalog is empty
   -- nothing has ever been read -- or is only the ``models.json`` subset (the
@@ -47,6 +52,7 @@ import math
 
 from aiohttp import web
 from .chat import aggregate_chunks
+from .credits import display_model_id
 from .errors import ChatStreamError, UpstreamError
 from .limits import ConcurrencyGate, LimitExceeded
 from .models import MAX_MODEL_ID_CHARS, strip_model_alias
@@ -62,6 +68,11 @@ _log = logging.getLogger(__name__)
 _MIB = 1024 * 1024
 # Approved default body cap; ``0`` never means "unlimited".
 _DEFAULT_MAX_REQUEST_BODY_MB = 16
+
+# 倍率是两次串行的上游请求。它只影响显示，却挂在 ``/v1/models`` 的应答路径上：
+# 计费接口一卡，客户端会先于网关超时，连一行模型 ID 都拿不到。所以只给它这点
+# 时间，到点就交裸 ID；到点即取消，顺带让 ``ModelPricing`` 记一笔退避。
+PRICING_WAIT_SECONDS = 5.0
 
 # The router's own fixed code for "no candidate may be asked this round": that
 # refusal is a *local* 429 rate limit, never a plain upstream failure.
@@ -113,6 +124,7 @@ class Gateway:
         limits=None,
         router=None,
         catalog=None,
+        pricing=None,
         max_request_body_mb=_DEFAULT_MAX_REQUEST_BODY_MB,
     ):
         # The body cap is a positive integer number of MiB: ``bool``, ``0``, a
@@ -129,6 +141,9 @@ class Gateway:
         # 就只报虚拟入口，聊天也不做未知模型校验。生产里一定是
         # :class:`core.models.ModelCatalog`。
         self._catalog = catalog
+        # 倍率表（:class:`core.pricing.ModelPricing`）。给 ``None`` 就是"不显示
+        # 积分"，模型名回到裸 ID——这条链路只影响显示，缺了它一切照旧。
+        self._pricing = pricing
         self._router = router
         self._api_key = api_key or ""
         self._host = host
@@ -416,30 +431,61 @@ class Gateway:
         catalog = self._catalog
         return bool(getattr(catalog, "authoritative", False))
 
+    async def _pricing_details(self) -> dict:
+        """倍率表；读不到就当空表。
+
+        与 :meth:`_catalog_models` 同一个道理：这是显示层的数据，缺了只会让模型名
+        退回裸 ID，绝不该让 ``/v1/models`` 变成 5xx。也绝不该让客户端干等——倍率
+        要串行读两个接口，计费一慢，默认的 HTTP 超时比客户端自己的耐心长得多。
+        所以这里给一个短上限，到点交裸 ID，重读留给下一次。
+        """
+        pricing = self._pricing
+        if pricing is None:
+            return {}
+        try:
+            details = await asyncio.wait_for(
+                pricing.ensure(), timeout=PRICING_WAIT_SECONDS
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - 没有倍率不是网关故障
+            return {}
+        return details if isinstance(details, dict) else {}
+
     async def _handle_models(self, request):
         if not self._authorized(request):
             return self._auth_error()
         models = await self._catalog_models()
-        data = [
+        details = await self._pricing_details()
+        data = []
+        for model in models:
+            detail = details.get(model)
+            if isinstance(detail, dict):
+                # 有价才拼后缀：``glm-5.2 [0.79x]``。这是 AstrBot 唯一能显示价格
+                # 的位置，请求回来时再按同一形状剥掉（见 ``_handle_chat``）。
+                entry = {"id": display_model_id(detail)}
+            else:
+                entry = {"id": model}
+            entry.update(
+                {"object": "model", "created": 0, "owned_by": "workbuddy"}
+            )
+            if isinstance(detail, dict):
+                entry["credits"] = detail.get("credits")
+                entry["effective_credits"] = detail.get("effective_credits")
+                entry["promo_label"] = detail.get("promo_label", "")
+                entry["promo_note"] = detail.get("promo_note", "")
+            data.append(entry)
+        # 虚拟入口**始终**列出来。它能不能用由 ``routing.enabled`` 决定：关着的时候
+        # 选了它会拿到一条明确的本地 400，而不是从列表里凭空消失——消失了没人看得
+        # 出原因，只会以为功能被删了（真踩过）。
+        data.append(
             {
-                "id": model,
+                "id": ORDERED_MODEL_ID,
                 "object": "model",
                 "created": 0,
                 "owned_by": "workbuddy",
             }
-            for model in models
-        ]
-        if self._route_enabled():
-            # Appended after every real entry: the virtual id is a route, never a
-            # model the CLI knows how to start.
-            data.append(
-                {
-                    "id": ORDERED_MODEL_ID,
-                    "object": "model",
-                    "created": 0,
-                    "owned_by": "workbuddy",
-                }
-            )
+        )
         return web.json_response({"object": "list", "data": data})
 
     async def _handle_chat(self, request):
@@ -473,10 +519,11 @@ class Gateway:
                 "both 'model' and a non-empty 'messages' list are required",
                 "invalid_request_error",
             )
-        # 旧版把倍率拼在模型 ID 后面（``wb-1 [0.11x]``），升级后 Provider 里存着的
-        # 可能还是这种别名。按同一条规则剥掉再往下走：不剥的话，清单非空时它是一个
-        # 本地 400（把升级前的配置直接打死），清单为空时又会带着后缀进 ``--model``。
-        # 剥完往后每一层（路由判断、目录校验、下发）都只见纯 ID。
+        # 模型名后面可能挂着显示用的倍率后缀（``glm-5.2 [0.79x]``，见
+        # ``core.credits``）：那是我们自己在 ``/v1/models`` 里拼的，客户端会原样回传。
+        # 按同一条规则剥掉再往下走——不剥的话，清单非空时它是一个本地 400，清单为空时
+        # 又会带着后缀进 ``--model``。剥完往后每一层（路由判断、目录校验、下发）都只见
+        # 纯 ID。
         payload = dict(payload)
         model = strip_model_alias(payload["model"])
         if not isinstance(model, str) or not model.strip():

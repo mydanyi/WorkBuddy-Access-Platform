@@ -335,6 +335,38 @@ class ScriptedChat:
         }
 
 
+class StubPricing:
+    """只回答"某个模型多少钱"的倍率表，形状与 ``core.pricing.ModelPricing`` 对齐。
+
+    ``fail`` 用来验退化成裸 ID 那条路：网关必须把读失败当成"没有倍率"，而不是
+    把 ``/v1/models`` 变成 5xx。
+    """
+
+    def __init__(self, details=None, *, fail=False) -> None:
+        self._details = dict(details or {})
+        self.fail = fail
+        self.calls = 0
+        self.refreshes = 0
+
+    async def ensure(self):
+        self.calls += 1
+        if self.fail:
+            raise RuntimeError("pricing unavailable")
+        return dict(self._details)
+
+    async def refresh(self):
+        self.refreshes += 1
+        return await self.ensure()
+
+    def detail_for(self, model_id):
+        return self._details.get(model_id)
+
+    @property
+    def loaded(self) -> bool:
+        """与真身同一个语义：有没有一份能用的倍率表。"""
+        return bool(self._details)
+
+
 class StubCatalog:
     """只回答"清单是什么"的模型目录，用于网关的 ``/v1/models`` 与校验。
 
@@ -384,6 +416,7 @@ __all__ = [
     "SEED_CREDENTIALS",
     "ScriptedChat",
     "StubCatalog",
+    "StubPricing",
     "UID",
     "biz",
     "clear_cli_credentials",

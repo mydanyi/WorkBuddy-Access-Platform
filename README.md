@@ -8,7 +8,7 @@
 
 聊天、签到、管理员通知，在 AstrBot 里一起打理。
 
-[![版本](https://img.shields.io/badge/WorkBuddy-0.4.0-6d7fe8)](https://github.com/mydanyi/WorkBuddy-Access-Platform/releases)
+[![版本](https://img.shields.io/badge/WorkBuddy-0.4.2-6d7fe8)](https://github.com/mydanyi/WorkBuddy-Access-Platform/releases)
 [![AstrBot](https://img.shields.io/badge/AstrBot-%3E%3D4.27.4%2C%3C5-52b9b2)](https://github.com/AstrBotDevs/AstrBot)
 [![许可](https://img.shields.io/badge/License-MIT-f0bc68)](LICENSE)
 
@@ -45,10 +45,14 @@ prompt 交给 CLI，AstrBot 的 Provider 体系还是你在用的那一套，不
 清单只留在内存里，默认 60 秒保鲜，`/wb models` 随时可以重读。读不到就是空列表——
 不会拿一份写死的模型名凑数。
 
+有报价的模型，名字后面会带一个倍率，比如 `glm-5.2 [0.79x]`、促销期间
+`glm-5.2 [0.395x · 错峰使用]`。这是 AstrBot 里唯一能显示价格的位置，所以显示名就是
+模型 ID 本身；请求回来时插件把那截后缀剥掉再交给 CLI。没报价的模型保持裸名字。
+
 ### 主用失败时按顺序换下一个
 
-开启「按顺序调用」后，模型列表会多出一个虚拟入口，勾选顺序就是调用顺序：第一项主用，
-其余依次备用。
+虚拟入口「按顺序调用」始终排在模型列表最后，开启后才能用；关着的时候选中它，会直接
+收到一条本地报错说明没启用。开启后勾选顺序就是调用顺序：第一项主用，其余依次备用。
 
 只有在上游真实返回 `429` / `502` / `503` / `504`、并且还没吐出任何正文时才会换下一个；
 一旦开始出字就不重播，避免群里出现两遍回答。连续两个 `429` 会让整条路由进入冷却，
@@ -75,6 +79,9 @@ prompt 交给 CLI，AstrBot 的 Provider 体系还是你在用的那一套，不
 在管理员私聊里执行 `/wb status`，可以一次看到就绪状态、登录态、CLI 进程、监听端口、
 签到调度、通知开关、模型清单和主备顺序。它本身不发起聊天、不签到、不领奖；某个查询
 失败只会单独提示，其它部分照常显示。
+
+开了模型自动刷新，这里还多一行「刷新任务」：上次是几点跑的、已经自动刷过几次、下次
+大约几点。任务没在跑会直接写「未在运行」，不会只报一句「已启用」就完事。
 
 ### 把结果告诉管理员
 
@@ -122,7 +129,7 @@ prompt 交给 CLI，AstrBot 的 Provider 体系还是你在用的那一套，不
 | `acp.model` | 空 | 不指定时用 CLI 自己的默认模型 |
 | `acp.max_processes` | `2` | 同时常驻的 CLI 进程数上限 |
 | `gateway.api_key` | 空 | 网关密钥，**必须填**，否则监听不会开 |
-| `routing.enabled` | `false` | 开启后模型列表出现「按顺序调用」 |
+| `routing.enabled` | `false` | 「按顺序调用」始终在列表里，开启后才可用 |
 | `routing.first_frame_timeout` | `90` | 整轮等待首帧的总期限（秒）；超时不再切换备用 |
 | `signin.enabled` | `true` | 每日自动签到 |
 | `notifications.enabled` | `false` | 管理员 QQ 通知总开关 |
