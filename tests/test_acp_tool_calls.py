@@ -385,6 +385,92 @@ class RequiredToolTests(_Base):
         self.assertEqual(calls[0]["function"]["name"], "search_memes")
 
 
+    async def test_auto_inline_marker_after_prose_is_not_executed(self):
+        # Real providers sometimes append the exact marker + JSON array
+        # immediately after ordinary prose on the SAME line.
+        args = {"query": "sad cat"}
+        payload = self._payload(tools=[_SEARCH_MEMES_SCHEMA], tool_choice="auto")
+        prose = "这是一只猫 here is a cat meme list"
+
+        def _responder(prompt):
+            match = _MARKER_RE.search(prompt)
+            if match is None:
+                return [{"kind": "text", "text": "plain reply"},
+                        {"kind": "done", "stop_reason": "end_turn"}]
+            nonce = match.group(1)
+            body = json.dumps([{"name": "search_memes", "arguments": args}],
+                              separators=(",", ":"), ensure_ascii=False)
+            full = prose + "WB_TOOL_CALLS:" + nonce + "\n" + body
+            parts = [{"kind": "text", "text": ch} for ch in full]
+            parts.append({"kind": "done", "stop_reason": "end_turn"})
+            return parts
+
+        backend = self._make_backend(_responder)
+        chunks = await self._drain(backend, payload)
+        text = _text_of(chunks)
+        self.assertEqual(text, prose)
+        self.assertNotIn("WB_TOOL_CALLS", text)
+        self.assertNotIn('"search_memes"', text)
+        self.assertFalse(_tool_call_deltas(chunks))
+        self.assertEqual(_finish_of(chunks), "stop")
+
+    async def test_auto_multiline_json_before_marker_discarded(self):
+        # Pretty-printed argument-shaped JSON (literal newlines) precedes a
+        # standalone marker emitting []; only intro text survives.
+        payload = self._payload(tools=[_SEARCH_MEMES_SCHEMA], tool_choice="auto")
+        intro = "intro"
+        obj = '{\n  "meme_id": ""\n}'
+
+        def _responder(prompt):
+            match = _MARKER_RE.search(prompt)
+            if match is None:
+                return [{"kind": "text", "text": "plain reply"},
+                        {"kind": "done", "stop_reason": "end_turn"}]
+            nonce = match.group(1)
+            full = intro + "\n" + obj + "\nWB_TOOL_CALLS:" + nonce + "\n[]"
+            parts = [{"kind": "text", "text": full[i:i + 7]}
+                     for i in range(0, len(full), 7)]
+            parts.append({"kind": "done", "stop_reason": "end_turn"})
+            return parts
+
+        backend = self._make_backend(_responder)
+        chunks = await self._drain(backend, payload)
+        text = _text_of(chunks)
+        self.assertIn(intro, text)
+        self.assertNotIn('"meme_id"', text)
+        self.assertNotIn("[]", text)
+        self.assertFalse(_tool_call_deltas(chunks))
+
+    async def test_auto_multiline_object_without_marker_preserved(self):
+        # A real multiline object without a marker must survive EXACTLY,
+        # including whitespace and following prose.
+        payload = self._payload(tools=[_SEARCH_MEMES_SCHEMA], tool_choice="auto")
+        full = 'note\n{\n  "meme_id": "x",\n  "n": 1\n}\ntail text'
+        backend = self._make_backend(_plain_responder(full))
+        chunks = await self._drain(backend, payload)
+        self.assertEqual(_text_of(chunks), full)
+        self.assertFalse(_tool_call_deltas(chunks))
+
+    async def test_auto_trailing_wb_prefix_preserved_in_final_chunk(self):
+        # Ordinary prose ending with literal "WB_" in a separate final chunk
+        # must keep those exact bytes (nonempty prose already emitted).
+        payload = self._payload(tools=[_SEARCH_MEMES_SCHEMA], tool_choice="auto")
+
+        def _responder(_prompt):
+            return [{"kind": "text", "text": "ordinary line without the marker yet "},
+                    {"kind": "text", "text": "WB_"},
+                    {"kind": "done", "stop_reason": "end_turn"}]
+
+        backend = self._make_backend(_responder)
+        chunks = await self._drain(backend, payload)
+        text = _text_of(chunks)
+        self.assertTrue(text.endswith("WB_"))
+        self.assertEqual(text, "ordinary line without the marker yet WB_")
+        self.assertNotIn("WB_TOOL_CALLS", text)
+        self.assertFalse(_tool_call_deltas(chunks))
+        self.assertEqual(_finish_of(chunks), "stop")
+
+
 class ToolHistoryTests(_Base):
     CALL_ID = "call_ab12cd34"
 

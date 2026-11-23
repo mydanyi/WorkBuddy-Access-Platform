@@ -93,6 +93,7 @@ class ToolBridge:
         self._state = None  # None | "text" | "call"
         self._call_buf = []
         self._pending_json = ""
+        self._json_candidate = ""
         self.directive = self._build_directive()
 
     def _build_directive(self):
@@ -194,23 +195,59 @@ class ToolBridge:
 
         return held, []
 
+    def _emit_auto_text(self, text, *, line_end):
+        match = re.search(r"WB_TOOL_CALLS:[0-9a-f]{16}", text)
+        if match is not None:
+            prefix = text[:match.start()]
+            self._pending_json = ""
+            self._json_candidate = ""
+            self._held = ""
+            self._state = "discard"
+            return prefix
+        if line_end:
+            self._state = None
+            return text
+        pos = text.rfind("W")
+        if pos != -1:
+            suffix = text[pos:]
+            if _MARKER_PREFIX.startswith(suffix):
+                self._held = suffix
+                self._state = "text"
+                return text[:pos]
+            if suffix.startswith(_MARKER_PREFIX):
+                tail = suffix[len(_MARKER_PREFIX):]
+                if len(tail) < 16 and re.fullmatch(r"[0-9a-f]*", tail):
+                    self._held = suffix
+                    self._state = "text"
+                    return text[:pos]
+        self._held = ""
+        self._state = "text"
+        return text
+
     def _feed_auto(self, chunk):
         if self._state == "call":
             self._call_buf.append(chunk)
             return ""
         if self._state == "discard":
             return ""
-        self._held += chunk
-        parts = self._held.split("\n")
+        text = self._held + chunk
+        self._held = ""
+        parts = text.split("\n")
         self._held = parts.pop()
         out = []
         for i, line in enumerate(parts):
+            raw = line + "\n"
             if self._state == "text":
-                out.append(line + "\n")
-                self._state = None
+                piece = self._emit_auto_text(raw, line_end=True)
+                if piece:
+                    out.append(piece)
+                if self._state == "discard":
+                    return "".join(out)
                 continue
+            lstripped = line.lstrip()
             if line.lstrip().startswith(_MARKER_PREFIX):
                 self._pending_json = ""
+                self._json_candidate = ""
                 if line.strip() == self.marker:
                     self._state = "call"
                     rest = "\n".join(parts[i + 1:] + [self._held])
@@ -219,41 +256,59 @@ class ToolBridge:
                 else:
                     self._state = "discard"
                 return "".join(out)
-            if not line.strip() and self._pending_json:
-                self._pending_json += line + "\n"
-                continue
-            parsed = None
-            if line.lstrip().startswith("{"):
+            if self._json_candidate or lstripped.startswith("{"):
+                if lstripped.startswith("{") and not self._json_candidate:
+                    if self._pending_json:
+                        out.append(self._pending_json)
+                        self._pending_json = ""
+                self._json_candidate += raw
                 try:
-                    parsed = json.loads(line)
+                    json.loads(self._json_candidate)
                 except (ValueError, TypeError):
-                    parsed = None
-                if not isinstance(parsed, dict):
-                    parsed = None
-            if parsed is not None:
-                out.append(self._pending_json)
-                self._pending_json = line + "\n"
+                    continue
+                self._pending_json = self._json_candidate
+                self._json_candidate = ""
                 continue
-            out.append(self._pending_json + line + "\n")
-            self._pending_json = ""
+            if not line.strip() and self._pending_json:
+                self._pending_json += raw
+                continue
+            if self._pending_json:
+                out.append(self._pending_json)
+                self._pending_json = ""
+            piece = self._emit_auto_text(raw, line_end=True)
+            if piece:
+                out.append(piece)
+            if self._state == "discard":
+                return "".join(out)
         tail = self._held
+        self._held = ""
+        if self._state == "text":
+            if tail:
+                piece = self._emit_auto_text(tail, line_end=False)
+                if piece:
+                    out.append(piece)
+            return "".join(out)
+        if self._state == "call":
+            if tail:
+                self._call_buf.append(tail)
+            return "".join(out)
+        if self._state == "discard":
+            return "".join(out)
         if not tail:
             return "".join(out)
-        if tail.isspace() or tail.lstrip().startswith("{"):
-            return "".join(out)
-        if tail.lstrip().startswith(_MARKER_PREFIX) or tail.lstrip().startswith(self.marker):
-            return "".join(out)
         lstripped = tail.lstrip()
-        if _MARKER_PREFIX.startswith(lstripped) or self.marker.startswith(lstripped):
+        if (self._json_candidate or not lstripped
+                or lstripped.startswith("{")
+                or lstripped.startswith(_MARKER_PREFIX)
+                or _MARKER_PREFIX.startswith(lstripped)):
+            self._held = tail
             return "".join(out)
-        if self._state == "text":
-            out.append(tail)
-            self._held = ""
-            return "".join(out)
-        out.append(self._pending_json + tail)
-        self._pending_json = ""
-        self._held = ""
-        self._state = "text"
+        if self._pending_json:
+            out.append(self._pending_json)
+            self._pending_json = ""
+        piece = self._emit_auto_text(tail, line_end=False)
+        if piece:
+            out.append(piece)
         return "".join(out)
 
     def _finish_auto(self, complete):
@@ -266,19 +321,13 @@ class ToolBridge:
             return "", []
         if self._state == "discard":
             return "", []
-        held = self._held
-        self._held = ""
-        stripped = held.strip()
-        if stripped.startswith(_MARKER_PREFIX):
-            self._pending_json = ""
-            return "", []
-        if self.marker.startswith(stripped) and len(stripped) >= 3:
-            self._pending_json = ""
-            return "", []
-        text = self._pending_json + held
-        self._pending_json = ""
-        return text, []
-
+        stripped = self._held.strip()
+        if self._state != "text":
+            if stripped.startswith(_MARKER_PREFIX):
+                return "", []
+            if len(stripped) >= 3 and self.marker.startswith(stripped):
+                return "", []
+        return self._pending_json + self._json_candidate + self._held, []
     def _parse_calls(self, raw):
         text = raw
         if not text.strip():
