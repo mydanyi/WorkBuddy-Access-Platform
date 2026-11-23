@@ -92,6 +92,8 @@ class ToolBridge:
         self._held = ""
         self._state = None  # None | "text" | "call"
         self._call_buf = []
+        self._pending_json = ""
+        self._json_candidate = ""
         self.directive = self._build_directive()
 
     def _build_directive(self):
@@ -116,7 +118,9 @@ class ToolBridge:
             "",
             "Tool calls are executed by the caller, not by you. Do not use a "
             "CLI, local, shell, or command-line tool.",
-            "Output exactly this marker on its own line:",
+            "Only when you are actually invoking a nonempty tool call, output "
+            "exactly this marker on its own line (never for plain text, and "
+            "never output argument objects alone without a marker):",
             self.marker,
             "Immediately after that marker line, output a JSON array of "
             "objects such as "
@@ -128,6 +132,8 @@ class ToolBridge:
     # ---- streaming filter -------------------------------------------------
 
     def feed(self, chunk):
+        if self._mode == "auto":
+            return self._feed_auto(chunk)
         if self._state == "text":
             return chunk
         if self._state == "call":
@@ -162,6 +168,8 @@ class ToolBridge:
     # ---- finish ----------------------------------------------------------
 
     def finish(self, complete):
+        if self._mode == "auto":
+            return self._finish_auto(complete)
         if self._state == "call":
             if not complete:
                 raise ChatStreamError("incomplete tool call envelope", status=502)
@@ -187,6 +195,139 @@ class ToolBridge:
 
         return held, []
 
+    def _emit_auto_text(self, text, *, line_end):
+        match = re.search(r"WB_TOOL_CALLS:[0-9a-f]{16}", text)
+        if match is not None:
+            prefix = text[:match.start()]
+            self._pending_json = ""
+            self._json_candidate = ""
+            self._held = ""
+            self._state = "discard"
+            return prefix
+        if line_end:
+            self._state = None
+            return text
+        pos = text.rfind("W")
+        if pos != -1:
+            suffix = text[pos:]
+            if _MARKER_PREFIX.startswith(suffix):
+                self._held = suffix
+                self._state = "text"
+                return text[:pos]
+            if suffix.startswith(_MARKER_PREFIX):
+                tail = suffix[len(_MARKER_PREFIX):]
+                if len(tail) < 16 and re.fullmatch(r"[0-9a-f]*", tail):
+                    self._held = suffix
+                    self._state = "text"
+                    return text[:pos]
+        self._held = ""
+        self._state = "text"
+        return text
+
+    def _feed_auto(self, chunk):
+        if self._state == "call":
+            self._call_buf.append(chunk)
+            return ""
+        if self._state == "discard":
+            return ""
+        text = self._held + chunk
+        self._held = ""
+        parts = text.split("\n")
+        self._held = parts.pop()
+        out = []
+        for i, line in enumerate(parts):
+            raw = line + "\n"
+            if self._state == "text":
+                piece = self._emit_auto_text(raw, line_end=True)
+                if piece:
+                    out.append(piece)
+                if self._state == "discard":
+                    return "".join(out)
+                continue
+            lstripped = line.lstrip()
+            if line.lstrip().startswith(_MARKER_PREFIX):
+                self._pending_json = ""
+                self._json_candidate = ""
+                if line.strip() == self.marker:
+                    self._state = "call"
+                    rest = "\n".join(parts[i + 1:] + [self._held])
+                    self._call_buf.append(rest)
+                    self._held = ""
+                else:
+                    self._state = "discard"
+                return "".join(out)
+            if self._json_candidate or lstripped.startswith("{"):
+                if lstripped.startswith("{") and not self._json_candidate:
+                    if self._pending_json:
+                        out.append(self._pending_json)
+                        self._pending_json = ""
+                self._json_candidate += raw
+                try:
+                    json.loads(self._json_candidate)
+                except (ValueError, TypeError):
+                    continue
+                self._pending_json = self._json_candidate
+                self._json_candidate = ""
+                continue
+            if not line.strip() and self._pending_json:
+                self._pending_json += raw
+                continue
+            if self._pending_json:
+                out.append(self._pending_json)
+                self._pending_json = ""
+            piece = self._emit_auto_text(raw, line_end=True)
+            if piece:
+                out.append(piece)
+            if self._state == "discard":
+                return "".join(out)
+        tail = self._held
+        self._held = ""
+        if self._state == "text":
+            if tail:
+                piece = self._emit_auto_text(tail, line_end=False)
+                if piece:
+                    out.append(piece)
+            return "".join(out)
+        if self._state == "call":
+            if tail:
+                self._call_buf.append(tail)
+            return "".join(out)
+        if self._state == "discard":
+            return "".join(out)
+        if not tail:
+            return "".join(out)
+        lstripped = tail.lstrip()
+        if (self._json_candidate or not lstripped
+                or lstripped.startswith("{")
+                or lstripped.startswith(_MARKER_PREFIX)
+                or _MARKER_PREFIX.startswith(lstripped)):
+            self._held = tail
+            return "".join(out)
+        if self._pending_json:
+            out.append(self._pending_json)
+            self._pending_json = ""
+        piece = self._emit_auto_text(tail, line_end=False)
+        if piece:
+            out.append(piece)
+        return "".join(out)
+
+    def _finish_auto(self, complete):
+        if self._state == "call":
+            if complete:
+                try:
+                    return "", self._parse_calls("".join(self._call_buf))
+                except ChatStreamError:
+                    return "", []
+            return "", []
+        if self._state == "discard":
+            return "", []
+        stripped = self._held.strip()
+        if self._state != "text":
+            if stripped.startswith(_MARKER_PREFIX):
+                return "", []
+            if len(stripped) >= 3 and self.marker.startswith(stripped):
+                return "", []
+        return self._pending_json + self._json_candidate + self._held, []
     def _parse_calls(self, raw):
         text = raw
         if not text.strip():

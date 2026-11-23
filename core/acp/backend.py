@@ -44,10 +44,12 @@ OpenAI 的 chunk 形状。只要这一层产出同样的形状，网关、流式
 
 from __future__ import annotations
 
+import base64
 import contextlib
 import inspect
 import json
 import logging
+import re
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -135,6 +137,36 @@ def _content_text(content):
     return None
 
 
+def _user_images(content):
+    """Return real ACP image blocks from a message's content; malformed input raises 400."""
+    if not isinstance(content, list):
+        return []
+    images = []
+    for part in content:
+        if not isinstance(part, dict) or part.get("type") != "image_url":
+            continue
+        image_url = part.get("image_url")
+        if not isinstance(image_url, dict):
+            raise ChatStreamError("malformed image block", status=400)
+        url = image_url.get("url")
+        if not isinstance(url, str) or not url.startswith("data:image/") or ";base64," not in url:
+            raise ChatStreamError("malformed image block", status=400)
+        header, _, data = url.partition(";base64,")
+        mime = header[len("data:"):]
+        if re.fullmatch(r"image/[A-Za-z0-9.+-]+", mime) is None:
+            raise ChatStreamError("malformed image block", status=400)
+        if not data:
+            raise ChatStreamError("malformed image block", status=400)
+        try:
+            raw = base64.b64decode(data, validate=True)
+        except ValueError:
+            raise ChatStreamError("malformed image block", status=400) from None
+        if not raw:
+            raise ChatStreamError("malformed image block", status=400)
+        images.append({"type": "image", "mimeType": mime, "data": data})
+    return images
+
+
 def _neutralize(text):
     """把消息正文里可能出现的历史分隔语换掉，避免伪造对话边界。"""
     for header, replacement in _HEADER_GUARDS.items():
@@ -174,7 +206,7 @@ def _render_tool_call(call):
     }
 
 
-def build_prompt(payload, *, tool_directive=""):
+def build_prompt(payload, *, tool_directive="", image_blocks=None):
     """把 AstrBot 的 ``messages`` 摊平成一段自包含的 prompt 文本。
 
     返回 ``str``；没有可发的用户消息时返回 ``None``（调用方转成 400）。
@@ -215,6 +247,15 @@ def build_prompt(payload, *, tool_directive=""):
         if role == "user":
             pending_calls = {}
             consumed_ids = set()
+            user_images = _user_images(message.get("content")) if image_blocks is not None else []
+            if image_blocks is not None and user_images:
+                first_label = len(image_blocks) + 1
+                labels = [
+                    "[图片 {}]".format(first_label + index)
+                    for index in range(len(user_images))
+                ]
+                text = "{}\n{}".format(text, "\n".join(labels)) if text else "\n".join(labels)
+                image_blocks.extend(user_images)
             if text is not None:
                 turns.append(("用户", text))
                 pending_user_seen = True
@@ -421,8 +462,11 @@ class AcpChatBackend:
 
     async def _stream(self, payload):
         bridge = build_tool_bridge(payload)
+        image_blocks = []
         prompt_text = build_prompt(
-            payload, tool_directive=bridge.directive if bridge else ""
+            payload,
+            tool_directive=bridge.directive if bridge else "",
+            image_blocks=image_blocks,
         )
         if prompt_text is None:
             raise ChatStreamError("no user message was provided", status=400)
@@ -476,7 +520,17 @@ class AcpChatBackend:
                     ) from exc
 
             # 无状态：每次新建会话，上下文全靠 prompt_text 自带（见模块 docstring 第 1 条）。
-            updates = client.prompt_once(prompt_text, timeout=self._prompt_timeout)
+            if image_blocks:
+                prompt_caps = client.capabilities.get("promptCapabilities")
+                if not (isinstance(prompt_caps, dict) and prompt_caps.get("image") is True):
+                    raise ChatStreamError(
+                        "upstream does not support image prompts", status=400
+                    )
+                updates = client.prompt_once(
+                    prompt_text, timeout=self._prompt_timeout, image_blocks=image_blocks
+                )
+            else:
+                updates = client.prompt_once(prompt_text, timeout=self._prompt_timeout)
             try:
                 async for update in updates:
                     kind = update.get("kind")

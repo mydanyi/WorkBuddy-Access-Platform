@@ -252,6 +252,7 @@ def handle(message):
                 "cancel": handle.cancel_count,
                 "prompt_sessions": list(handle.prompt_sessions),
                 "cancel_sessions": list(handle.cancel_sessions),
+                "last_prompt_blocks": list(handle.last_prompt_blocks),
                 "config_dir": os.environ.get("CODEBUDDY_CONFIG_DIR"),
                 "home": os.environ.get("HOME"),
                 "userprofile": os.environ.get("USERPROFILE"),
@@ -329,6 +330,7 @@ def handle(message):
         # 会话上"这种回归照样能绿。
         handle.prompt_sessions.append(session_id)
         blocks = params.get("prompt") or []
+        handle.last_prompt_blocks = blocks
         text = "".join(
             block.get("text") or ""
             for block in blocks
@@ -364,6 +366,7 @@ def main():
     handle.cancel_count = 0
     handle.prompt_sessions = []
     handle.cancel_sessions = []
+    handle.last_prompt_blocks = []
 
     if args.scenario == "crash":
         sys.exit(3)
