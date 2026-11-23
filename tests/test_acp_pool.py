@@ -357,29 +357,163 @@ class TrimTests(_PoolCase):
             self.assertEqual(pool.status()["running"], [ALPHA])
             self.assertEqual(await pool.trim(), 0, "已经在上限内了")
 
-    async def test_the_lease_counter_returns_to_zero_after_the_outer_lease(self):
-        pool = self.make_pool(max_processes=1)
-        alpha = pool.get(ALPHA)
-        _start(alpha)
+    async def test_same_model_leases_are_fifo_exclusive_turns(self):
+        # 同一模型的 ACP 回合是一条连接上的顺序对话：第二个租约必须等第一个退出，
+        # 否则两轮并发打到同一条 CLI，busy 的那一轮会被当成 end_turn 空回复（网关
+        # 502）。第一个租约用事件故意按住不放，第二、第三个必须等；等第一个放开，
+        # 二先于三进场——这钉住的是真 FIFO，不是"碰巧只排了一个人"。
+        pool = self.make_pool(max_processes=2)
 
-        async with pool.lease(ALPHA):
-            self.assertEqual(pool.busy(ALPHA), 1)
+        first_in = asyncio.Event()
+        release_first = asyncio.Event()
+        order = []
+
+        async def _hold_first():
             async with pool.lease(ALPHA):
-                self.assertEqual(pool.busy(ALPHA), 2, "嵌套领取要累加，不能覆盖")
-            self.assertEqual(pool.busy(ALPHA), 1, "退出一层只减一层")
+                order.append("first")
+                first_in.set()
+                await release_first.wait()
 
-        # 直接看计数：不靠"该淘汰谁"去反推，淘汰策略一改也不会误报。
-        self.assertEqual(pool.busy(ALPHA), 0, "两层都退出了就该归零")
-        self.assertEqual(pool.busy(BETA), 0, "没领过的模型读出来也是 0")
+        first = asyncio.ensure_future(_hold_first())
+        try:
+            await asyncio.wait_for(first_in.wait(), 5.0)
+            self.assertEqual(pool.busy(ALPHA), 1, "第一个租约占着该模型")
 
-        # 归零之后它才重新可淘汰。这条保留 LRU 视角，因为它验的是另一半：
-        # 计数归零真的放开了淘汰。
-        beta = pool.get(BETA)
-        _start(beta)
-        self.assertEqual(await pool.trim(), 1)
-        self.assertEqual(alpha.shutdowns, 1, "两层都退出了，它就该能被淘汰")
-        self.assertEqual(beta.shutdowns, 0)
+            second_in = asyncio.Event()
+            third_in = asyncio.Event()
 
+            async def _take_second():
+                async with pool.lease(ALPHA):
+                    order.append("second")
+                    second_in.set()
+
+            async def _take_third():
+                async with pool.lease(ALPHA):
+                    order.append("third")
+                    third_in.set()
+
+            second = asyncio.ensure_future(_take_second())
+            try:
+                # 让第二个任务真的把租约请求提上去、排进队列，再起第三个。
+                await asyncio.sleep(0.01)
+                third = asyncio.ensure_future(_take_third())
+                try:
+                    # 第一个被故意按住不放，下面这段等待必须超时：不超时就说明
+                    # 第二个（乃至第三个）越界进了场。
+                    with self.assertRaises(asyncio.TimeoutError):
+                        await asyncio.wait_for(second_in.wait(), 0.2)
+                    self.assertFalse(
+                        second_in.is_set(),
+                        "前一个租约没退出，同模型的第二个不许进场",
+                    )
+                    self.assertFalse(
+                        third_in.is_set(),
+                        "前一个租约没退出，同模型的第三个也不许进场",
+                    )
+
+                    release_first.set()
+                    await asyncio.wait_for(second_in.wait(), 5.0)
+                    await asyncio.wait_for(third_in.wait(), 5.0)
+                    self.assertEqual(
+                        order, ["first", "second", "third"], "先到先得"
+                    )
+                finally:
+                    third.cancel()
+                    await asyncio.gather(third, return_exceptions=True)
+            finally:
+                second.cancel()
+                await asyncio.gather(second, return_exceptions=True)
+        finally:
+            release_first.set()
+            await asyncio.gather(first, return_exceptions=True)
+
+        self.assertEqual(pool.busy(ALPHA), 0, "全部结束后计数归零")
+
+    async def test_different_models_can_lease_concurrently(self):
+        # 不同模型是各自独立的进程，必须能同时进场——把它串行化会白白拖慢多模型。
+        # 两个模型都故意按住不放，各自进场都必须等到，而不是靠谁先退。
+        pool = self.make_pool(max_processes=2)
+
+        alpha_in = asyncio.Event()
+        beta_in = asyncio.Event()
+        release = asyncio.Event()
+
+        async def _hold(model, entered):
+            async with pool.lease(model):
+                entered.set()
+                await release.wait()
+
+        alpha_task = asyncio.ensure_future(_hold(ALPHA, alpha_in))
+        beta_task = asyncio.ensure_future(_hold(BETA, beta_in))
+        try:
+            await asyncio.wait_for(alpha_in.wait(), 5.0)
+            await asyncio.wait_for(beta_in.wait(), 5.0)
+            self.assertEqual(pool.busy(ALPHA), 1)
+            self.assertEqual(pool.busy(BETA), 1)
+            self.assertFalse(release.is_set(), "两个都进了场，没在互相等")
+        finally:
+            release.set()
+            await asyncio.gather(alpha_task, beta_task, return_exceptions=True)
+
+        self.assertEqual(pool.busy(ALPHA), 0)
+        self.assertEqual(pool.busy(BETA), 0)
+
+    async def test_a_cancelled_waiter_does_not_block_the_model(self):
+        # 排队等着的人被取消（客户端断线）之后，必须离开队列，不能让后面的人
+        # 对着一个已经不存在的等待者干等。取消后由第三个租约证明该模型还能进。
+        pool = self.make_pool(max_processes=2)
+
+        first_in = asyncio.Event()
+        release_first = asyncio.Event()
+
+        async def _hold_first():
+            async with pool.lease(ALPHA):
+                first_in.set()
+                await release_first.wait()
+
+        first = asyncio.ensure_future(_hold_first())
+        waiter = None
+        try:
+            await asyncio.wait_for(first_in.wait(), 5.0)
+
+            waiter_in = asyncio.Event()
+
+            async def _waiter():
+                async with pool.lease(ALPHA):
+                    waiter_in.set()
+
+            waiter = asyncio.ensure_future(_waiter())
+            # 第一个被故意按住，下面这段等待必须超时：不超时说明等待者直接越界了。
+            with self.assertRaises(asyncio.TimeoutError):
+                await asyncio.wait_for(waiter_in.wait(), 0.2)
+            self.assertFalse(waiter_in.is_set(), "前一个还在，等待者不得进场")
+
+            waiter.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await waiter
+        finally:
+            release_first.set()
+            await asyncio.gather(first, return_exceptions=True)
+            if waiter is not None:
+                waiter.cancel()
+                await asyncio.gather(waiter, return_exceptions=True)
+
+        self.assertEqual(pool.busy(ALPHA), 0, "取消的等待者不得留下计数")
+
+        # 前一个走了、等待者取消了：该模型照常能被领取。
+        entered = asyncio.Event()
+
+        async def _last():
+            async with pool.lease(ALPHA):
+                entered.set()
+
+        last = asyncio.ensure_future(_last())
+        try:
+            await asyncio.wait_for(entered.wait(), 5.0)
+        finally:
+            await asyncio.gather(last, return_exceptions=True)
+
+        self.assertEqual(pool.busy(ALPHA), 0)
 
     async def test_an_eviction_that_leaves_the_child_alive_is_not_counted(self):
         # ``shutdown()`` 正常返回不等于进程没了：``AcpRuntime.close()`` 在子进程死活

@@ -14,8 +14,7 @@ OpenAI 的 chunk 形状。只要这一层产出同样的形状，网关、流式
    上下文，插件就照旧做无状态转发——这与迁移前 ``/v2/chat/completions`` 的行为
    完全一致。
 2. **system 提示每轮都带。** 会话是一次性的，没有「首轮」可言。
-3. **工具调用不映射成 OpenAI ``tools``。** 群聊消息永远不能驱动服务器执行命令。
-   ``tool_call`` / ``tool_call_update`` 在这一层直接丢弃。
+3. **工具调用校验调用方声明的 tools。** 群聊消息永远不能驱动服务器执行命令。本层校验调用方声明的工具，把模型的工具请求渲染成 OpenAI delta 的 ``tool_calls``，由调用方 AstrBot 执行；上一轮的调用与结果会被序列化进 prompt 历史，供模型继续多步工具循环。
 4. **一轮一个模型，模型决定进程。** ``payload["model"]`` 直接决定用哪条 CLI
    进程（``--model`` 是进程启动参数，见 :mod:`core.acp.pool`）。本层不再"回显
    一个模型、实际用另一个"——那正是迁移前最容易骗过调用方的地方。
@@ -47,6 +46,7 @@ from __future__ import annotations
 
 import contextlib
 import inspect
+import json
 import logging
 import time
 import uuid
@@ -56,6 +56,7 @@ from ..errors import ChatStreamError, UpstreamError
 from ..limits import ConcurrencyGate
 from ..routing import ORDERED_MODEL_ID
 from .client import KIND_DONE
+from .tool_bridge import build_tool_bridge
 from .protocol import (
     KIND_TEXT,
     KIND_THOUGHT,
@@ -142,18 +143,51 @@ def _neutralize(text):
     return text
 
 
-def build_prompt(payload):
+def _render_tool_call(call):
+    """把一条 OpenAI 风格的 tool_call 渲染成可读数据行。"""
+    if not isinstance(call, dict):
+        return None
+    call_id = call.get("id")
+    if not isinstance(call_id, str) or not call_id:
+        return None
+    function = call.get("function")
+    if not isinstance(function, dict):
+        return None
+    name = function.get("name")
+    if not isinstance(name, str) or not name:
+        return None
+    arguments = function.get("arguments")
+    if isinstance(arguments, str):
+        try:
+            parsed = json.loads(arguments)
+        except (TypeError, ValueError):
+            parsed = None
+        if isinstance(parsed, dict):
+            arguments = parsed
+        # 解析失败或结果不是 JSON 对象：保留原始字符串，作为不可信数据写入。
+    elif not isinstance(arguments, dict):
+        arguments = {}
+    return {
+        "id": call_id,
+        "name": name,
+        "arguments": arguments,
+    }
+
+
+def build_prompt(payload, *, tool_directive=""):
     """把 AstrBot 的 ``messages`` 摊平成一段自包含的 prompt 文本。
 
     返回 ``str``；没有可发的用户消息时返回 ``None``（调用方转成 400）。
 
     规则：
     * ``system`` / ``developer`` 只认第一条**非空白**的（空串等于没写，不许占位）；
-    * 只保留 ``user`` / ``assistant``，``tool`` 等一律丢弃——CLI 侧工具已被
-      ``--tools ""`` 关掉，历史里的工具痕迹对它没有意义，反而占预算；
-    * **最后一条必须是 user 且非空白**，否则视为没有可回答的问题。末条 user
-      若内容是纯图片/空数组（取不到文本）也算没有——绝不能退回去把上一条老
-      问题当成本轮问题再答一遍。
+    * ``tool_directive`` 非空时紧跟在该 system 之后、历史之前单独成段；
+    * 保留 ``user`` / ``assistant`` 文本；``assistant`` 的 ``tool_calls`` 会以 JSON
+      数据行写入历史；紧随其后的 ``tool`` 结果只在与上一批 assistant 的 tool_call
+      id 匹配时保留，孤儿 tool 消息直接丢弃；
+    * **最后一条必须是 user 且非空白**，或者是一条已被匹配、且之前确有 user 的
+      tool 结果，否则视为没有可回答的问题。末条 user 若内容是纯图片/空数组
+      （取不到文本）也算没有——绝不能退回去把上一条老问题当成本轮问题再答一遍。
     """
     messages = payload.get("messages") if isinstance(payload, dict) else None
     if not isinstance(messages, list):
@@ -161,6 +195,10 @@ def build_prompt(payload):
 
     system_text = None
     turns = []
+    pending_calls = {}
+    pending_user_seen = False
+    consumed_ids = set()
+
     for message in messages:
         if not isinstance(message, dict):
             continue
@@ -174,21 +212,89 @@ def build_prompt(payload):
             if system_text is None and text is not None and text.strip():
                 system_text = text
             continue
-        if text is None:
-            # 取不到文本的消息（纯图片、空数组、非文本块）也要参与「末条」判定，
-            # 否则它会从列表里消失，让更早的一条 user 顶上来。
-            if role in ("user", "assistant"):
-                turns.append((role, None))
-            continue
         if role == "user":
-            turns.append(("用户", text))
-        elif role == "assistant":
-            turns.append(("助手", text))
+            pending_calls = {}
+            consumed_ids = set()
+            if text is not None:
+                turns.append(("用户", text))
+                pending_user_seen = True
+            else:
+                turns.append(("用户", None))
+            continue
+        if role == "assistant":
+            pending_calls = {}
+            consumed_ids = set()
+            raw_calls = message.get("tool_calls")
+            call_lines = []
+            if isinstance(raw_calls, list):
+                for call in raw_calls:
+                    rendered = _render_tool_call(call)
+                    if rendered is None or rendered["id"] in pending_calls:
+                        continue
+                    pending_calls[rendered["id"]] = rendered
+                    call_lines.append(
+                        json.dumps(
+                            {
+                                "tool_call": {
+                                    "id": rendered["id"],
+                                    "name": rendered["name"],
+                                    "arguments": rendered["arguments"],
+                                }
+                            },
+                            ensure_ascii=False,
+                            sort_keys=True,
+                        )
+                    )
+            if text is not None and text.strip() and call_lines:
+                turns.append(
+                    (
+                        "助手",
+                        "\n".join([text.strip(), "工具调用：", "\n".join(call_lines)]),
+                    )
+                )
+            elif call_lines:
+                # text 为空串/纯空白也走这里：call_lines 必须保留，不能被空白文本顶掉。
+                turns.append(("助手", "\n".join(call_lines)))
+            elif text is not None:
+                turns.append(("助手", text))
+            else:
+                # 没有文本也没有可用 tool_calls：仍占位，防止更早的消息顶成末条。
+                turns.append(("助手", None))
+            continue
+        if role == "tool":
+            call_id = message.get("tool_call_id")
+            if not isinstance(call_id, str) or call_id not in pending_calls:
+                # 孤儿结果：不渲染，也不参与「末条」判定。
+                continue
+            if call_id in consumed_ids:
+                continue
+            consumed_ids.add(call_id)
+            call = pending_calls[call_id]
+            result_text = _content_text(message.get("content"))
+            if result_text is None:
+                result_text = ""
+            payload_line = {
+                "tool_result": {
+                    "label": call.get("name"),
+                    "id": call_id,
+                    "content": result_text,
+                }
+            }
+            rendered = json.dumps(payload_line, ensure_ascii=False, sort_keys=True)
+            turns.append(("工具", rendered))
+            continue
+        # 其余角色（如 function）整条忽略。
 
     if not turns:
         return None
     last_role, last_text = turns[-1]
-    if last_role != "用户" or last_text is None or not last_text.strip():
+    if last_role == "用户":
+        if last_text is None or not last_text.strip():
+            return None
+    elif last_role == "工具":
+        if not pending_user_seen:
+            return None
+    else:
         return None
 
     history = [
@@ -200,12 +306,14 @@ def build_prompt(payload):
     parts = []
     if system_text is not None and system_text.strip():
         parts.append(_neutralize(system_text.strip()))
+    if tool_directive:
+        parts.append(tool_directive)
     if history:
         parts.append(_HISTORY_HEADER)
         for label, text in history:
             parts.append(_neutralize("{}：{}".format(label, text.strip())))
         parts.append(_CURRENT_HEADER)
-    parts.append(_neutralize(last_text.strip()))
+    parts.append(_neutralize(last_text.strip()) if last_text else "")
     return "\n\n".join(parts)
 
 
@@ -312,7 +420,10 @@ class AcpChatBackend:
             pass
 
     async def _stream(self, payload):
-        prompt_text = build_prompt(payload)
+        bridge = build_tool_bridge(payload)
+        prompt_text = build_prompt(
+            payload, tool_directive=bridge.directive if bridge else ""
+        )
         if prompt_text is None:
             raise ChatStreamError("no user message was provided", status=400)
 
@@ -329,6 +440,7 @@ class AcpChatBackend:
         created = int(self._clock())
         emitted_role = False
         emitted_text = False
+        bridge_calls = []
 
         async with self._lease(model) as runtime:
             client = self._client
@@ -377,6 +489,10 @@ class AcpChatBackend:
                         text = update.get("text") or ""
                         if not text:
                             continue
+                        if bridge is not None:
+                            text = bridge.feed(text)
+                            if not text:
+                                continue
                         delta = {"content": text}
                         emitted_text = True
                         if not emitted_role:
@@ -388,6 +504,9 @@ class AcpChatBackend:
                         thought = update.get("text") or ""
                         if not thought:
                             continue
+                        if bridge is not None:
+                            # 工具桥接生效时不把思考块当正文/元数据外泄给普通聊天路径。
+                            continue
                         delta = {"reasoning_content": thought}
                         if not emitted_role:
                             # 首帧可能是思考块：role 必须挂在真正发出去的第一帧上，
@@ -398,6 +517,35 @@ class AcpChatBackend:
 
                     elif kind == KIND_DONE:
                         finish = self._finish_reason(update.get("stop_reason"))
+                        tail = ""
+                        if bridge is not None:
+                            tail, bridge_calls = bridge.finish(
+                                complete=(update.get("stop_reason") == STOP_END_TURN)
+                            )
+                        if tail:
+                            delta = {"content": tail}
+                            if not emitted_role:
+                                delta["role"] = "assistant"
+                                emitted_role = True
+                            emitted_text = True
+                            yield self._chunk(stream_id, created, delta, model=model)
+                        if bridge_calls:
+                            if runtime is not None:
+                                runtime.note_session_ok()
+                            yield self._chunk(
+                                stream_id,
+                                created,
+                                {"role": "assistant", "tool_calls": bridge_calls},
+                                model=model,
+                            )
+                            yield self._chunk(
+                                stream_id,
+                                created,
+                                {},
+                                model=model,
+                                finish="tool_calls",
+                            )
+                            return
                         if not emitted_text:
                             # 一帧正文都没有（例如上游只给了思考块、图片或资源块）：
                             # 宁可报错，也不能把空正文配 stop 当成功交出去。

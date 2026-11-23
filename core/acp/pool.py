@@ -78,6 +78,8 @@ class AcpRuntimePool:
         self._runtimes = {}
         # 模型 ID → 正在它上面跑的请求数。只有 0 才允许淘汰。
         self._busy = {}
+        # 模型 ID → 该模型的租约锁，保证同一进程同时只处理一轮请求。
+        self._turn_locks = {}
         # 模型 ID → 最近一次领取的序号，用来挑最久未用的那个。
         self._last_used = {}
         self._sequence = 0
@@ -199,7 +201,13 @@ class AcpRuntimePool:
 
     @asynccontextmanager
     async def lease(self, model=None):
-        """占用该模型的运行时直到本轮结束：占用期间它不会被淘汰。"""
+        """占用该模型的运行时直到本轮结束：占用期间它不会被淘汰。
+
+        同一模型的请求在 ``_turn_locks`` 上串行：每个进程同一时刻只处理一轮，
+        后来的调用方等在锁上而不是并发打进同一条 CLI。等待期间 pin 已经计入
+        ``_busy``，所以 :meth:`trim` 不会把它等的那条进程淘汰掉。不同模型各有
+        一把锁，互不阻塞，各自按 ``max_processes`` 限额占用进程。
+        """
         if self._closed:
             raise AcpError("acp runtime pool is closed")
         if self._logout_depth:
@@ -210,24 +218,26 @@ class AcpRuntimePool:
         key = _normalize(model)
         epoch = self._epoch
         runtime = self.get(key)
+        turn_lock = self._turn_locks.setdefault(key, asyncio.Lock())
         self._busy[key] = self._busy.get(key, 0) + 1
         try:
-            # 先淘汰再交出去：这样"新起一条"与"收掉一条空闲"在同一轮里完成，
-            # 稳态下进程数不会越过上限。
-            await self.trim()
-            if self._closed:
-                # 池在 ``trim()`` 等着的时候被永久关掉了。``shutdown()`` 不碰登出深度、
-                # 也不动 ``_epoch``（那两样是登出专用的），只查它们会放行一条刚被
-                # ``_close_batch`` 关掉的运行时——调用方拿到一条作废的池里的死运行
-                # 时，紧接着的 ``ensure_started()`` 只会撞上"运行时已关闭"。
-                raise AcpError("acp runtime pool is closed")
-            if self._logout_depth or self._epoch != epoch:
-                # 进门之后才开始、甚至已经跑完的登出。``trim()`` 可能等了很久，
-                # 久到凭据已经被删、闸门重新放开——只查登出深度会漏掉后半段，而
-                # 这一刻放行，调用方下一次 ``ensure_started()`` 就会在用户看到
-                # "已退出登录"之后拉起一条 CLI。
-                raise AcpError("acp runtime pool is logging out")
-            yield runtime
+            async with turn_lock:
+                # 先淘汰再交出去：这样"新起一条"与"收掉一条空闲"在同一轮里完成，
+                # 稳态下进程数不会越过上限。
+                await self.trim()
+                if self._closed:
+                    # 池在 ``trim()`` 等着的时候被永久关掉了。``shutdown()`` 不碰登出深度、
+                    # 也不动 ``_epoch``（那两样是登出专用的），只查它们会放行一条刚被
+                    # ``_close_batch`` 关掉的运行时——调用方拿到一条作废的池里的死运行
+                    # 时，紧接着的 ``ensure_started()`` 只会撞上"运行时已关闭"。
+                    raise AcpError("acp runtime pool is closed")
+                if self._logout_depth or self._epoch != epoch:
+                    # 进门之后才开始、甚至已经跑完的登出。``trim()`` 可能等了很久，
+                    # 久到凭据已经被删、闸门重新放开——只查登出深度会漏掉后半段，而
+                    # 这一刻放行，调用方下一次 ``ensure_started()`` 就会在用户看到
+                    # "已退出登录"之后拉起一条 CLI。
+                    raise AcpError("acp runtime pool is logging out")
+                yield runtime
         finally:
             remaining = self._busy.get(key, 1) - 1
             if remaining < 0:
@@ -235,12 +245,14 @@ class AcpRuntimePool:
                 # 把它藏成"淘汰策略随机失灵"，当场炸出来反而好定位。带上模型键，
                 # 否则看到这条只能靠栈去猜是哪一条。
                 self._busy.pop(key, None)
+                self._turn_locks.pop(key, None)
                 raise AcpError(
                     "acp runtime pool busy counter went negative for model "
                     "{!r}".format(key)
                 )
             if remaining == 0:
                 self._busy.pop(key, None)
+                self._turn_locks.pop(key, None)
                 # 释放之后再收一次：并发冷启动会让两条进程同时越过限额（谁都不空闲，
                 # trim 当时挑不出牺牲者），等它们陆续结束，这里才是真正能收的时候。
                 # 没超额时这一步只看一眼列表就返回，不 spawn、不关任何东西。
