@@ -169,7 +169,7 @@ class AcpClient:
             raise AcpProcessError("acp session/new returned no sessionId")
         return session_id
 
-    async def prompt_once(self, text, *, cwd=None, timeout=None):
+    async def prompt_once(self, text, *, cwd=None, timeout=None, image_blocks=None):
         """跑一轮用完即弃的 prompt：新建会话 → 发一次 → 丢弃会话。
 
         这是插件唯一的聊天路径。AstrBot 每轮都把完整上下文重发一遍，且请求体里
@@ -181,14 +181,14 @@ class AcpClient:
         ——每个请求天然独占一个会话，也就不需要锁。
         """
         session_id = await self._create_session(cwd=cwd)
-        stream = self._prompt_once(session_id, text, timeout=timeout)
+        stream = self._prompt_once(session_id, text, timeout=timeout, image_blocks=image_blocks)
         try:
             async for item in stream:
                 yield item
         finally:
             await stream.aclose()
 
-    async def _prompt_once(self, session_id, text, *, timeout=None):
+    async def _prompt_once(self, session_id, text, *, timeout=None, image_blocks=None):
         queue = self._transport.subscribe(session_id)
         loop = asyncio.get_running_loop()
         done_marker = object()
@@ -196,11 +196,14 @@ class AcpClient:
 
         async def runner():
             try:
+                blocks = build_prompt_blocks(text)
+                if image_blocks:
+                    blocks.extend(image_blocks)
                 result = await self._transport.request(
                     M_SESSION_PROMPT,
                     {
                         "sessionId": session_id,
-                        "prompt": build_prompt_blocks(text),
+                        "prompt": blocks,
                     },
                     timeout=timeout,
                 )

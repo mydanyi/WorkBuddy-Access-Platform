@@ -257,6 +257,134 @@ class RequiredToolTests(_Base):
             await self._drain(backend, payload)
 
 
+    async def test_auto_leaks_prose_before_protocol_envelope(self):
+        # Screenshot reproduction: prose first, then a protocol envelope.
+        # Old implementation permanently entered text state on prose and leaked
+        # the marker/JSON body verbatim.
+        args = {"query": "sad cat"}
+        payload = self._payload(
+            tools=[_SEARCH_MEMES_SCHEMA], tool_choice="auto"
+        )
+
+        # Interleave: prose, then marker envelope split across chunks.
+
+        # Replace fake with a prose+marker responder in one stream.
+        def _prose_then_marker(prompt):
+            match = _MARKER_RE.search(prompt)
+            if match is None:
+                return [
+                    {"kind": "text", "text": "plain reply"},
+                    {"kind": "done", "stop_reason": "end_turn"},
+                ]
+            nonce = match.group(1)
+            body = json.dumps(
+                [{"name": "search_memes", "arguments": args}],
+                separators=(",", ":"),
+                ensure_ascii=False,
+            )
+            full = (
+                "here is a cat meme list\n\n"
+                + '{"meme_id":""}\n'
+                + "WB_TOOL_CALLS:"
+                + nonce
+                + "\n"
+                + body
+            )
+            return [
+                {"kind": "text", "text": full[:15]},
+                {"kind": "text", "text": full[15:40]},
+                {"kind": "text", "text": full[40:70]},
+                {"kind": "text", "text": full[70:]},
+                {"kind": "done", "stop_reason": "end_turn"},
+            ]
+
+        backend = self._make_backend(_prose_then_marker)
+        chunks = await self._drain(backend, payload)
+        text = _text_of(chunks)
+        calls = _tool_call_deltas(chunks)
+
+        self.assertNotIn("WB_TOOL_CALLS", text)
+        self.assertNotIn('{"meme_id"', text)
+        self.assertIn("here is a cat meme list", text)
+        self.assertTrue(calls, "expected structured tool_calls in auto mode")
+        self.assertEqual(calls[0]["function"]["name"], "search_memes")
+        self.assertEqual(json.loads(calls[0]["function"]["arguments"]), args)
+
+    async def test_auto_discards_malformed_marker_after_prose(self):
+        def _responder(prompt):
+            return [
+                {"kind": "text", "text": "hi there\n\nWB_TOOL_CALLS:deadbeefdeadbeef\nnot json"},
+                {"kind": "done", "stop_reason": "end_turn"},
+            ]
+
+        backend = self._make_backend(_responder)
+        payload = self._payload(tools=[_SEARCH_MEMES_SCHEMA], tool_choice="auto")
+        chunks = await self._drain(backend, payload)
+        text = _text_of(chunks)
+        self.assertNotIn("WB_TOOL_CALLS", text)
+        self.assertNotIn("deadbeef", text)
+        self.assertNotIn("not json", text)
+        self.assertIn("hi there", text)
+        self.assertFalse(_tool_call_deltas(chunks))
+
+    async def test_auto_empty_array_envelope_is_no_call(self):
+        def _responder(prompt):
+            match = _MARKER_RE.search(prompt)
+            if match is None:
+                return [
+                    {"kind": "text", "text": "plain reply"},
+                    {"kind": "done", "stop_reason": "end_turn"},
+                ]
+            nonce = match.group(1)
+            return [
+                {"kind": "text", "text": "done thinking\n\nWB_TOOL_CALLS:" + nonce + "\n[]"},
+                {"kind": "done", "stop_reason": "end_turn"},
+            ]
+
+        backend = self._make_backend(_responder)
+        payload = self._payload(tools=[_SEARCH_MEMES_SCHEMA], tool_choice="auto")
+        chunks = await self._drain(backend, payload)
+        text = _text_of(chunks)
+        self.assertIn("done thinking", text)
+        self.assertNotIn("WB_TOOL_CALLS", text)
+        self.assertNotIn("[]", text)
+        self.assertFalse(_tool_call_deltas(chunks))
+
+    async def test_auto_preserves_standalone_user_json(self):
+        obj = '{"meme_id":""}'
+        backend = self._make_backend(_plain_responder("see:\n" + obj + "\nend"))
+        payload = self._payload(tools=[_SEARCH_MEMES_SCHEMA], tool_choice="auto")
+        chunks = await self._drain(backend, payload)
+        self.assertEqual(_text_of(chunks), "see:\n" + obj + "\nend")
+        self.assertFalse(_tool_call_deltas(chunks))
+
+    async def test_auto_detects_marker_across_arbitrary_splits_crlf(self):
+        def _responder(prompt):
+            match = _MARKER_RE.search(prompt)
+            if match is None:
+                return [
+                    {"kind": "text", "text": "plain reply"},
+                    {"kind": "done", "stop_reason": "end_turn"},
+                ]
+            nonce = match.group(1)
+            body = '[{"name":"search_memes","arguments":{"query":"x"}}]'
+            full = "intro\r\n\r\nWB_TOOL_CALLS:" + nonce + "\r\n" + body
+            # one-char-at-a-time split
+            parts = [{"kind": "text", "text": ch} for ch in full]
+            parts.append({"kind": "done", "stop_reason": "end_turn"})
+            return parts
+
+        backend = self._make_backend(_responder)
+        payload = self._payload(tools=[_SEARCH_MEMES_SCHEMA], tool_choice="auto")
+        chunks = await self._drain(backend, payload)
+        text = _text_of(chunks)
+        calls = _tool_call_deltas(chunks)
+        self.assertNotIn("WB_TOOL_CALLS", text)
+        self.assertIn("intro", text)
+        self.assertTrue(calls)
+        self.assertEqual(calls[0]["function"]["name"], "search_memes")
+
+
 class ToolHistoryTests(_Base):
     CALL_ID = "call_ab12cd34"
 

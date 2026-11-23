@@ -92,6 +92,7 @@ class ToolBridge:
         self._held = ""
         self._state = None  # None | "text" | "call"
         self._call_buf = []
+        self._pending_json = ""
         self.directive = self._build_directive()
 
     def _build_directive(self):
@@ -116,7 +117,9 @@ class ToolBridge:
             "",
             "Tool calls are executed by the caller, not by you. Do not use a "
             "CLI, local, shell, or command-line tool.",
-            "Output exactly this marker on its own line:",
+            "Only when you are actually invoking a nonempty tool call, output "
+            "exactly this marker on its own line (never for plain text, and "
+            "never output argument objects alone without a marker):",
             self.marker,
             "Immediately after that marker line, output a JSON array of "
             "objects such as "
@@ -128,6 +131,8 @@ class ToolBridge:
     # ---- streaming filter -------------------------------------------------
 
     def feed(self, chunk):
+        if self._mode == "auto":
+            return self._feed_auto(chunk)
         if self._state == "text":
             return chunk
         if self._state == "call":
@@ -162,6 +167,8 @@ class ToolBridge:
     # ---- finish ----------------------------------------------------------
 
     def finish(self, complete):
+        if self._mode == "auto":
+            return self._finish_auto(complete)
         if self._state == "call":
             if not complete:
                 raise ChatStreamError("incomplete tool call envelope", status=502)
@@ -186,6 +193,91 @@ class ToolBridge:
             raise ChatStreamError("missing tool call", status=502)
 
         return held, []
+
+    def _feed_auto(self, chunk):
+        if self._state == "call":
+            self._call_buf.append(chunk)
+            return ""
+        if self._state == "discard":
+            return ""
+        self._held += chunk
+        parts = self._held.split("\n")
+        self._held = parts.pop()
+        out = []
+        for i, line in enumerate(parts):
+            if self._state == "text":
+                out.append(line + "\n")
+                self._state = None
+                continue
+            if line.lstrip().startswith(_MARKER_PREFIX):
+                self._pending_json = ""
+                if line.strip() == self.marker:
+                    self._state = "call"
+                    rest = "\n".join(parts[i + 1:] + [self._held])
+                    self._call_buf.append(rest)
+                    self._held = ""
+                else:
+                    self._state = "discard"
+                return "".join(out)
+            if not line.strip() and self._pending_json:
+                self._pending_json += line + "\n"
+                continue
+            parsed = None
+            if line.lstrip().startswith("{"):
+                try:
+                    parsed = json.loads(line)
+                except (ValueError, TypeError):
+                    parsed = None
+                if not isinstance(parsed, dict):
+                    parsed = None
+            if parsed is not None:
+                out.append(self._pending_json)
+                self._pending_json = line + "\n"
+                continue
+            out.append(self._pending_json + line + "\n")
+            self._pending_json = ""
+        tail = self._held
+        if not tail:
+            return "".join(out)
+        if tail.isspace() or tail.lstrip().startswith("{"):
+            return "".join(out)
+        if tail.lstrip().startswith(_MARKER_PREFIX) or tail.lstrip().startswith(self.marker):
+            return "".join(out)
+        lstripped = tail.lstrip()
+        if _MARKER_PREFIX.startswith(lstripped) or self.marker.startswith(lstripped):
+            return "".join(out)
+        if self._state == "text":
+            out.append(tail)
+            self._held = ""
+            return "".join(out)
+        out.append(self._pending_json + tail)
+        self._pending_json = ""
+        self._held = ""
+        self._state = "text"
+        return "".join(out)
+
+    def _finish_auto(self, complete):
+        if self._state == "call":
+            if complete:
+                try:
+                    return "", self._parse_calls("".join(self._call_buf))
+                except ChatStreamError:
+                    return "", []
+            return "", []
+        if self._state == "discard":
+            return "", []
+        held = self._held
+        self._held = ""
+        stripped = held.strip()
+        if stripped.startswith(_MARKER_PREFIX):
+            self._pending_json = ""
+            return "", []
+        if self.marker.startswith(stripped) and len(stripped) >= 3:
+            self._pending_json = ""
+            return "", []
+        text = self._pending_json + held
+        self._pending_json = ""
+        return text, []
 
     def _parse_calls(self, raw):
         text = raw

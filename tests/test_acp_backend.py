@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextlib
 import sys
 import unittest
@@ -307,6 +308,76 @@ class StreamShapeTests(BackendTestCase):
         self.assertIn("用户：第一句", text)
         self.assertIn("助手：第一答", text)
         self.assertTrue(text.rstrip().endswith("第二句"))
+
+
+    async def test_text_plus_image_reaches_acp_session_prompt(self):
+        # 绿条件：CLI 收到的 prompt 块里同时有 text 和 image，且图片 data 逐字节一致。
+
+        raw = b"\x89PNG\r\n\x1a\n-synthetic"
+        url = "data:image/png;base64," + base64.b64encode(raw).decode()
+        payload = {
+            "model": "glm-5.2",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "看图"},
+                        {"type": "image_url", "image_url": {"url": url}},
+                    ],
+                }
+            ],
+        }
+        chunks = await self._collect(payload)
+        text = "".join(c["choices"][0]["delta"].get("content", "") for c in chunks)
+        self.assertIn("Hello world!", text)
+        stats = await self.transport.request("test/stats", {})
+        blocks = stats["last_prompt_blocks"]
+        types = [b.get("type") for b in blocks]
+        self.assertIn("text", types)
+        self.assertIn("image", types)
+        image = next(b for b in blocks if b.get("type") == "image")
+        self.assertEqual(image["mimeType"], "image/png")
+        self.assertEqual(image["data"], base64.b64encode(raw).decode())
+
+    async def test_pure_image_turn_reaches_acp_session_prompt(self):
+        raw = b"\x89PNG-pure"
+        url = "data:image/png;base64," + base64.b64encode(raw).decode()
+        payload = {
+            "model": "glm-5.2",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image_url", "image_url": {"url": url}}
+                    ],
+                }
+            ],
+        }
+        chunks = await self._collect(payload)
+        self.assertEqual(chunks[-1]["choices"][0]["finish_reason"], "stop")
+        stats = await self.transport.request("test/stats", {})
+        block_types = [b.get("type") for b in stats["last_prompt_blocks"]]
+        self.assertEqual(block_types, ["text", "image"])
+
+    async def test_remote_image_is_a_400(self):
+        with self.assertRaises(ChatStreamError) as ctx:
+            await self._collect(
+                {
+                    "model": "glm-5.2",
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "image_url",
+                                    "image_url": {"url": "https://cdn.example/x.png"},
+                                }
+                            ],
+                        }
+                    ],
+                }
+            )
+        self.assertEqual(ctx.exception.status, 400)
 
 
 class FrameTooLargeTests(unittest.IsolatedAsyncioTestCase):
